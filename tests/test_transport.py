@@ -611,7 +611,8 @@ class TestTransportIntegration:
         redis_client.zadd(queue_name, {"delayed": delayed_score})
 
         # When we pop with a max score of "now", only immediate should be returned
-        current_max_score = _queue_score(255, now)  # Lowest priority at current time
+        # Use priority 0 (highest priority = highest score) to get max possible score for current time
+        current_max_score = _queue_score(0, now)
         result = redis_client.zrangebyscore(queue_name, "-inf", current_max_score)
 
         assert b"immediate" in result
@@ -628,7 +629,7 @@ class TestTransportIntegration:
         redis_client.zadd(queue_name, {"message1": score})
 
         # BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT count]
-        result = redis_client.bzmpop(1, 1, queue_name, min=True)
+        result = redis_client.bzmpop(1, 1, [queue_name], min=True)
 
         assert result is not None
         key, members = result
@@ -758,10 +759,10 @@ class TestTransportIntegration:
         stream_name = "test_stream_maxlen"
         maxlen = 5
 
-        # Add more messages than maxlen
+        # Add more messages than maxlen (use approximate=False for exact trimming)
         for i in range(10):
-            redis_client.xadd(stream_name, {"msg": str(i)}, maxlen=maxlen)
+            redis_client.xadd(stream_name, {"msg": str(i)}, maxlen=maxlen, approximate=False)
 
-        # Stream should be trimmed to approximately maxlen
+        # Stream should be trimmed to exactly maxlen
         info = redis_client.xinfo_stream(stream_name)
-        assert info["length"] <= maxlen + 1  # Approximate trimming may leave a few extra
+        assert info["length"] == maxlen
