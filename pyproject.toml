@@ -1,0 +1,95 @@
+[project]
+name = "celery-redis-plus"
+version = "0.1.0a1"
+description = "Enhanced Redis transport for Celery with native delayed delivery"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = [
+    "celery>=5.6.1",
+    "redis>=7.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.2",
+    "testcontainers[redis]==4.13.3",
+    "ruff==0.14.10",
+    "ty==0.0.8",
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+explicit-preview-rules = true
+fixable = ["ALL"]
+ignore = [
+  # flake8-annotations (ANN) - Type annotations
+  "ANN401", # INTENTIONAL: Any needed for untyped external APIs (Celery, Kombu)
+
+  # flake8-unused-arguments (ARG) - Unused arguments
+  "ARG001", # INTENTIONAL: Too many false positives, unused-function-argument.
+  "ARG002", # INTENTIONAL: Too many false positives, unused-method-argument.
+
+  # flake8-commas (COM)
+  "COM812", # INTENTIONAL: Can cause problems in combination with ruff-format
+
+  # pydocstyle (D) - Documentation
+  "D", # INTENTIONAL: Too extensive, even if only partially enabled
+
+  # pycodestyle (E5) - Line too long and similar
+  "E5", # INTENTIONAL: Line length violations - 120 char limit is sufficient
+
+  # flake8-errmsg (EM) - Error message patterns
+  "EM101", # INTENTIONAL: raw-string-in-exception - opinionated readability change not needed
+  "EM102", # INTENTIONAL: f-string-in-exception - opinionated readability change not needed
+
+  # flake8-future-annotations (FA) - Future annotations
+  "FA", # INTENTIONAL: We prefer to stay with the current Python version.
+
+  # flake8-boolean-trap (FBT) - Boolean traps
+  "FBT001", # INTENTIONAL: boolean-type-hint-positional-argument - too many violations across patterns
+  "FBT002", # INTENTIONAL: boolean-default-value-positional-argument - breaks compatibility
+
+  # pylint (PLC) - Pylint conventions
+  "PLC0415", # INTENTIONAL: import-outside-top-level - needed for optional dependencies
+
+  # pylint (PLR) - Pylint refactor
+  "PLR0913", # INTENTIONAL: too-many-arguments - signal handlers have many args
+  "PLR2004", # INTENTIONAL: magic-value-comparison - test values are fine
+
+  # Ruff-specific (RUF)
+  "RUF012", # INTENTIONAL: Too many false positives
+  "RUF015", # INTENTIONAL: unnecessary-iterable-allocation-for-first-element - readability
+  "RUF059", # INTENTIONAL: Keep variable as unused
+
+  # flake8-bandit (S) - Security
+  "S101", # INTENTIONAL: assert - needed for tests and type narrowing
+
+  # flake8-self (SLF) - Private member access
+  "SLF001", # INTENTIONAL: private-member-access - needed for testing internals
+
+  # flake8-type-checking (TC)
+  "TC003", # INTENTIONAL: move-stdlib-import - prefer explicit imports
+  "TC005", # INTENTIONAL: empty-type-checking-block - sometimes needed for structure
+
+  # tryceratops (TRY) - Exception handling
+  "TRY003", # INTENTIONAL: raise-vanilla-args - long exception messages are fine
+]
+preview = true
+select = ["ALL", "UP045"]
+unfixable = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "unit: marks tests as unit tests",
+    "integration: marks tests as integration tests",
+]
