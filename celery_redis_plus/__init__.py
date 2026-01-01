@@ -1,20 +1,22 @@
-"""celery-redis-plus: Enhanced Redis transport for Celery with native delayed delivery.
+"""celery-redis-plus: Enhanced Redis transport for Celery.
 
-This package provides a drop-in replacement Redis transport for Celery that
-supports native delayed message delivery using Redis ZSETs. Tasks with
-countdown or eta will use Redis-native delayed delivery instead of the
-default Celery approach.
+This package provides an enhanced Redis transport for Celery that uses:
+- BZMPOP + sorted sets for regular queues (priority support + reliability)
+- Redis Streams for fanout exchanges (reliable consumer groups)
+- Native delayed delivery integrated into sorted set scoring
+
+Requirements:
+- Redis 7.0+ (for BZMPOP command)
+- Python 3.13+
 
 Usage:
     from celery import Celery
-    import celery_redis_plus  # Auto-registers signal handler
+    import celery_redis_plus  # Auto-registers signal handler for eta/countdown
 
     app = Celery('myapp')
     app.config_from_object({
-        'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+        'broker_url': 'redis+celery-redis-plus://localhost:6379/0',
     })
-
-    celery_redis_plus.configure_app(app)  # Registers bootstep
 
     @app.task
     def my_task():
@@ -22,6 +24,9 @@ Usage:
 
     # Tasks with countdown/eta will use native Redis delayed delivery
     my_task.apply_async(countdown=60)
+
+    # Full 0-255 priority support
+    my_task.apply_async(priority=5)
 """
 
 from __future__ import annotations
@@ -33,8 +38,6 @@ from .constants import DELAY_HEADER
 from .transport import Transport
 
 __all__ = ["DELAY_HEADER", "DelayedDeliveryBootstep", "Transport", "configure_app"]
-
-__version__ = "0.1.0a1"
 
 
 def configure_app(app: Any) -> None:
@@ -54,6 +57,10 @@ def configure_app(app: Any) -> None:
         >>> celery_redis_plus.configure_app(app)
     """
     app.steps["consumer"].add(DelayedDeliveryBootstep)
+
+
+__version__ = "0.1.0a1"
+
 
 
 # Auto-register signal handler on import
