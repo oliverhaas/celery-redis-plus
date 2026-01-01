@@ -126,6 +126,33 @@ app.config_from_object({
 })
 ```
 
+### SSL/TLS Connections
+
+For secure connections to Redis, use the `ssl` transport option:
+
+```python
+app.config_from_object({
+    'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+    'broker_transport_options': {
+        'ssl': True,  # Use default SSL settings
+    },
+})
+
+# Or with custom SSL options:
+import ssl
+app.config_from_object({
+    'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+    'broker_transport_options': {
+        'ssl': {
+            'ssl_cert_reqs': ssl.CERT_REQUIRED,
+            'ssl_ca_certs': '/path/to/ca.crt',
+            'ssl_certfile': '/path/to/client.crt',
+            'ssl_keyfile': '/path/to/client.key',
+        },
+    },
+})
+```
+
 ## Components
 
 ### `celery_redis_plus.Transport`

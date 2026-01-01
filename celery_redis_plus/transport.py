@@ -13,7 +13,7 @@ Connection string has the following format:
 
 .. code-block::
 
-    redis+celery-redis-plus://[USER:PASSWORD@]REDIS_ADDRESS[:PORT][/VIRTUALHOST]
+    celery_redis_plus.transport:Transport://[USER:PASSWORD@]REDIS_ADDRESS[:PORT][/VIRTUALHOST]
 
 Transport Options
 =================
@@ -25,6 +25,8 @@ Transport Options
 * ``socket_connect_timeout``: Socket connection timeout in seconds
 * ``max_connections``: Maximum number of connections in pool
 * ``health_check_interval``: Interval for health checks (default: 25)
+* ``ssl``: Enable SSL/TLS connection. Set to ``True`` for default SSL settings,
+  or a dict with SSL options (e.g., ``{'ssl_cert_reqs': ssl.CERT_REQUIRED}``)
 """
 
 from __future__ import annotations
@@ -1175,9 +1177,16 @@ class Channel(virtual.Channel):
             else:
                 connparams.pop("health_check_interval")
 
-        if conninfo.ssl:
+        # Check for SSL configuration from URL scheme (rediss://) or transport_options
+        ssl_config = conninfo.ssl
+        if not ssl_config:
+            # Fall back to transport_options for path-based transport URLs
+            ssl_config = self.connection.client.transport_options.get("ssl")
+
+        if ssl_config:
             try:
-                connparams.update(conninfo.ssl)
+                if isinstance(ssl_config, dict):
+                    connparams.update(ssl_config)
                 connparams["connection_class"] = self.connection_class_ssl
             except TypeError:
                 pass

@@ -15,8 +15,14 @@ Usage:
 
     app = Celery('myapp')
     app.config_from_object({
-        'broker_url': 'redis+celery-redis-plus://localhost:6379/0',
+        'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
     })
+
+    # For SSL/TLS connections:
+    # app.config_from_object({
+    #     'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+    #     'broker_transport_options': {'ssl': True},
+    # })
 
     @app.task
     def my_task():
