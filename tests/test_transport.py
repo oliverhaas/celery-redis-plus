@@ -489,7 +489,7 @@ class TestMultiChannelPoller:
     def test_fds_property(self) -> None:
         """Test that fds property returns _fd_to_chan."""
         poller = MultiChannelPoller()
-        poller._fd_to_chan = {1: ("channel", "BZMPOP")}
+        poller._fd_to_chan = {1: ("channel", "BZMPOP")}  # type: ignore[assignment]
         assert poller.fds == poller._fd_to_chan
 
     def test_close_unregisters_fds(self) -> None:
@@ -497,7 +497,7 @@ class TestMultiChannelPoller:
         poller = MultiChannelPoller()
         mock_poller = MagicMock()
         poller.poller = mock_poller
-        poller._chan_to_sock.update({1: 1, 2: 2, 3: 3})
+        poller._chan_to_sock.update({1: 1, 2: 2, 3: 3})  # type: ignore[dict-item]
 
         poller.close()
 
@@ -506,61 +506,61 @@ class TestMultiChannelPoller:
     def test_on_poll_start_no_channels(self) -> None:
         """Test on_poll_start with no channels."""
         poller = MultiChannelPoller()
-        poller._channels = []
+        poller._channels = set()  # type: ignore[assignment]
         # Should not raise
         poller.on_poll_start()
 
     def test_on_poll_start_with_active_queues(self) -> None:
         """Test on_poll_start with active queues."""
         poller = MultiChannelPoller()
-        poller._register_BZMPOP = MagicMock()
-        poller._register_XREADGROUP = MagicMock()
+        poller._register_BZMPOP = MagicMock()  # type: ignore[method-assign]
+        poller._register_XREADGROUP = MagicMock()  # type: ignore[method-assign]
 
         channel = MagicMock()
         channel.active_queues = ["queue1"]
         channel.active_fanout_queues = []
         channel.qos.can_consume.return_value = True
-        poller._channels = [channel]
+        poller._channels = {channel}  # type: ignore[assignment]
 
         poller.on_poll_start()
 
-        poller._register_BZMPOP.assert_called_once_with(channel)
-        poller._register_XREADGROUP.assert_not_called()
+        poller._register_BZMPOP.assert_called_once_with(channel)  # type: ignore[attr-defined]
+        poller._register_XREADGROUP.assert_not_called()  # type: ignore[attr-defined]
 
     def test_on_poll_start_with_fanout_queues(self) -> None:
         """Test on_poll_start with fanout queues."""
         poller = MultiChannelPoller()
-        poller._register_BZMPOP = MagicMock()
-        poller._register_XREADGROUP = MagicMock()
+        poller._register_BZMPOP = MagicMock()  # type: ignore[method-assign]
+        poller._register_XREADGROUP = MagicMock()  # type: ignore[method-assign]
 
         channel = MagicMock()
         channel.active_queues = []
         channel.active_fanout_queues = ["fanout_queue"]
         channel.qos.can_consume.return_value = True
-        poller._channels = [channel]
+        poller._channels = {channel}  # type: ignore[assignment]
 
         poller.on_poll_start()
 
-        poller._register_BZMPOP.assert_not_called()
-        poller._register_XREADGROUP.assert_called_once_with(channel)
+        poller._register_BZMPOP.assert_not_called()  # type: ignore[attr-defined]
+        poller._register_XREADGROUP.assert_called_once_with(channel)  # type: ignore[attr-defined]
 
     def test_on_poll_start_qos_cannot_consume(self) -> None:
         """Test on_poll_start when QoS cannot consume."""
         poller = MultiChannelPoller()
-        poller._register_BZMPOP = MagicMock()
-        poller._register_XREADGROUP = MagicMock()
+        poller._register_BZMPOP = MagicMock()  # type: ignore[method-assign]
+        poller._register_XREADGROUP = MagicMock()  # type: ignore[method-assign]
 
         channel = MagicMock()
         channel.active_queues = ["queue1"]
         channel.active_fanout_queues = ["fanout_queue"]
         channel.qos.can_consume.return_value = False  # QoS limit reached
-        poller._channels = [channel]
+        poller._channels = {channel}  # type: ignore[assignment]
 
         poller.on_poll_start()
 
         # Neither should be registered when can_consume is False
-        poller._register_BZMPOP.assert_not_called()
-        poller._register_XREADGROUP.assert_not_called()
+        poller._register_BZMPOP.assert_not_called()  # type: ignore[attr-defined]
+        poller._register_XREADGROUP.assert_not_called()  # type: ignore[attr-defined]
 
 
 class TestTransportIntegration:
