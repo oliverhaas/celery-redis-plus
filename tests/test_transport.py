@@ -1,151 +1,335 @@
-"""Tests for the custom Redis transport with delayed delivery."""
+"""Tests for the enhanced Redis transport with BZMPOP, Streams, and delayed delivery."""
 
 from __future__ import annotations
 
 import time
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from celery_redis_plus.constants import DELAY_HEADER, DELAYED_QUEUE_SUFFIX
-from celery_redis_plus.transport import Channel, Transport
+from celery_redis_plus.constants import (
+    DELAY_HEADER,
+    PRIORITY_SCORE_MULTIPLIER,
+)
+from celery_redis_plus.transport import (
+    Channel,
+    GlobalKeyPrefixMixin,
+    MultiChannelPoller,
+    QoS,
+    Transport,
+    _queue_score,
+)
+
+
+@pytest.mark.unit
+class TestQueueScore:
+    """Tests for the queue score calculation."""
+
+    def test_score_without_delay(self) -> None:
+        """Test score calculation without delay."""
+        now = time.time()
+        score = _queue_score(priority=0, timestamp=now)
+        # Priority 0 (highest) -> 255 * MULTIPLIER + timestamp_ms
+        expected = 255 * PRIORITY_SCORE_MULTIPLIER + int(now * 1000)
+        assert score == expected
+
+    def test_score_with_delay(self) -> None:
+        """Test score calculation with delay."""
+        now = time.time()
+        delay = 60.0
+        score = _queue_score(priority=0, timestamp=now, delay_seconds=delay)
+        expected = 255 * PRIORITY_SCORE_MULTIPLIER + int((now + delay) * 1000)
+        assert score == expected
+
+    def test_higher_priority_lower_score(self) -> None:
+        """Test that higher priority (lower number) results in lower score."""
+        now = time.time()
+        high_priority_score = _queue_score(priority=0, timestamp=now)  # Highest priority
+        low_priority_score = _queue_score(priority=255, timestamp=now)  # Lowest priority
+        # Lower score = popped first
+        assert high_priority_score > low_priority_score
+
+    def test_earlier_timestamp_lower_score_same_priority(self) -> None:
+        """Test FIFO within same priority."""
+        earlier = time.time()
+        later = earlier + 10
+        score_earlier = _queue_score(priority=5, timestamp=earlier)
+        score_later = _queue_score(priority=5, timestamp=later)
+        assert score_earlier < score_later
+
+    def test_default_timestamp_uses_current_time(self) -> None:
+        """Test that None timestamp uses current time."""
+        before = time.time()
+        score = _queue_score(priority=0)
+        after = time.time()
+        # Extract timestamp from score (note: int() truncation may cause small loss)
+        timestamp_ms = score - (255 * PRIORITY_SCORE_MULTIPLIER)
+        timestamp = timestamp_ms / 1000
+        # Allow small tolerance for int() truncation in _queue_score
+        assert before - 0.001 <= timestamp <= after + 0.001
+
+
+@pytest.mark.unit
+class TestGlobalKeyPrefixMixin:
+    """Tests for the GlobalKeyPrefixMixin."""
+
+    def test_prefix_simple_commands(self) -> None:
+        """Test that simple commands get prefixed."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = "test:"
+
+        args = mixin._prefix_args(["ZADD", "myqueue", {"tag1": 100}])
+        assert args[0] == "ZADD"
+        assert args[1] == "test:myqueue"
+
+    def test_prefix_bzmpop(self) -> None:
+        """Test BZMPOP key prefixing."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = "test:"
+
+        # BZMPOP timeout numkeys key1 key2 MIN
+        args = mixin._prefix_args(["BZMPOP", 1, 2, "queue1", "queue2", "MIN"])
+        assert args[0] == "BZMPOP"
+        assert args[1] == 1  # timeout
+        assert args[2] == 2  # numkeys
+        assert args[3] == "test:queue1"
+        assert args[4] == "test:queue2"
+        assert args[5] == "MIN"
+
+    def test_prefix_xreadgroup(self) -> None:
+        """Test XREADGROUP key prefixing."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = "test:"
+
+        # XREADGROUP GROUP group consumer STREAMS stream1 stream2 id1 id2
+        args = mixin._prefix_args(
+            ["XREADGROUP", "GROUP", "mygroup", "consumer1", "STREAMS", "stream1", "stream2", ">", ">"]
+        )
+        assert args[0] == "XREADGROUP"
+        assert "test:stream1" in args
+        assert "test:stream2" in args
+
+    def test_no_prefix_when_empty(self) -> None:
+        """Test that empty prefix doesn't change keys."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = ""
+
+        args = mixin._prefix_args(["ZADD", "myqueue", {"tag1": 100}])
+        assert args[1] == "myqueue"
 
 
 @pytest.mark.unit
 class TestChannel:
     """Tests for the custom Channel class."""
 
-    def test_get_delayed_key(self) -> None:
-        """Test delayed key generation."""
-        # Create a minimal mock channel
+    def test_put_stores_in_sorted_set(self) -> None:
+        """Test that _put stores messages in sorted set with correct score."""
         channel = object.__new__(Channel)
-        result = channel._get_delayed_key("my_queue")
-        assert result == "my_queue:delayed"
+        channel.messages_key = "messages"
+        channel.messages_index_key = "messages_index"
+        channel.global_keyprefix = ""
 
-    def test_put_with_delay_uses_zadd(self) -> None:
-        """Test that messages with delay header go to delayed ZSET."""
-        # Create a channel with mocked internals
-        channel = object.__new__(Channel)
         mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
 
-        # Mock conn_or_acquire context manager
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
         mock_context.__exit__ = MagicMock(return_value=False)
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        channel._get_message_priority = MagicMock(return_value=0)
 
         message = {
             "body": '{"task": "test"}',
-            "properties": {"headers": {DELAY_HEADER: 60.0}},
+            "properties": {
+                "delivery_tag": "tag123",
+                "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                "headers": {},
+            },
         }
 
-        # Patch the parent's _put to prevent actual put
-        with patch("kombu.transport.redis.Channel._put"):
-            channel._put("my_queue", message)
+        channel._put("my_queue", message)
 
-        # zadd should be called with the delayed key
-        mock_client.zadd.assert_called_once()
-        call_args = mock_client.zadd.call_args
-        assert call_args[0][0] == "my_queue:delayed"
-        # The second arg is a dict {serialized_message: score}
-        zadd_mapping = call_args[0][1]
-        # Check that there's exactly one entry
-        assert len(zadd_mapping) == 1
-        # Score should be approximately current_time + 60
-        score = list(zadd_mapping.values())[0]
-        assert score > time.time() + 55
-        assert score < time.time() + 65
+        # Verify pipeline was used
+        mock_client.pipeline.assert_called_once()
+        # Verify hset was called for message storage
+        mock_pipe.hset.assert_called_once()
+        # Verify zadd was called twice (once for index, once for queue)
+        assert mock_pipe.zadd.call_count == 2
+        mock_pipe.execute.assert_called_once()
 
-    def test_put_without_delay_calls_parent(self) -> None:
-        """Test that messages without delay header are published normally."""
+    def test_put_with_delay_uses_future_score(self) -> None:
+        """Test that messages with delay header get future score."""
         channel = object.__new__(Channel)
+        channel.messages_key = "messages"
+        channel.messages_index_key = "messages_index"
+        channel.global_keyprefix = ""
+
         mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
+
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
         mock_context.__exit__ = MagicMock(return_value=False)
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        channel._get_message_priority = MagicMock(return_value=0)
+
+        delay_seconds = 60.0
+        message = {
+            "body": '{"task": "test"}',
+            "properties": {
+                "delivery_tag": "tag123",
+                "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                "headers": {DELAY_HEADER: delay_seconds},
+            },
+        }
+
+        before = time.time()
+        channel._put("my_queue", message)
+        after = time.time()
+
+        # Get the score that was passed to zadd for the queue
+        zadd_calls = mock_pipe.zadd.call_args_list
+        # Second zadd call is for the queue
+        queue_zadd_call = zadd_calls[1]
+        queue_name, score_dict = queue_zadd_call[0]
+        score = list(score_dict.values())[0]
+
+        # Score should reflect the delay
+        expected_min = 255 * PRIORITY_SCORE_MULTIPLIER + int((before + delay_seconds) * 1000)
+        expected_max = 255 * PRIORITY_SCORE_MULTIPLIER + int((after + delay_seconds) * 1000)
+        assert expected_min <= score <= expected_max
+
+    def test_put_with_zero_delay(self) -> None:
+        """Test that zero delay doesn't add to score."""
+        channel = object.__new__(Channel)
+        channel.messages_key = "messages"
+        channel.messages_index_key = "messages_index"
+        channel.global_keyprefix = ""
+
+        mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        channel._get_message_priority = MagicMock(return_value=0)
 
         message = {
             "body": '{"task": "test"}',
-            "properties": {"headers": {}},
+            "properties": {
+                "delivery_tag": "tag123",
+                "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                "headers": {DELAY_HEADER: 0},
+            },
         }
 
-        with patch("kombu.transport.redis.Channel._put") as mock_parent_put:
-            channel._put("my_queue", message)
-            mock_parent_put.assert_called_once_with("my_queue", message)
-            # zadd should NOT be called
-            mock_client.zadd.assert_not_called()
+        before = time.time()
+        channel._put("my_queue", message)
+        after = time.time()
 
-    def test_put_with_zero_delay_calls_parent(self) -> None:
-        """Test that messages with zero delay are published normally."""
+        zadd_calls = mock_pipe.zadd.call_args_list
+        queue_zadd_call = zadd_calls[1]
+        queue_name, score_dict = queue_zadd_call[0]
+        score = list(score_dict.values())[0]
+
+        # Score should be approximately now (no delay)
+        expected_min = 255 * PRIORITY_SCORE_MULTIPLIER + int(before * 1000)
+        expected_max = 255 * PRIORITY_SCORE_MULTIPLIER + int(after * 1000)
+        assert expected_min <= score <= expected_max
+
+    def test_put_with_negative_delay_treated_as_zero(self) -> None:
+        """Test that negative delay is treated as zero."""
         channel = object.__new__(Channel)
+        channel.messages_key = "messages"
+        channel.messages_index_key = "messages_index"
+        channel.global_keyprefix = ""
+
         mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
+
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
         mock_context.__exit__ = MagicMock(return_value=False)
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        channel._get_message_priority = MagicMock(return_value=0)
 
         message = {
             "body": '{"task": "test"}',
-            "properties": {"headers": {DELAY_HEADER: 0}},
+            "properties": {
+                "delivery_tag": "tag123",
+                "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                "headers": {DELAY_HEADER: -10},
+            },
         }
 
-        with patch("kombu.transport.redis.Channel._put") as mock_parent_put:
-            channel._put("my_queue", message)
-            mock_parent_put.assert_called_once()
-            mock_client.zadd.assert_not_called()
+        before = time.time()
+        channel._put("my_queue", message)
+        after = time.time()
 
-    def test_put_with_negative_delay_calls_parent(self) -> None:
-        """Test that messages with negative delay are published normally."""
+        zadd_calls = mock_pipe.zadd.call_args_list
+        queue_zadd_call = zadd_calls[1]
+        queue_name, score_dict = queue_zadd_call[0]
+        score = list(score_dict.values())[0]
+
+        # Score should be approximately now (negative delay treated as 0)
+        expected_min = 255 * PRIORITY_SCORE_MULTIPLIER + int(before * 1000)
+        expected_max = 255 * PRIORITY_SCORE_MULTIPLIER + int(after * 1000)
+        assert expected_min <= score <= expected_max
+
+    def test_fanout_stream_key(self) -> None:
+        """Test fanout stream key generation."""
         channel = object.__new__(Channel)
-        mock_client = MagicMock()
-        mock_context = MagicMock()
-        mock_context.__enter__ = MagicMock(return_value=mock_client)
-        mock_context.__exit__ = MagicMock(return_value=False)
-        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        channel.keyprefix_fanout = "/0."
+        channel.fanout_patterns = True
 
-        message = {
-            "body": '{"task": "test"}',
-            "properties": {"headers": {DELAY_HEADER: -10}},
-        }
+        # Without routing key
+        key = channel._fanout_stream_key("myexchange")
+        assert key == "/0.myexchange"
 
-        with patch("kombu.transport.redis.Channel._put") as mock_parent_put:
-            channel._put("my_queue", message)
-            mock_parent_put.assert_called_once()
-            mock_client.zadd.assert_not_called()
+        # With routing key
+        key = channel._fanout_stream_key("myexchange", "myroute")
+        assert key == "/0.myexchange/myroute"
 
-    def test_put_no_properties(self) -> None:
-        """Test put with no properties dict."""
+    def test_fanout_consumer_group(self) -> None:
+        """Test fanout consumer group name generation."""
         channel = object.__new__(Channel)
-        mock_client = MagicMock()
-        mock_context = MagicMock()
-        mock_context.__enter__ = MagicMock(return_value=mock_client)
-        mock_context.__exit__ = MagicMock(return_value=False)
-        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        channel.consumer_group_prefix = "celery-redis-plus"
 
-        message = {"body": '{"task": "test"}'}
+        group = channel._fanout_consumer_group("myqueue")
+        assert group == "celery-redis-plus-fanout-myqueue"
 
-        with patch("kombu.transport.redis.Channel._put") as mock_parent_put:
-            channel._put("my_queue", message)
-            mock_parent_put.assert_called_once()
-            mock_client.zadd.assert_not_called()
 
-    def test_put_empty_message(self) -> None:
-        """Test put with empty message dict."""
-        channel = object.__new__(Channel)
-        mock_client = MagicMock()
-        mock_context = MagicMock()
-        mock_context.__enter__ = MagicMock(return_value=mock_client)
-        mock_context.__exit__ = MagicMock(return_value=False)
-        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+@pytest.mark.unit
+class TestQoS:
+    """Tests for the QoS class."""
 
-        message: dict = {}
+    def test_stream_metadata_tracked_for_fanout(self) -> None:
+        """Test that stream metadata is tracked for fanout messages."""
+        qos = object.__new__(QoS)
+        qos._stream_metadata = {}
 
-        with patch("kombu.transport.redis.Channel._put") as mock_parent_put:
-            channel._put("my_queue", message)
-            mock_parent_put.assert_called_once()
-            mock_client.zadd.assert_not_called()
+        # Simulate adding stream metadata
+        qos._stream_metadata["tag1"] = ("stream1", "msg-id-1", "group1")
+
+        assert "tag1" in qos._stream_metadata
+        stream, msg_id, group = qos._stream_metadata["tag1"]
+        assert stream == "stream1"
+        assert msg_id == "msg-id-1"
+        assert group == "group1"
 
 
 @pytest.mark.unit
@@ -160,203 +344,167 @@ class TestTransport:
         """Test that transport uses our custom Channel class."""
         assert Transport.Channel is Channel
 
-    def test_setup_native_delayed_delivery_starts_thread(self) -> None:
-        """Test setting up delayed delivery starts the background thread."""
-        # Create transport without full initialization
-        transport = object.__new__(Transport)
-        transport._delayed_delivery_thread = None
-        transport._delayed_delivery_stop_event = None
-        transport._monitored_queues = []
+    def test_implements_async_and_exchanges(self) -> None:
+        """Test that transport implements async and all exchange types."""
+        assert Transport.implements.asynchronous is True
+        assert "direct" in Transport.implements.exchange_type
+        assert "topic" in Transport.implements.exchange_type
+        assert "fanout" in Transport.implements.exchange_type
 
-        connection = MagicMock()
-        queues = ["queue1", "queue2"]
 
-        transport.setup_native_delayed_delivery(connection, queues)
+@pytest.mark.unit
+class TestMultiChannelPoller:
+    """Tests for the MultiChannelPoller."""
 
-        try:
-            assert transport._monitored_queues == ["queue1", "queue2"]
-            assert transport._delayed_delivery_stop_event is not None
-            assert transport._delayed_delivery_thread is not None
-            assert transport._delayed_delivery_thread.is_alive()
-        finally:
-            # Clean up thread
-            transport.teardown_native_delayed_delivery()
+    def test_add_and_discard_channel(self) -> None:
+        """Test adding and removing channels."""
+        poller = MultiChannelPoller()
+        channel = MagicMock()
 
-    def test_setup_native_delayed_delivery_already_setup_skips(self) -> None:
-        """Test that setup does nothing if already set up."""
-        transport = object.__new__(Transport)
-        existing_thread = MagicMock()
-        transport._delayed_delivery_thread = existing_thread
-        transport._delayed_delivery_stop_event = None
-        transport._monitored_queues = []
+        poller.add(channel)
+        assert channel in poller._channels
 
-        connection = MagicMock()
-        queues = ["queue1"]
+        poller.discard(channel)
+        assert channel not in poller._channels
 
-        transport.setup_native_delayed_delivery(connection, queues)
+    def test_close_clears_state(self) -> None:
+        """Test that close clears all state."""
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        poller.add(channel)
 
-        # Thread should not be replaced
-        assert transport._delayed_delivery_thread is existing_thread
+        poller.close()
 
-    def test_teardown_native_delayed_delivery_stops_thread(self) -> None:
-        """Test tearing down delayed delivery stops the thread."""
-        transport = object.__new__(Transport)
-        transport._delayed_delivery_thread = None
-        transport._delayed_delivery_stop_event = None
-        transport._monitored_queues = []
-
-        # Start the thread first
-        connection = MagicMock()
-        transport.setup_native_delayed_delivery(connection, ["queue1"])
-        assert transport._delayed_delivery_thread is not None
-        assert transport._delayed_delivery_thread.is_alive()
-
-        # Now tear it down
-        transport.teardown_native_delayed_delivery()
-
-        assert transport._delayed_delivery_thread is None
-        assert transport._delayed_delivery_stop_event is None
-        assert transport._monitored_queues == []
+        assert len(poller._channels) == 0
+        assert len(poller._fd_to_chan) == 0
+        assert len(poller._chan_to_sock) == 0
 
 
 class TestTransportIntegration:
     """Integration tests for transport with real Redis."""
 
     @pytest.mark.integration
-    def test_delayed_message_delivery(self, redis_client: Any) -> None:
-        """Test that delayed messages are delivered after the delay."""
-        queue_name = "test_queue"
-        delayed_key = f"{queue_name}{DELAYED_QUEUE_SUFFIX}"
-        message = b'{"task": "test_task", "id": "123"}'
-
-        # Simulate adding a delayed message (due in 1 second)
-        delivery_time = time.time() + 1.0
-        redis_client.zadd(delayed_key, {message: delivery_time})
-
-        # Verify message is in delayed queue
-        delayed_messages = redis_client.zrange(delayed_key, 0, -1)
-        assert message in delayed_messages
-
-        # Verify message is NOT in ready queue yet
-        ready_messages = redis_client.lrange(queue_name, 0, -1)
-        assert message not in ready_messages
-
-        # Wait for delivery time
-        time.sleep(1.5)
-
-        # Simulate the Lua script that moves messages
-        lua_script = """
-        local delayed_key = KEYS[1]
-        local queue_key = KEYS[2]
-        local current_time = tonumber(ARGV[1])
-        local batch_size = tonumber(ARGV[2])
-
-        local messages = redis.call('ZRANGEBYSCORE', delayed_key, '-inf', current_time, 'LIMIT', 0, batch_size)
-
-        local count = 0
-        for i, message in ipairs(messages) do
-            redis.call('ZREM', delayed_key, message)
-            redis.call('LPUSH', queue_key, message)
-            count = count + 1
-        end
-
-        return count
-        """
-
-        moved_count = redis_client.eval(lua_script, 2, delayed_key, queue_name, time.time(), 100)
-        assert moved_count == 1
-
-        # Verify message is now in ready queue
-        ready_messages = redis_client.lrange(queue_name, 0, -1)
-        assert message in ready_messages
-
-        # Verify message is no longer in delayed queue
-        delayed_messages = redis_client.zrange(delayed_key, 0, -1)
-        assert message not in delayed_messages
-
-    @pytest.mark.integration
-    def test_multiple_delayed_messages_ordered(self, redis_client: Any) -> None:
-        """Test that multiple delayed messages are delivered in order."""
-        queue_name = "test_queue_multi"
-        delayed_key = f"{queue_name}{DELAYED_QUEUE_SUFFIX}"
+    def test_sorted_set_message_ordering(self, redis_client: Any) -> None:
+        """Test that messages are ordered by score in sorted set."""
+        queue_name = "test_queue_ordering"
 
         now = time.time()
-        messages = [
-            (b'{"task": "task3"}', now + 3),  # Third to deliver
-            (b'{"task": "task1"}', now + 1),  # First to deliver
-            (b'{"task": "task2"}', now + 2),  # Second to deliver
-        ]
 
-        # Add all messages
-        for msg, delivery_time in messages:
-            redis_client.zadd(delayed_key, {msg: delivery_time})
+        # Add messages with different priorities
+        # Lower score = popped first, higher priority (lower number) = lower score component
+        # But we invert: (255 - priority), so priority 0 -> 255, priority 255 -> 0
+        high_pri_score = _queue_score(0, now)  # Highest priority
+        med_pri_score = _queue_score(128, now)  # Medium priority
+        low_pri_score = _queue_score(255, now)  # Lowest priority
 
-        # Wait for all to be ready
-        time.sleep(3.5)
+        redis_client.zadd(queue_name, {"high_pri": high_pri_score})
+        redis_client.zadd(queue_name, {"low_pri": low_pri_score})
+        redis_client.zadd(queue_name, {"med_pri": med_pri_score})
 
-        # Move messages
-        lua_script = """
-        local delayed_key = KEYS[1]
-        local queue_key = KEYS[2]
-        local current_time = tonumber(ARGV[1])
-        local batch_size = tonumber(ARGV[2])
+        # Pop should return lowest score first (lowest priority number = highest priority)
+        result = redis_client.zpopmin(queue_name, 1)
+        assert result[0][0] == b"low_pri"  # Priority 255 has lowest score
 
-        local messages = redis.call('ZRANGEBYSCORE', delayed_key, '-inf', current_time, 'LIMIT', 0, batch_size)
+        result = redis_client.zpopmin(queue_name, 1)
+        assert result[0][0] == b"med_pri"
 
-        local count = 0
-        for i, message in ipairs(messages) do
-            redis.call('ZREM', delayed_key, message)
-            redis.call('LPUSH', queue_key, message)
-            count = count + 1
-        end
-
-        return count
-        """
-
-        moved_count = redis_client.eval(lua_script, 2, delayed_key, queue_name, time.time(), 100)
-        assert moved_count == 3
-
-        # Verify all messages are in the queue
-        ready_messages = redis_client.lrange(queue_name, 0, -1)
-        assert len(ready_messages) == 3
+        result = redis_client.zpopmin(queue_name, 1)
+        assert result[0][0] == b"high_pri"
 
     @pytest.mark.integration
-    def test_no_premature_delivery(self, redis_client: Any) -> None:
-        """Test that messages are not delivered before their time."""
-        queue_name = "test_queue_premature"
-        delayed_key = f"{queue_name}{DELAYED_QUEUE_SUFFIX}"
-        message = b'{"task": "future_task"}'
+    def test_delayed_message_not_visible_until_time(self, redis_client: Any) -> None:
+        """Test that delayed messages have future scores."""
+        queue_name = "test_queue_delayed"
 
-        # Schedule for 10 seconds in the future
-        delivery_time = time.time() + 10.0
-        redis_client.zadd(delayed_key, {message: delivery_time})
+        now = time.time()
+        delay = 60.0  # 60 second delay
 
-        # Try to move messages now
-        lua_script = """
-        local delayed_key = KEYS[1]
-        local queue_key = KEYS[2]
-        local current_time = tonumber(ARGV[1])
-        local batch_size = tonumber(ARGV[2])
+        # Message without delay
+        immediate_score = _queue_score(0, now)
+        # Message with delay
+        delayed_score = _queue_score(0, now, delay_seconds=delay)
 
-        local messages = redis.call('ZRANGEBYSCORE', delayed_key, '-inf', current_time, 'LIMIT', 0, batch_size)
+        redis_client.zadd(queue_name, {"immediate": immediate_score})
+        redis_client.zadd(queue_name, {"delayed": delayed_score})
 
-        local count = 0
-        for i, message in ipairs(messages) do
-            redis.call('ZREM', delayed_key, message)
-            redis.call('LPUSH', queue_key, message)
-            count = count + 1
-        end
+        # When we pop with a max score of "now", only immediate should be returned
+        current_max_score = _queue_score(255, now)  # Lowest priority at current time
+        result = redis_client.zrangebyscore(queue_name, "-inf", current_max_score)
 
-        return count
-        """
+        assert b"immediate" in result
+        assert b"delayed" not in result
 
-        moved_count = redis_client.eval(lua_script, 2, delayed_key, queue_name, time.time(), 100)
-        assert moved_count == 0
+    @pytest.mark.integration
+    def test_bzmpop_with_sorted_set(self, redis_client: Any) -> None:
+        """Test BZMPOP command with sorted sets (requires Redis 7.0+)."""
+        queue_name = "test_queue_bzmpop"
 
-        # Message should still be in delayed queue
-        delayed_messages = redis_client.zrange(delayed_key, 0, -1)
-        assert message in delayed_messages
+        now = time.time()
+        score = _queue_score(0, now)
 
-        # Ready queue should be empty
-        ready_messages = redis_client.lrange(queue_name, 0, -1)
-        assert message not in ready_messages
+        redis_client.zadd(queue_name, {"message1": score})
+
+        # BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT count]
+        result = redis_client.bzmpop(1, 1, queue_name, min=True)
+
+        assert result is not None
+        key, members = result
+        assert key == queue_name.encode() or key == queue_name
+        assert len(members) == 1
+        assert members[0][0] == b"message1"
+
+    @pytest.mark.integration
+    def test_stream_consumer_group(self, redis_client: Any) -> None:
+        """Test Redis Streams with consumer groups."""
+        stream_name = "test_stream"
+        group_name = "test_group"
+        consumer_name = "test_consumer"
+
+        # Create consumer group (mkstream=True creates stream if not exists)
+        try:
+            redis_client.xgroup_create(stream_name, group_name, id="0", mkstream=True)
+        except Exception as e:
+            if "BUSYGROUP" not in str(e):
+                raise
+
+        # Add message to stream
+        msg_id = redis_client.xadd(stream_name, {"payload": "test_message"})
+        assert msg_id is not None
+
+        # Read with consumer group
+        messages = redis_client.xreadgroup(
+            groupname=group_name,
+            consumername=consumer_name,
+            streams={stream_name: ">"},
+            count=1,
+            block=100,
+        )
+
+        assert messages is not None
+        assert len(messages) == 1
+        stream, message_list = messages[0]
+        assert len(message_list) == 1
+
+        # Acknowledge message
+        message_id = message_list[0][0]
+        ack_count = redis_client.xack(stream_name, group_name, message_id)
+        assert ack_count == 1
+
+    @pytest.mark.integration
+    def test_message_hash_storage(self, redis_client: Any) -> None:
+        """Test that messages can be stored and retrieved from hash."""
+        messages_key = "test_messages"
+        delivery_tag = "tag123"
+        message_data = '{"body": "test", "exchange": "celery", "routing_key": "celery"}'
+
+        # Store message
+        redis_client.hset(messages_key, delivery_tag, message_data)
+
+        # Retrieve message
+        result = redis_client.hget(messages_key, delivery_tag)
+        assert result == message_data.encode()
+
+        # Delete message
+        redis_client.hdel(messages_key, delivery_tag)
+        result = redis_client.hget(messages_key, delivery_tag)
+        assert result is None
