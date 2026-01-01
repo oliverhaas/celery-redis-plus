@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Generator
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
 from celery import Celery
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.waiting_utils import wait_for_logs
 
 if TYPE_CHECKING:
     from redis import Redis
@@ -45,55 +46,16 @@ def mock_redis_client() -> MagicMock:
     return client
 
 
-def _get_ci_redis_configs() -> list[tuple[str, int, str]]:
-    """Get Redis configurations from CI environment variables."""
-    configs = []
-
-    # Check for Redis service (GitHub Actions sets up services on localhost)
-    redis_host = os.environ.get("REDIS_HOST", "localhost")
-    redis_port = os.environ.get("REDIS_PORT", "6379")
-    if os.environ.get("CI"):
-        configs.append((redis_host, int(redis_port), "redis:latest"))
-
-    # Check for Valkey service
-    valkey_host = os.environ.get("VALKEY_HOST", "localhost")
-    valkey_port = os.environ.get("VALKEY_PORT", "6380")
-    if os.environ.get("CI"):
-        configs.append((valkey_host, int(valkey_port), "valkey/valkey:latest"))
-
-    return configs
-
-
-# Fixtures for integration tests with testcontainers or CI services
 @pytest.fixture(scope="session", params=[REDIS_IMAGE, VALKEY_IMAGE], ids=["redis", "valkey"])
 def redis_container(request: pytest.FixtureRequest) -> Generator[tuple[str, int, str]]:
     """Start a Redis/Valkey container for integration tests.
 
     This fixture is parametrized to run tests against both Redis and Valkey.
-    In CI environments, it uses pre-configured services instead of testcontainers.
 
     Yields:
         Tuple of (host, port, image_name) for the container.
     """
     image = request.param
-
-    # Check if running in CI with pre-configured services
-    if os.environ.get("CI"):
-        if image == REDIS_IMAGE:
-            host = os.environ.get("REDIS_HOST", "localhost")
-            port = int(os.environ.get("REDIS_PORT", "6379"))
-        else:
-            host = os.environ.get("VALKEY_HOST", "localhost")
-            port = int(os.environ.get("VALKEY_PORT", "6380"))
-        yield host, port, image
-        return
-
-    # Use testcontainers for local development
-    try:
-        from testcontainers.core.container import DockerContainer
-        from testcontainers.core.waiting_utils import wait_for_logs
-    except ImportError:
-        pytest.skip("testcontainers not installed")
 
     with DockerContainer(image).with_exposed_ports(6379) as container:
         wait_for_logs(container, "Ready to accept connections")
