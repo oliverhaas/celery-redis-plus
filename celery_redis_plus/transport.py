@@ -107,7 +107,7 @@ def get_redis_error_classes() -> error_classes_t:
     # This exception changed name between redis-py versions
     DataError = getattr(exceptions, "InvalidData", exceptions.DataError)
     return error_classes_t(
-        virtual.Transport.connection_errors
+        virtual.Transport.connection_errors  # type: ignore[attr-defined]
         + (
             InconsistencyError,
             socket_module.error,
@@ -117,7 +117,7 @@ def get_redis_error_classes() -> error_classes_t:
             exceptions.AuthenticationError,
             exceptions.TimeoutError,
         ),
-        virtual.Transport.channel_errors
+        virtual.Transport.channel_errors  # type: ignore[attr-defined]
         + (
             DataError,
             exceptions.InvalidResponse,
@@ -408,7 +408,7 @@ class QoS(virtual.QoS):
                             # Message already acked, remove from index
                             client.zrem(self.messages_index_key, tag_str)
                             continue
-                        M, EX, RK = loads(bytes_to_str(payload))
+                        M, EX, RK = loads(bytes_to_str(payload))  # type: ignore[call-arg]
                         # Check if delivery_tag is still in any target queue
                         queues = self.channel._lookup(EX, RK)
                         in_queue = False
@@ -429,7 +429,7 @@ class QoS(virtual.QoS):
             p = pipe.hget(self.messages_key, tag)
             pipe.multi()
             if p:
-                M, EX, RK = loads(bytes_to_str(p))
+                M, EX, RK = loads(bytes_to_str(p))  # type: ignore[call-arg]
                 self.channel._do_restore_message(M, EX, RK, pipe, leftmost, tag)
 
         with self.channel.conn_or_acquire(client) as client:
@@ -763,7 +763,7 @@ class Channel(virtual.Channel):
                 pri = self._get_message_priority(payload, reverse=False)
                 score = 0 if leftmost else _queue_score(pri)
                 pipe.zadd(queue, {delivery_tag: score})
-                pipe.hset(self.messages_key, delivery_tag, dumps([payload, exchange, routing_key]))
+                pipe.hset(self.messages_key, delivery_tag, dumps([payload, exchange, routing_key]))  # type: ignore[call-arg]
         except Exception:
             crit("Could not restore message: %r", payload, exc_info=True)
 
@@ -774,7 +774,7 @@ class Channel(virtual.Channel):
             P = pipe.hget(self.messages_key, tag)
             pipe.multi()
             if P:
-                M, EX, RK = loads(bytes_to_str(P))
+                M, EX, RK = loads(bytes_to_str(P))  # type: ignore[call-arg]
                 self._do_restore_message(M, EX, RK, pipe, leftmost, tag)
 
         with self.conn_or_acquire() as client:
@@ -796,7 +796,7 @@ class Channel(virtual.Channel):
         connection = self.connection
         if connection:
             if connection.cycle._in_protected_read:
-                return connection.cycle.after_read.add(promise(self._basic_cancel, (consumer_tag,)))
+                return connection.cycle.after_read.add(promise(self._basic_cancel, (consumer_tag,)))  # type: ignore[call-arg]
             return self._basic_cancel(consumer_tag)
         return None
 
@@ -850,7 +850,7 @@ class Channel(virtual.Channel):
                 self._queue_cycle.rotate(dest)
                 payload = self.client.hget(self.messages_key, delivery_tag)
                 if payload:
-                    message, _, _ = loads(bytes_to_str(payload))
+                    message, _, _ = loads(bytes_to_str(payload))  # type: ignore[call-arg]
                     self.connection._deliver(message, dest)
                     return True
                 raise Empty()
@@ -971,7 +971,7 @@ class Channel(virtual.Channel):
                     payload_field = fields.get(b"payload") or fields.get("payload")
                     if not payload_field:
                         continue
-                    payload = loads(bytes_to_str(payload_field))
+                    payload = loads(bytes_to_str(payload_field))  # type: ignore[call-arg]
 
                     # Set delivery tag
                     delivery_tag = self._next_delivery_tag()
@@ -992,7 +992,7 @@ class Channel(virtual.Channel):
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
         return self.client.parse_response(self.client.connection, cmd_type)
 
-    def _get(self, queue: str) -> dict[str, Any]:
+    def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:  # type: ignore[override]
         """Get single message from queue (synchronous)."""
         with self.conn_or_acquire() as client:
             result = client.zpopmin(queue, count=1)
@@ -1001,7 +1001,7 @@ class Channel(virtual.Channel):
                 delivery_tag = bytes_to_str(delivery_tag)
                 payload = client.hget(self.messages_key, delivery_tag)
                 if payload:
-                    message, _, _ = loads(bytes_to_str(payload))
+                    message, _, _ = loads(bytes_to_str(payload))  # type: ignore[call-arg]
                     return message
             raise Empty()
 
@@ -1028,7 +1028,7 @@ class Channel(virtual.Channel):
         queue_score = _queue_score(pri, now, delay_seconds)
 
         with self.conn_or_acquire() as client, client.pipeline() as pipe:
-            pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key]))
+            pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key]))  # type: ignore[call-arg]
             pipe.zadd(self.messages_index_key, {delivery_tag: now})
             pipe.zadd(queue, {delivery_tag: queue_score})
             pipe.execute()
@@ -1043,7 +1043,7 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             client.xadd(
                 name=stream_key,
-                fields={"uuid": message_uuid, "payload": dumps(message)},
+                fields={"uuid": message_uuid, "payload": dumps(message)},  # type: ignore[call-arg]
                 id="*",
                 maxlen=self.stream_maxlen,
                 approximate=True,
@@ -1066,7 +1066,15 @@ class Channel(virtual.Channel):
                 self.sep.join([routing_key or "", pattern or "", queue or ""]),
             )
 
-    def _delete(self, queue: str, exchange: str, routing_key: str, pattern: str, *args: Any, **kwargs: Any) -> None:
+    def _delete(
+        self,
+        queue: str,
+        exchange: str = "",
+        routing_key: str = "",
+        pattern: str = "",
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:  # type: ignore[override]
         self.auto_delete_queues.discard(queue)
         with self.conn_or_acquire(client=kwargs.get("client")) as client:
             client.srem(
@@ -1288,6 +1296,7 @@ class Transport(virtual.Transport):
     default_port = DEFAULT_PORT
     driver_type = "redis"
     driver_name = "redis"
+    cycle: MultiChannelPoller
 
     #: Flag indicating this transport supports native delayed delivery
     supports_native_delayed_delivery = True
@@ -1337,7 +1346,7 @@ class Transport(virtual.Transport):
         loop.on_tick.add(on_poll_start)
         loop.call_repeatedly(10, cycle.maybe_restore_messages)
 
-        visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)
+        visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]
         loop.call_repeatedly(visibility_timeout / 3, cycle.maybe_update_messages_index)
 
     def on_readable(self, fileno: int) -> Any:
