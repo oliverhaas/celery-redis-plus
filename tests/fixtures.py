@@ -13,6 +13,11 @@ if TYPE_CHECKING:
     from redis import Redis
 
 
+# Container images for testing
+REDIS_IMAGE = "redis:latest"
+VALKEY_IMAGE = "valkey/valkey:latest"
+
+
 @pytest.fixture
 def celery_app() -> Celery:
     """Create a Celery app for testing."""
@@ -40,37 +45,43 @@ def mock_redis_client() -> MagicMock:
 
 
 # Fixtures for integration tests with testcontainers
-@pytest.fixture(scope="session")
-def redis_container() -> Generator[tuple[str, int]]:
-    """Start a Redis container for integration tests.
+@pytest.fixture(scope="session", params=[REDIS_IMAGE, VALKEY_IMAGE], ids=["redis", "valkey"])
+def redis_container(request: pytest.FixtureRequest) -> Generator[tuple[str, int, str]]:
+    """Start a Redis/Valkey container for integration tests.
+
+    This fixture is parametrized to run tests against both Redis and Valkey.
 
     Yields:
-        Tuple of (host, port) for the Redis container.
+        Tuple of (host, port, image_name) for the container.
     """
     try:
-        from testcontainers.redis import RedisContainer
+        from testcontainers.core.container import DockerContainer
+        from testcontainers.core.waiting_utils import wait_for_logs
     except ImportError:
         pytest.skip("testcontainers not installed")
 
-    with RedisContainer() as redis:
-        host = redis.get_container_host_ip()
-        port = redis.get_exposed_port(6379)
-        yield host, int(port)
+    image = request.param
+
+    with DockerContainer(image).with_exposed_ports(6379) as container:
+        wait_for_logs(container, "Ready to accept connections")
+        host = container.get_container_host_ip()
+        port = container.get_exposed_port(6379)
+        yield host, int(port), image
 
 
 @pytest.fixture
-def redis_client(redis_container: tuple[str, int]) -> Generator[Redis]:
+def redis_client(redis_container: tuple[str, int, str]) -> Generator[Redis]:
     """Create a Redis client connected to the test container.
 
     Args:
-        redis_container: Tuple of (host, port) from redis_container fixture.
+        redis_container: Tuple of (host, port, image) from redis_container fixture.
 
     Yields:
         Connected Redis client.
     """
     import redis
 
-    host, port = redis_container
+    host, port, _image = redis_container
     client = redis.Redis(host=host, port=port, decode_responses=False)
     yield client
     client.flushall()
@@ -78,16 +89,16 @@ def redis_client(redis_container: tuple[str, int]) -> Generator[Redis]:
 
 
 @pytest.fixture
-def celery_app_with_redis(redis_container: tuple[str, int]) -> Celery:
+def celery_app_with_redis(redis_container: tuple[str, int, str]) -> Celery:
     """Create a Celery app configured for the Redis test container.
 
     Args:
-        redis_container: Tuple of (host, port) from redis_container fixture.
+        redis_container: Tuple of (host, port, image) from redis_container fixture.
 
     Returns:
         Configured Celery app.
     """
-    host, port = redis_container
+    host, port, _image = redis_container
     app = Celery("test_app")
     app.config_from_object(
         {
