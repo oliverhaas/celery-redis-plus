@@ -68,3 +68,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag "v${{ steps.version.outputs.current }}"
           git push origin "v${{ steps.version.outputs.current }}"
+
+      - name: Trigger publish workflow
+        if: steps.version.outputs.exists == 'false'
+        run: gh workflow run publish.yml -f version=${{ steps.version.outputs.current }}
+        env:
+          GH_TOKEN: ${{ github.token }}
