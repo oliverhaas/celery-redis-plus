@@ -1,0 +1,64 @@
+default_stages: [pre-commit]
+default_install_hook_types:
+  - pre-commit
+  - pre-push
+fail_fast: false
+
+default_language_version:
+  python: python3.13
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        stages: [pre-commit]
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  - repo: https://github.com/ComPWA/taplo-pre-commit
+    rev: v0.9.3
+    hooks:
+      - id: taplo-format
+        args:
+          ["--", "--indent-string", "  ", "--reorder-arrays", "--reorder-keys"]
+
+  - repo: https://github.com/asottile/add-trailing-comma
+    rev: v3.1.0
+    hooks:
+      - id: add-trailing-comma
+
+  - repo: local
+    hooks:
+      - id: uv-sync-check
+        name: uv-sync-check
+        language: system
+        entry: uv sync
+        pass_filenames: false
+      - id: ruff-check
+        name: ruff-check
+        entry: uv run ruff check --fix
+        language: system
+        pass_filenames: false
+      - id: ruff-format
+        name: ruff-format
+        entry: uv run ruff format
+        language: system
+        pass_filenames: false
+
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty
+        language: system
+        entry: uv run ty check
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

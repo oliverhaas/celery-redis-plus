@@ -27,7 +27,7 @@ def celery_app() -> Celery:
             "broker_url": "memory://",
             "result_backend": "cache+memory://",
             "task_always_eager": True,
-        }
+        },
     )
     return app
 
@@ -104,6 +104,6 @@ def celery_app_with_redis(redis_container: tuple[str, int, str]) -> Celery:
         {
             "broker_url": f"redis://{host}:{port}/0",
             "result_backend": f"redis://{host}:{port}/1",
-        }
+        },
     )
     return app

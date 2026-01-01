@@ -62,7 +62,6 @@ def configure_app(app: Any) -> None:
 __version__ = "0.1.0a2"
 
 
-
 # Auto-register signal handler on import
 # This ensures the delay header is added to all tasks with eta/countdown
 from . import signals as _signals  # noqa: F401, E402
