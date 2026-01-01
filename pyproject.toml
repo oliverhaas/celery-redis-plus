@@ -14,14 +14,13 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: System :: Distributed Computing",
 ]
-dependencies = ["kombu>=5.5.0", "redis>=7.1.0"]
+dependencies = ["celery>=5.5.0", "kombu>=5.5.0", "redis>=7.1.0"]
 
 [project.entry-points."kombu.transport"]
 "redis+celery-redis-plus" = "celery_redis_plus.transport:Transport"
 
 [project.optional-dependencies]
 dev = [
-  "celery>=5.4.0",
   "celery-types==0.24.0",
   "pre-commit==4.5.1",
   "pytest==9.0.2",

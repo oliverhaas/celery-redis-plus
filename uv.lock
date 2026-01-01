@@ -48,13 +48,13 @@ name = "celery-redis-plus"
 version = "0.1.0a3"
 source = { editable = "." }
 dependencies = [
+    { name = "celery" },
     { name = "kombu" },
     { name = "redis" },
 ]
 
 [package.optional-dependencies]
 dev = [
-    { name = "celery" },
     { name = "celery-types" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -65,7 +65,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "celery", marker = "extra == 'dev'", specifier = ">=5.4.0" },
+    { name = "celery", specifier = ">=5.5.0" },
     { name = "celery-types", marker = "extra == 'dev'", specifier = "==0.24.0" },
     { name = "kombu", specifier = ">=5.5.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = "==4.5.1" },
