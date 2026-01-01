@@ -134,7 +134,7 @@ class TestGlobalKeyPrefixMixin:
 
         # XREADGROUP GROUP group consumer STREAMS stream1 stream2 id1 id2
         args = mixin._prefix_args(
-            ["XREADGROUP", "GROUP", "mygroup", "consumer1", "STREAMS", "stream1", "stream2", ">", ">"]
+            ["XREADGROUP", "GROUP", "mygroup", "consumer1", "STREAMS", "stream1", "stream2", ">", ">"],
         )
         assert args[0] == "XREADGROUP"
         assert "test:stream1" in args
@@ -146,7 +146,7 @@ class TestGlobalKeyPrefixMixin:
         mixin.global_keyprefix = "prefix_"
 
         args = mixin._prefix_args(
-            ["XREADGROUP", "GROUP", "mygroup", "consumer1", "COUNT", "1", "STREAMS", "stream1", ">"]
+            ["XREADGROUP", "GROUP", "mygroup", "consumer1", "COUNT", "1", "STREAMS", "stream1", ">"],
         )
         assert "prefix_stream1" in args
         # The ID should not be prefixed
@@ -166,13 +166,15 @@ class TestGlobalKeyPrefixMixin:
         mixin.global_keyprefix = "prefix_"
 
         # EVALSHA sha numkeys key [key ...] arg [arg ...]
-        prefixed_args = mixin._prefix_args([
-            "EVALSHA",
-            "not_prefixed",  # sha
-            "1",  # numkeys
-            "fake_key",  # key
-            "not_prefixed",  # arg
-        ])
+        prefixed_args = mixin._prefix_args(
+            [
+                "EVALSHA",
+                "not_prefixed",  # sha
+                "1",  # numkeys
+                "fake_key",  # key
+                "not_prefixed",  # arg
+            ],
+        )
 
         assert prefixed_args == [
             "EVALSHA",

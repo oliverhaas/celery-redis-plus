@@ -240,11 +240,7 @@ class GlobalKeyPrefixMixin:
             pre_args = args[:args_start] if args_start and args_start > 0 else []
             post_args = args[args_end:] if args_end is not None else []
 
-            args = (
-                pre_args
-                + [self.global_keyprefix + str(arg) for arg in args[args_start:args_end]]
-                + post_args
-            )
+            args = pre_args + [self.global_keyprefix + str(arg) for arg in args[args_start:args_end]] + post_args
 
         return [command, *args]
 
@@ -397,7 +393,12 @@ class QoS(virtual.QoS):
             try:
                 with Mutex(client, self.messages_mutex_key, self.messages_mutex_expire):
                     visible = client.zrevrangebyscore(
-                        self.messages_index_key, ceil, 0, start=num and start, num=num, withscores=True
+                        self.messages_index_key,
+                        ceil,
+                        0,
+                        start=num and start,
+                        num=num,
+                        withscores=True,
                     )
                     for tag, _score in visible or []:
                         tag_str = bytes_to_str(tag)
@@ -1223,7 +1224,7 @@ class Channel(virtual.Channel):
     def _get_client(self) -> Any:
         if redis.VERSION < (3, 2, 0):
             raise VersionMismatch(
-                f"Redis transport requires redis-py versions 3.2.0 or later. You have {redis.__version__}"
+                f"Redis transport requires redis-py versions 3.2.0 or later. You have {redis.__version__}",
             )
 
         if self.global_keyprefix:
@@ -1292,7 +1293,8 @@ class Transport(virtual.Transport):
     supports_native_delayed_delivery = True
 
     implements = virtual.Transport.implements.extend(
-        asynchronous=True, exchange_type=frozenset(["direct", "topic", "fanout"])
+        asynchronous=True,
+        exchange_type=frozenset(["direct", "topic", "fanout"]),
     )
 
     if redis:
