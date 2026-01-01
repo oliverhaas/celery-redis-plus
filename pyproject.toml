@@ -1,14 +1,26 @@
 [project]
 name = "celery-redis-plus"
 version = "0.1.0a1"
-description = "Enhanced Redis transport for Celery with native delayed delivery"
+description = "Enhanced Redis transport for Celery with priority support and reliable fanout"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
-dependencies = [
-    "celery>=5.6.1",
-    "redis>=7.1.0",
+keywords = ["celery", "redis", "message-queue", "priority-queue", "kombu"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
 ]
+dependencies = [
+    "kombu>=5.5.0",
+    "redis>=5.0.0",
+]
+
+[project.entry-points."kombu.transport"]
+"redis+celery-redis-plus" = "celery_redis_plus.transport:Transport"
 
 [project.optional-dependencies]
 dev = [
