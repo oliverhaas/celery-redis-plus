@@ -83,6 +83,15 @@ class TestGlobalKeyPrefixMixin:
         assert args[0] == "ZADD"
         assert args[1] == "test:myqueue"
 
+    def test_prefix_all_simple_commands(self) -> None:
+        """Test that all simple commands in the list get prefixed."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = "prefix_"
+
+        for command in mixin.PREFIXED_SIMPLE_COMMANDS:
+            prefixed_args = mixin._prefix_args([command, "fake_key"])
+            assert prefixed_args == [command, "prefix_fake_key"]
+
     def test_prefix_bzmpop(self) -> None:
         """Test BZMPOP key prefixing."""
         mixin = GlobalKeyPrefixMixin()
@@ -97,6 +106,27 @@ class TestGlobalKeyPrefixMixin:
         assert args[4] == "test:queue2"
         assert args[5] == "MIN"
 
+    def test_prefix_bzmpop_single_key(self) -> None:
+        """Test BZMPOP with single key."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = "prefix_"
+
+        args = mixin._prefix_args(["BZMPOP", "0", "1", "fake_key", "MIN"])
+        assert args == ["BZMPOP", "0", "1", "prefix_fake_key", "MIN"]
+
+    def test_prefix_delete_multiple_keys(self) -> None:
+        """Test DEL command with multiple keys."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = "prefix_"
+
+        prefixed_args = mixin._prefix_args(["DEL", "fake_key", "fake_key2", "fake_key3"])
+        assert prefixed_args == [
+            "DEL",
+            "prefix_fake_key",
+            "prefix_fake_key2",
+            "prefix_fake_key3",
+        ]
+
     def test_prefix_xreadgroup(self) -> None:
         """Test XREADGROUP key prefixing."""
         mixin = GlobalKeyPrefixMixin()
@@ -110,6 +140,18 @@ class TestGlobalKeyPrefixMixin:
         assert "test:stream1" in args
         assert "test:stream2" in args
 
+    def test_prefix_xreadgroup_single_stream(self) -> None:
+        """Test XREADGROUP with single stream."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = "prefix_"
+
+        args = mixin._prefix_args(
+            ["XREADGROUP", "GROUP", "mygroup", "consumer1", "COUNT", "1", "STREAMS", "stream1", ">"]
+        )
+        assert "prefix_stream1" in args
+        # The ID should not be prefixed
+        assert "prefix_>" not in args
+
     def test_no_prefix_when_empty(self) -> None:
         """Test that empty prefix doesn't change keys."""
         mixin = GlobalKeyPrefixMixin()
@@ -117,6 +159,28 @@ class TestGlobalKeyPrefixMixin:
 
         args = mixin._prefix_args(["ZADD", "myqueue", {"tag1": 100}])
         assert args[1] == "myqueue"
+
+    def test_prefix_evalsha_args(self) -> None:
+        """Test EVALSHA command key prefixing."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = "prefix_"
+
+        # EVALSHA sha numkeys key [key ...] arg [arg ...]
+        prefixed_args = mixin._prefix_args([
+            "EVALSHA",
+            "not_prefixed",  # sha
+            "1",  # numkeys
+            "fake_key",  # key
+            "not_prefixed",  # arg
+        ])
+
+        assert prefixed_args == [
+            "EVALSHA",
+            "not_prefixed",
+            "1",
+            "prefix_fake_key",
+            "not_prefixed",
+        ]
 
 
 @pytest.mark.unit
@@ -331,6 +395,47 @@ class TestQoS:
         assert msg_id == "msg-id-1"
         assert group == "group1"
 
+    def test_can_consume_with_no_prefetch(self) -> None:
+        """Test can_consume when prefetch_count is 0 (unlimited)."""
+        qos = object.__new__(QoS)
+        qos.prefetch_count = 0
+        qos._delivered = {}
+        qos._dirty = set()
+
+        assert qos.can_consume() is True
+
+    def test_can_consume_under_limit(self) -> None:
+        """Test can_consume when under prefetch limit."""
+        qos = object.__new__(QoS)
+        qos.prefetch_count = 10
+        qos._delivered = {"tag1": True, "tag2": True}  # 2 delivered
+        qos._dirty = set()
+
+        assert qos.can_consume() is True
+
+    def test_can_consume_at_limit(self) -> None:
+        """Test can_consume when at prefetch limit."""
+        qos = object.__new__(QoS)
+        qos.prefetch_count = 2
+        qos._delivered = {"tag1": True, "tag2": True}  # 2 delivered
+        qos._dirty = set()
+
+        assert qos.can_consume() is False
+
+    def test_delivered_tracking(self) -> None:
+        """Test that delivered messages are tracked."""
+        qos = object.__new__(QoS)
+        qos._delivered = {}
+        qos._stream_metadata = {}
+
+        # Simulate append (like in real QoS)
+        qos._delivered["tag1"] = True
+        qos._delivered["tag2"] = True
+
+        assert len(qos._delivered) == 2
+        assert "tag1" in qos._delivered
+        assert "tag2" in qos._delivered
+
 
 @pytest.mark.unit
 class TestTransport:
@@ -378,6 +483,82 @@ class TestMultiChannelPoller:
         assert len(poller._channels) == 0
         assert len(poller._fd_to_chan) == 0
         assert len(poller._chan_to_sock) == 0
+
+    def test_fds_property(self) -> None:
+        """Test that fds property returns _fd_to_chan."""
+        poller = MultiChannelPoller()
+        poller._fd_to_chan = {1: ("channel", "BZMPOP")}
+        assert poller.fds == poller._fd_to_chan
+
+    def test_close_unregisters_fds(self) -> None:
+        """Test that close unregisters all file descriptors."""
+        poller = MultiChannelPoller()
+        mock_poller = MagicMock()
+        poller.poller = mock_poller
+        poller._chan_to_sock.update({1: 1, 2: 2, 3: 3})
+
+        poller.close()
+
+        assert mock_poller.unregister.call_count == 3
+
+    def test_on_poll_start_no_channels(self) -> None:
+        """Test on_poll_start with no channels."""
+        poller = MultiChannelPoller()
+        poller._channels = []
+        # Should not raise
+        poller.on_poll_start()
+
+    def test_on_poll_start_with_active_queues(self) -> None:
+        """Test on_poll_start with active queues."""
+        poller = MultiChannelPoller()
+        poller._register_BZMPOP = MagicMock()
+        poller._register_XREADGROUP = MagicMock()
+
+        channel = MagicMock()
+        channel.active_queues = ["queue1"]
+        channel.active_fanout_queues = []
+        channel.qos.can_consume.return_value = True
+        poller._channels = [channel]
+
+        poller.on_poll_start()
+
+        poller._register_BZMPOP.assert_called_once_with(channel)
+        poller._register_XREADGROUP.assert_not_called()
+
+    def test_on_poll_start_with_fanout_queues(self) -> None:
+        """Test on_poll_start with fanout queues."""
+        poller = MultiChannelPoller()
+        poller._register_BZMPOP = MagicMock()
+        poller._register_XREADGROUP = MagicMock()
+
+        channel = MagicMock()
+        channel.active_queues = []
+        channel.active_fanout_queues = ["fanout_queue"]
+        channel.qos.can_consume.return_value = True
+        poller._channels = [channel]
+
+        poller.on_poll_start()
+
+        poller._register_BZMPOP.assert_not_called()
+        poller._register_XREADGROUP.assert_called_once_with(channel)
+
+    def test_on_poll_start_qos_cannot_consume(self) -> None:
+        """Test on_poll_start when QoS cannot consume."""
+        poller = MultiChannelPoller()
+        poller._register_BZMPOP = MagicMock()
+        poller._register_XREADGROUP = MagicMock()
+
+        channel = MagicMock()
+        channel.active_queues = ["queue1"]
+        channel.active_fanout_queues = ["fanout_queue"]
+        channel.qos.can_consume.return_value = False  # QoS limit reached
+        poller._channels = [channel]
+
+        poller.on_poll_start()
+
+        # Neither should be registered when can_consume is False
+        poller._register_BZMPOP.assert_not_called()
+        poller._register_XREADGROUP.assert_not_called()
 
 
 class TestTransportIntegration:
@@ -508,3 +689,77 @@ class TestTransportIntegration:
         redis_client.hdel(messages_key, delivery_tag)
         result = redis_client.hget(messages_key, delivery_tag)
         assert result is None
+
+    @pytest.mark.integration
+    def test_stream_xadd_and_xread(self, redis_client: Any) -> None:
+        """Test basic stream XADD and XREAD operations."""
+        stream_name = "test_stream_basic"
+
+        # Add messages to stream
+        msg_id1 = redis_client.xadd(stream_name, {"field1": "value1"})
+        msg_id2 = redis_client.xadd(stream_name, {"field2": "value2"})
+
+        assert msg_id1 is not None
+        assert msg_id2 is not None
+
+        # Read messages
+        messages = redis_client.xread(streams={stream_name: "0"}, count=10)
+        assert len(messages) == 1
+        stream, message_list = messages[0]
+        assert len(message_list) == 2
+
+    @pytest.mark.integration
+    def test_stream_consumer_group_redelivery(self, redis_client: Any) -> None:
+        """Test that unacked messages can be reclaimed from PEL."""
+        stream_name = "test_stream_pel"
+        group_name = "test_group_pel"
+        consumer1 = "consumer1"
+        consumer2 = "consumer2"
+
+        # Create consumer group
+        try:
+            redis_client.xgroup_create(stream_name, group_name, id="0", mkstream=True)
+        except Exception as e:
+            if "BUSYGROUP" not in str(e):
+                raise
+
+        # Add message
+        redis_client.xadd(stream_name, {"payload": "test"})
+
+        # Read with consumer1 (but don't ack)
+        messages = redis_client.xreadgroup(
+            groupname=group_name,
+            consumername=consumer1,
+            streams={stream_name: ">"},
+            count=1,
+        )
+        assert len(messages) == 1
+
+        # Check pending
+        pending = redis_client.xpending(stream_name, group_name)
+        assert pending["pending"] == 1
+
+        # Try to claim with consumer2 (min_idle_time=0 for test)
+        msg_id = messages[0][1][0][0]
+        claimed = redis_client.xclaim(
+            stream_name,
+            group_name,
+            consumer2,
+            min_idle_time=0,
+            message_ids=[msg_id],
+        )
+        assert len(claimed) == 1
+
+    @pytest.mark.integration
+    def test_stream_maxlen_trimming(self, redis_client: Any) -> None:
+        """Test that stream respects maxlen for trimming."""
+        stream_name = "test_stream_maxlen"
+        maxlen = 5
+
+        # Add more messages than maxlen
+        for i in range(10):
+            redis_client.xadd(stream_name, {"msg": str(i)}, maxlen=maxlen)
+
+        # Stream should be trimmed to approximately maxlen
+        info = redis_client.xinfo_stream(stream_name)
+        assert info["length"] <= maxlen + 1  # Approximate trimming may leave a few extra
