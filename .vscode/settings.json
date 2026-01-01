@@ -1,8 +1,105 @@
 {
+    "python.terminal.activateEnvironment": true,
+    "python.analysis.autoImportCompletions": true,
+    "python.languageServer": "Pylance",
+    "ruff.configuration": "./pyproject.toml",
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "explicit",
+            "source.fixAll": "explicit"
+        }
+    },
+    "[toml]": {
+        "editor.defaultFormatter": "tamasfe.even-better-toml",
+        "editor.formatOnSave": true
+    },
+    "[json]": {
+        "editor.defaultFormatter": "vscode.json-language-features",
+        "editor.formatOnSave": true
+    },
+    "[yaml]": {
+        "editor.defaultFormatter": "redhat.vscode-yaml",
+        "editor.formatOnSave": true,
+        "editor.insertSpaces": true,
+        "editor.tabSize": 2
+    },
+    "python.testing.pytestArgs": [],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true,
+    "cSpell.allowCompoundWords": true,
+    "cSpell.ignorePaths": [
+        ".venv",
+        ".vscode"
+    ],
+    "cSpell.dictionaries": [
+        "bash",
+        "computing-acronyms",
+        "docker",
+        "en_US",
+        "filetypes",
+        "git",
+        "python",
+        "python-common",
+        "softwareTerms"
+    ],
     "cSpell.words": [
+        "bootstep",
+        "bootsteps",
+        "brpoplpush",
+        "BUSYGROUP",
+        "BZMPOP",
+        "consumername",
+        "DELCONSUMER",
+        "EVALSHA",
+        "eventio",
+        "fanout",
+        "HDEL",
+        "HGET",
+        "HLEN",
+        "HSET",
+        "keyprefix",
+        "kombu",
+        "llen",
+        "lpush",
+        "mkstream",
+        "myapp",
+        "myexchange",
+        "mygroup",
+        "myqueue",
+        "myroute",
+        "numkeys",
         "pytest",
+        "rpoplpush",
+        "SADD",
+        "SMEMBERS",
+        "SREM",
+        "testcontainers",
+        "timedelta",
+        "unacked",
+        "Valkey",
         "venv",
-        "ZSET",
-        "ZSETs"
+        "VIRTUALHOST",
+        "vrestore",
+        "withscores",
+        "XACK",
+        "XADD",
+        "XAUTOCLAIM",
+        "xclaim",
+        "XGROUP",
+        "XINFO",
+        "xpending",
+        "XPENDING",
+        "xread",
+        "XREADGROUP",
+        "ZADD",
+        "ZCARD",
+        "zpopmin",
+        "ZPOPMIN",
+        "zrangebyscore",
+        "ZREM",
+        "ZREVRANGEBYSCORE",
+        "ZSET"
     ]
 }
