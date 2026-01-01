@@ -25,6 +25,7 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
+    { name = "celery-types" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "ruff" },
@@ -34,6 +35,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "celery-types", marker = "extra == 'dev'", specifier = "==0.24.0" },
     { name = "kombu", specifier = ">=5.5.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = "==4.5.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==9.0.2" },
@@ -43,6 +45,18 @@ requires-dist = [
     { name = "ty", marker = "extra == 'dev'", specifier = "==0.0.8" },
 ]
 provides-extras = ["dev"]
+
+[[package]]
+name = "celery-types"
+version = "0.24.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/72/25/2276a1f00f8ab9fc88128c939333933a24db7df1d75aa57ecc27b7dd3a22/celery_types-0.24.0.tar.gz", hash = "sha256:c93fbcd0b04a9e9c2f55d5540aca4aa1ea4cc06a870c0c8dee5062fdd59663fe", size = 33148, upload-time = "2025-12-23T17:16:30.847Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3a/7e/3252cba5f5c9a65a3f52a69734d8e51e023db8981022b503e8183cf0225e/celery_types-0.24.0-py3-none-any.whl", hash = "sha256:a21e04681e68719a208335e556a79909da4be9c5e0d6d2fd0dd4c5615954b3fd", size = 60473, upload-time = "2025-12-23T17:16:29.89Z" },
+]
 
 [[package]]
 name = "certifi"
