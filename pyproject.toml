@@ -14,7 +14,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Topic :: System :: Distributed Computing",
 ]
-dependencies = ["kombu>=5.5.0", "redis>=5.0.0"]
+dependencies = ["kombu>=5.5.0", "redis>=7.1.0"]
 
 [project.entry-points."kombu.transport"]
 "redis+celery-redis-plus" = "celery_redis_plus.transport:Transport"

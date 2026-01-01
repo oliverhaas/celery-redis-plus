@@ -70,7 +70,7 @@ requires-dist = [
     { name = "kombu", specifier = ">=5.5.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = "==4.5.1" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==9.0.2" },
-    { name = "redis", specifier = ">=5.0.0" },
+    { name = "redis", specifier = ">=7.1.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.14.10" },
     { name = "testcontainers", extras = ["redis"], marker = "extra == 'dev'", specifier = "==4.13.3" },
     { name = "ty", marker = "extra == 'dev'", specifier = "==0.0.8" },
