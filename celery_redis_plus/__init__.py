@@ -59,7 +59,7 @@ def configure_app(app: Any) -> None:
     app.steps["consumer"].add(DelayedDeliveryBootstep)
 
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a2"
 
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "celery-redis-plus"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "Enhanced Redis transport for Celery with priority support and reliable fanout"
 readme = "README.md"
 license = "MIT"
