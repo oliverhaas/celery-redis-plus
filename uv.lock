@@ -53,7 +53,7 @@ dependencies = [
     { name = "redis" },
 ]
 
-[package.optional-dependencies]
+[package.dev-dependencies]
 dev = [
     { name = "celery-types" },
     { name = "pre-commit" },
@@ -66,16 +66,19 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "celery", specifier = ">=5.5.0" },
-    { name = "celery-types", marker = "extra == 'dev'", specifier = "==0.24.0" },
     { name = "kombu", specifier = ">=5.5.0" },
-    { name = "pre-commit", marker = "extra == 'dev'", specifier = "==4.5.1" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = "==9.0.2" },
     { name = "redis", specifier = ">=7.1.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.14.10" },
-    { name = "testcontainers", extras = ["redis"], marker = "extra == 'dev'", specifier = "==4.13.3" },
-    { name = "ty", marker = "extra == 'dev'", specifier = "==0.0.8" },
 ]
-provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "celery-types", specifier = "==0.24.0" },
+    { name = "pre-commit", specifier = "==4.5.1" },
+    { name = "pytest", specifier = "==9.0.2" },
+    { name = "ruff", specifier = "==0.14.10" },
+    { name = "testcontainers", extras = ["redis"], specifier = "==4.13.3" },
+    { name = "ty", specifier = "==0.0.8" },
+]
 
 [[package]]
 name = "celery-types"

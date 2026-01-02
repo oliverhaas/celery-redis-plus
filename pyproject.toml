@@ -19,7 +19,7 @@ dependencies = ["celery>=5.5.0", "kombu>=5.5.0", "redis>=7.1.0"]
 [project.entry-points."kombu.transport"]
 "redis+celery-redis-plus" = "celery_redis_plus.transport:Transport"
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
   "celery-types==0.24.0",
   "pre-commit==4.5.1",
