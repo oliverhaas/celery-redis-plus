@@ -186,9 +186,6 @@ class GlobalKeyPrefixMixin:
         "ZREVRANGEBYSCORE",
         "ZSCORE",
         "XADD",
-        "XACK",
-        "XGROUP CREATE",
-        "XRANGE",
     ]
 
     @staticmethod
@@ -206,10 +203,10 @@ class GlobalKeyPrefixMixin:
         return pre_args + keys + post_args
 
     @staticmethod
-    def _prefix_xreadgroup_args(args: list[Any], prefix: str) -> list[Any]:
-        """Prefix keys in XREADGROUP command.
+    def _prefix_xread_args(args: list[Any], prefix: str) -> list[Any]:
+        """Prefix keys in XREAD command.
 
-        XREADGROUP GROUP <group> <consumer> [COUNT n] [BLOCK ms] STREAMS <key1> ... <id1> ...
+        XREAD [COUNT n] [BLOCK ms] STREAMS <key1> ... <id1> ...
         """
         streams_idx = None
         for i, arg in enumerate(args):
@@ -228,7 +225,7 @@ class GlobalKeyPrefixMixin:
         "DEL": {"args_start": 0, "args_end": None},
         "WATCH": {"args_start": 0, "args_end": None},
         "BZMPOP": _prefix_bzmpop_args,
-        "XREADGROUP": _prefix_xreadgroup_args,
+        "XREAD": _prefix_xread_args,
     }
 
     def _prefix_args(self, args: list[Any]) -> list[Any]:
@@ -307,8 +304,8 @@ class QoS(virtual.QoS):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._vrestore_count = 0
-        # For streams fanout: track stream/message_id/group for ack
-        self._stream_metadata: dict[str, tuple[str, str, str]] = {}
+        # For streams fanout: track delivery tags that came from fanout (no ack needed)
+        self._fanout_tags: set[str] = set()
 
     def append(self, message: Any, delivery_tag: str) -> None:
         # Message is already stored in messages hash at publish time.
@@ -316,45 +313,18 @@ class QoS(virtual.QoS):
         super().append(message, delivery_tag)
 
     def ack(self, delivery_tag: str) -> None:
-        # Check if this is a stream message (fanout)
-        if delivery_tag in self._stream_metadata:
-            stream, message_id, group_name = self._stream_metadata.pop(delivery_tag)
-            # Strip global prefix since client will add it
-            prefix = self.channel.global_keyprefix
-            if prefix and stream.startswith(prefix):
-                stream = stream[len(prefix) :]
-            self.channel.client.xack(stream, group_name, message_id)
+        # Fanout messages don't need Redis cleanup (no consumer groups)
+        if delivery_tag in self._fanout_tags:
+            self._fanout_tags.discard(delivery_tag)
         else:
             # Regular sorted set message
             self._remove_from_indices(delivery_tag).execute()
         super().ack(delivery_tag)
 
     def reject(self, delivery_tag: str, requeue: bool = False) -> None:
-        # Check if this is a stream message (fanout)
-        if delivery_tag in self._stream_metadata:
-            stream, message_id, group_name = self._stream_metadata.pop(delivery_tag)
-            prefix = self.channel.global_keyprefix
-            if prefix and stream.startswith(prefix):
-                stream = stream[len(prefix) :]
-
-            if requeue:
-                # Re-add to stream
-                try:
-                    messages = self.channel.client.xrange(stream, min=message_id, max=message_id, count=1)
-                    if messages:
-                        _msg_id, fields = messages[0]
-                        self.channel.client.xadd(
-                            name=stream,
-                            fields=fields,
-                            id="*",
-                            maxlen=self.channel.stream_maxlen,
-                            approximate=True,
-                        )
-                        self.channel.client.xack(stream, group_name, message_id)
-                except Exception:
-                    crit("Failed to requeue stream message %r", delivery_tag, exc_info=True)
-            else:
-                self.channel.client.xack(stream, group_name, message_id)
+        # Fanout messages: requeue not supported (fire-and-forget broadcast)
+        if delivery_tag in self._fanout_tags:
+            self._fanout_tags.discard(delivery_tag)
             super().ack(delivery_tag)
         else:
             # Regular sorted set message
@@ -387,8 +357,8 @@ class QoS(virtual.QoS):
         now = time()
         with self.channel.conn_or_acquire() as client, client.pipeline() as pipe:
             for tag in self._delivered:
-                # Skip stream messages
-                if tag not in self._stream_metadata:
+                # Skip fanout messages (they don't use the index)
+                if tag not in self._fanout_tags:
                     pipe.zadd(self.messages_index_key, {tag: now})
             pipe.execute()
 
@@ -529,14 +499,14 @@ class MultiChannelPoller:
         if not channel._in_poll:
             channel._bzmpop_start()
 
-    def _register_XREADGROUP(self, channel: Channel) -> None:
-        """Enable XREADGROUP mode for channel (fanout streams)."""
-        ident = channel, channel.client, "XREADGROUP"
-        if not self._client_registered(channel, channel.client, "XREADGROUP"):
+    def _register_XREAD(self, channel: Channel) -> None:
+        """Enable XREAD mode for channel (fanout streams)."""
+        ident = channel, channel.client, "XREAD"
+        if not self._client_registered(channel, channel.client, "XREAD"):
             channel._in_fanout_poll = False
             self._register(*ident)
         if not channel._in_fanout_poll:
-            channel._xreadgroup_start()
+            channel._xread_start()
 
     def on_poll_start(self) -> None:
         for channel in self._channels:
@@ -545,7 +515,7 @@ class MultiChannelPoller:
                     self._register_BZMPOP(channel)
             if channel.active_fanout_queues:
                 if channel.qos.can_consume():
-                    self._register_XREADGROUP(channel)
+                    self._register_XREAD(channel)
 
     def on_poll_init(self, poller: Any) -> None:
         self.poller = poller
@@ -588,7 +558,7 @@ class MultiChannelPoller:
                         self._register_BZMPOP(channel)
                 if channel.active_fanout_queues:
                     if channel.qos.can_consume():
-                        self._register_XREADGROUP(channel)
+                        self._register_XREAD(channel)
 
             events = self.poller.poll(timeout)
             if events:
@@ -698,7 +668,9 @@ class Channel(virtual.Channel):
         self.active_fanout_queues: set[str] = set()
         self.auto_delete_queues: set[str] = set()
         self._fanout_to_queue: dict[str, str] = {}
-        self.handlers = {"BZMPOP": self._bzmpop_read, "XREADGROUP": self._xreadgroup_read}
+        self.handlers = {"BZMPOP": self._bzmpop_read, "XREAD": self._xread_read}
+        # Track last-read stream ID per stream for fanout (start with $ = only new messages)
+        self._stream_offsets: dict[str, str] = {}
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -866,68 +838,39 @@ class Channel(virtual.Channel):
             return f"{self.keyprefix_fanout}{exchange}/{routing_key}"
         return f"{self.keyprefix_fanout}{exchange}"
 
-    def _fanout_consumer_group(self, queue: str) -> str:
-        """Get consumer group name for fanout queue."""
-        return queue
-
-    @cached_property
-    def consumer_id(self) -> str:
-        """Unique consumer identifier."""
-        import os
-        import threading
-
-        hostname = socket_module.gethostname()
-        pid = os.getpid()
-        thread_id = threading.get_ident()
-        return f"{hostname}-{pid}-{thread_id}"
-
-    def _ensure_consumer_group(self, stream: str, group: str) -> None:
-        """Ensure consumer group exists for stream."""
-        try:
-            self.client.xgroup_create(name=stream, groupname=group, id="0", mkstream=True)
-        except self.ResponseError as e:
-            if "BUSYGROUP" not in str(e):
-                raise
-
-    def _xreadgroup_start(self, timeout: float | None = None) -> None:
-        """Start XREADGROUP for fanout streams."""
+    def _xread_start(self, timeout: float | None = None) -> None:
+        """Start XREAD for fanout streams (true broadcast - every consumer gets every message)."""
         if timeout is None:
             timeout = self.connection.polling_interval or 1
 
         streams: dict[str, str] = {}
-        self._pending_fanout_groups: dict[str, str] = {}
 
         for queue in self.active_fanout_queues:
             if queue in self._fanout_queues:
                 exchange, routing_key = self._fanout_queues[queue]
                 stream_key = self._fanout_stream_key(exchange, routing_key)
-                group_name = self._fanout_consumer_group(queue)
-                self._ensure_consumer_group(stream_key, group_name)
-                streams[stream_key] = ">"
-                self._pending_fanout_groups[stream_key] = group_name
+                # Use stored offset or "$" for only new messages
+                offset = self._stream_offsets.get(stream_key, "$")
+                streams[stream_key] = offset
 
         if not streams:
             return
 
         self._in_fanout_poll = self.client.connection
 
-        # Build and send command - we can only use one group per XREADGROUP call
-        # so we just use the first one
-        first_stream = next(iter(streams.keys()))
-        first_group = self._pending_fanout_groups[first_stream]
+        # Build XREAD command
+        stream_keys = list(streams.keys())
+        stream_ids = [streams[k] for k in stream_keys]
 
         command_args: list[Any] = [
-            "XREADGROUP",
-            "GROUP",
-            first_group,
-            self.consumer_id,
+            "XREAD",
             "COUNT",
             "1",
             "BLOCK",
             str(int((timeout or 0) * 1000)),
             "STREAMS",
-            first_stream,
-            ">",
+            *stream_keys,
+            *stream_ids,
         ]
 
         if self.global_keyprefix:
@@ -935,11 +878,11 @@ class Channel(virtual.Channel):
 
         self.client.connection.send_command(*command_args)
 
-    def _xreadgroup_read(self, **options: Any) -> bool:
-        """Read messages from XREADGROUP."""
+    def _xread_read(self, **options: Any) -> bool:
+        """Read messages from XREAD (fanout broadcast)."""
         try:
             try:
-                messages = self.client.parse_response(self.client.connection, "XREADGROUP", **options)
+                messages = self.client.parse_response(self.client.connection, "XREAD", **options)
             except self.connection_errors:
                 self.client.connection.disconnect()
                 raise
@@ -952,14 +895,20 @@ class Channel(virtual.Channel):
                 for message_id, fields in message_list:
                     message_id_str = bytes_to_str(message_id) if isinstance(message_id, bytes) else message_id
 
+                    # Update offset for this stream
+                    # Strip prefix if present for storing offset
+                    offset_key = stream_str
+                    prefix = self.global_keyprefix
+                    if prefix and stream_str.startswith(prefix):
+                        offset_key = stream_str[len(prefix) :]
+                    self._stream_offsets[offset_key] = message_id_str
+
                     # Find which queue this stream belongs to
                     queue_name = None
-                    group_name = None
                     for queue, (exchange, routing_key) in self._fanout_queues.items():
                         fanout_stream = self._fanout_stream_key(exchange, routing_key)
                         if stream_str.endswith(fanout_stream) or stream_str == fanout_stream:
                             queue_name = queue
-                            group_name = self._fanout_consumer_group(queue)
                             break
 
                     if not queue_name:
@@ -975,8 +924,8 @@ class Channel(virtual.Channel):
                     delivery_tag = self._next_delivery_tag()
                     payload["properties"]["delivery_tag"] = delivery_tag
 
-                    # Store metadata for ack
-                    self.qos._stream_metadata[delivery_tag] = (stream_str, message_id_str, group_name)
+                    # Mark as fanout message (no ack needed)
+                    self.qos._fanout_tags.add(delivery_tag)
 
                     # Deliver message
                     self.connection._deliver(payload, queue_name)
@@ -985,7 +934,6 @@ class Channel(virtual.Channel):
             raise Empty()
         finally:
             self._in_fanout_poll = None  # type: ignore[assignment]
-            self._pending_fanout_groups = {}
 
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
         return self.client.parse_response(self.client.connection, cmd_type)
@@ -1054,10 +1002,6 @@ class Channel(virtual.Channel):
     def _queue_bind(self, exchange: str, routing_key: str, pattern: str, queue: str) -> None:
         if self.typeof(exchange).type == "fanout":
             self._fanout_queues[queue] = (exchange, routing_key.replace("#", "*"))
-            # Ensure consumer group for fanout
-            stream_key = self._fanout_stream_key(exchange, routing_key)
-            group_name = self._fanout_consumer_group(queue)
-            self._ensure_consumer_group(stream_key, group_name)
         with self.conn_or_acquire() as client:
             client.sadd(
                 self.keyprefix_queue % (exchange,),
@@ -1108,7 +1052,7 @@ class Channel(virtual.Channel):
                 pass
         if self._in_fanout_poll:
             try:
-                self._xreadgroup_read()
+                self._xread_read()
             except Empty:
                 pass
         if not self.closed:
