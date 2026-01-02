@@ -52,10 +52,12 @@ from kombu.utils.url import _parse_url
 from vine import promise
 
 from .constants import (
+    DEFAULT_DELAYED_CHECK_INTERVAL,
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
     DELAY_HEADER,
+    DELAYED_QUEUE_SUFFIX,
     PRIORITY_SCORE_MULTIPLIER,
 )
 
@@ -77,18 +79,16 @@ DEFAULT_DB = 0
 error_classes_t = namedtuple("error_classes_t", ("connection_errors", "channel_errors"))
 
 
-def _queue_score(priority: int, timestamp: float | None = None, delay_seconds: float = 0.0) -> float:
+def _queue_score(priority: int, timestamp: float | None = None) -> float:
     """Compute sorted set score for queue ordering.
 
     Higher priority number = higher priority = lower score = popped first.
     This matches RabbitMQ semantics where priority 255 is highest, 0 is lowest.
     Within same priority, earlier timestamp = lower score = popped first (FIFO).
-    Delayed messages have future timestamps in their score.
 
     Args:
         priority: Message priority (0-255, higher is higher priority, matching RabbitMQ)
         timestamp: Unix timestamp in seconds (defaults to current time)
-        delay_seconds: Additional delay in seconds for delayed delivery
 
     Returns:
         Float score for ZADD
@@ -97,7 +97,7 @@ def _queue_score(priority: int, timestamp: float | None = None, delay_seconds: f
         timestamp = time()
     # Invert priority so higher priority number = lower score = popped first
     # Multiply by large factor to leave room for millisecond timestamps
-    return (255 - priority) * PRIORITY_SCORE_MULTIPLIER + int((timestamp + delay_seconds) * 1000)
+    return (255 - priority) * PRIORITY_SCORE_MULTIPLIER + int(timestamp * 1000)
 
 
 def get_redis_error_classes() -> error_classes_t:
@@ -182,6 +182,7 @@ class GlobalKeyPrefixMixin:
         "ZADD",
         "ZCARD",
         "ZPOPMIN",
+        "ZRANGEBYSCORE",
         "ZREM",
         "ZREVRANGEBYSCORE",
         "ZSCORE",
@@ -387,9 +388,9 @@ class QoS(virtual.QoS):
                             # Message already acked, remove from index
                             client.zrem(self.messages_index_key, tag_str)
                             continue
-                        M, EX, RK = loads(bytes_to_str(payload))  # type: ignore[call-arg]
+                        _message, exchange, routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
                         # Check if delivery_tag is still in any target queue
-                        queues = self.channel._lookup(EX, RK)
+                        queues = self.channel._lookup(exchange, routing_key)
                         in_queue = False
                         for queue in queues:
                             if client.zscore(queue, tag_str) is not None:
@@ -408,8 +409,8 @@ class QoS(virtual.QoS):
             p = pipe.hget(self.messages_key, tag)
             pipe.multi()
             if p:
-                M, EX, RK = loads(bytes_to_str(p))  # type: ignore[call-arg]
-                self.channel._do_restore_message(M, EX, RK, pipe, leftmost, tag)
+                message, exchange, routing_key, _priority = loads(bytes_to_str(p))  # type: ignore[call-arg]
+                self.channel._do_restore_message(message, exchange, routing_key, pipe, leftmost, tag)
 
         with self.channel.conn_or_acquire(client) as client:
             client.transaction(restore_transaction, self.messages_key)
@@ -534,6 +535,18 @@ class MultiChannelPoller:
         for channel in self._channels:
             if channel.active_queues:
                 channel.qos.maybe_update_messages_index()
+
+    def maybe_move_ready_delayed_messages(self) -> int:
+        """Move delayed messages that are ready to their destination queues.
+
+        Returns:
+            Total number of messages moved across all channels.
+        """
+        total_moved = 0
+        for channel in self._channels:
+            if channel.active_queues:
+                total_moved += channel.move_ready_delayed_messages()
+        return total_moved
 
     def on_readable(self, fileno: int) -> bool | None:
         chan, cmd_type = self._fd_to_chan[fileno]
@@ -734,8 +747,8 @@ class Channel(virtual.Channel):
             if delivery_tag is None:
                 delivery_tag = payload["properties"]["delivery_tag"]
             for queue in self._lookup(exchange, routing_key):
-                pri = self._get_message_priority(payload, reverse=False)
-                score = 0 if leftmost else _queue_score(pri)
+                priority = self._get_message_priority(payload, reverse=False)
+                score = 0 if leftmost else _queue_score(priority)
                 pipe.zadd(queue, {delivery_tag: score})
                 pipe.hset(self.messages_key, delivery_tag, dumps([payload, exchange, routing_key]))  # type: ignore[call-arg]
         except Exception:
@@ -745,11 +758,11 @@ class Channel(virtual.Channel):
         tag = message.delivery_tag
 
         def restore_transaction(pipe: Any) -> None:
-            P = pipe.hget(self.messages_key, tag)
+            payload = pipe.hget(self.messages_key, tag)
             pipe.multi()
-            if P:
-                M, EX, RK = loads(bytes_to_str(P))  # type: ignore[call-arg]
-                self._do_restore_message(M, EX, RK, pipe, leftmost, tag)
+            if payload:
+                message, exchange, routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
+                self._do_restore_message(message, exchange, routing_key, pipe, leftmost, tag)
 
         with self.conn_or_acquire() as client:
             client.transaction(restore_transaction, self.messages_key)
@@ -822,7 +835,7 @@ class Channel(virtual.Channel):
                 delivery_tag = bytes_to_str(delivery_tag)
                 payload = self.client.hget(self.messages_key, delivery_tag)
                 if payload:
-                    message, _, _ = loads(bytes_to_str(payload))  # type: ignore[call-arg]
+                    message, _exchange, _routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
                     self.connection._deliver(message, dest)
                     return True
                 raise Empty()
@@ -947,7 +960,7 @@ class Channel(virtual.Channel):
                 delivery_tag = bytes_to_str(delivery_tag)
                 payload = client.hget(self.messages_key, delivery_tag)
                 if payload:
-                    message, _, _ = loads(bytes_to_str(payload))  # type: ignore[call-arg]
+                    message, _exchange, _routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
                     return message
             raise Empty()
 
@@ -955,9 +968,67 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             return client.zcard(queue)
 
+    def move_ready_delayed_messages(self) -> int:
+        """Move messages from delayed queues to ready queues when their eta has passed.
+
+        For each active queue, checks the corresponding {queue}:delayed sorted set
+        for messages with score <= current time. Those messages are moved to the
+        main queue with the correct priority+timestamp score.
+
+        Returns:
+            Number of messages moved.
+        """
+        if not self.active_queues:
+            return 0
+
+        now = time()
+        moved = 0
+
+        with self.conn_or_acquire() as client:
+            for queue in list(self.active_queues):
+                delayed_queue = queue + DELAYED_QUEUE_SUFFIX
+
+                # Get messages that are ready (score <= now)
+                # Use ZRANGEBYSCORE to get messages with score <= current time
+                ready_tags = client.zrangebyscore(delayed_queue, "-inf", now, withscores=False)
+
+                if not ready_tags:
+                    continue
+
+                with client.pipeline() as pipe:
+                    for tag_bytes in ready_tags:
+                        tag = bytes_to_str(tag_bytes)
+
+                        # Get message data to extract priority
+                        payload = client.hget(self.messages_key, tag)
+                        if not payload:
+                            # Message was deleted, remove from delayed queue
+                            pipe.zrem(delayed_queue, tag)
+                            continue
+
+                        _message, _exchange, _routing_key, priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
+
+                        # Calculate new score with priority and current time
+                        queue_score = _queue_score(priority, now)
+
+                        # Move from delayed queue to ready queue
+                        pipe.zrem(delayed_queue, tag)
+                        pipe.zadd(queue, {tag: queue_score})
+                        moved += 1
+
+                    pipe.execute()
+
+        return moved
+
     def _put(self, queue: str, message: dict[str, Any], **kwargs: Any) -> None:
-        """Deliver message to queue using sorted set."""
-        pri = self._get_message_priority(message, reverse=False)
+        """Deliver message to queue using sorted set.
+
+        Messages with short delay (≤ DEFAULT_DELAYED_CHECK_INTERVAL) go to {queue}
+        with a future timestamp in the score. The worker will honor the eta.
+        Messages with longer delay go to {queue}:delayed with eta as score,
+        and are moved to {queue} by a background process when ready.
+        """
+        priority = self._get_message_priority(message, reverse=False)
         props = message["properties"]
         delivery_tag = props["delivery_tag"]
         delivery_info = props["delivery_info"]
@@ -971,12 +1042,24 @@ class Channel(virtual.Channel):
             delay_seconds = 0.0
 
         now = time()
-        queue_score = _queue_score(pri, now, delay_seconds)
 
         with self.conn_or_acquire() as client, client.pipeline() as pipe:
-            pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key]))  # type: ignore[call-arg]
-            pipe.zadd(self.messages_index_key, {delivery_tag: now})
-            pipe.zadd(queue, {delivery_tag: queue_score})
+            if delay_seconds > DEFAULT_DELAYED_CHECK_INTERVAL:
+                # Long delay: store in {queue}:delayed with eta timestamp as score
+                # Background process will move it to main queue when ready
+                eta_timestamp = now + delay_seconds
+                delayed_queue = queue + DELAYED_QUEUE_SUFFIX
+                # Store message with priority info for later retrieval
+                pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key, priority]))  # type: ignore[call-arg]
+                pipe.zadd(self.messages_index_key, {delivery_tag: now})
+                pipe.zadd(delayed_queue, {delivery_tag: eta_timestamp})
+            else:
+                # Immediate or short delay: store in queue with priority+timestamp score
+                # For short delays, worker will honor the eta when it receives the message
+                queue_score = _queue_score(priority, now + delay_seconds)
+                pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key, priority]))  # type: ignore[call-arg]
+                pipe.zadd(self.messages_index_key, {delivery_tag: now})
+                pipe.zadd(queue, {delivery_tag: queue_score})
             pipe.execute()
 
     def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
@@ -1298,12 +1381,17 @@ class Transport(virtual.Transport):
         visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]
         loop.call_repeatedly(visibility_timeout / 3, cycle.maybe_update_messages_index)
 
+        # Check for ready delayed messages every DEFAULT_DELAYED_CHECK_INTERVAL seconds
+        loop.call_repeatedly(DEFAULT_DELAYED_CHECK_INTERVAL, cycle.maybe_move_ready_delayed_messages)
+
     def on_readable(self, fileno: int) -> Any:
         """Handle AIO event for one of our file descriptors."""
         return self.cycle.on_readable(fileno)
 
     def setup_native_delayed_delivery(self, connection: Connection, queues: list[str]) -> None:
-        """No-op: delayed delivery is handled inline via score-based retrieval."""
+        """Set up native delayed delivery (background processing via event loop callback)."""
+        # Delayed delivery is now handled by cycle.maybe_move_ready_delayed_messages
+        # which is registered in register_with_event_loop
 
     def teardown_native_delayed_delivery(self) -> None:
-        """No-op: no background processing to tear down."""
+        """Tear down native delayed delivery (no-op, event loop handles cleanup)."""

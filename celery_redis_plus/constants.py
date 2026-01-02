@@ -24,3 +24,9 @@ DEFAULT_HEALTH_CHECK_INTERVAL = 25
 
 # Default stream maximum length for fanout streams
 DEFAULT_STREAM_MAXLEN = 10000
+
+# Suffix for delayed message queues (stores messages until their eta)
+DELAYED_QUEUE_SUFFIX = ":delayed"
+
+# Interval in seconds for checking delayed messages (move ready ones to queue)
+DEFAULT_DELAYED_CHECK_INTERVAL = 60

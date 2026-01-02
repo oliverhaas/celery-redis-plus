@@ -43,13 +43,18 @@ class TestQueueScore:
         expected = 255 * PRIORITY_SCORE_MULTIPLIER + int(now * 1000)
         assert score == expected
 
-    def test_score_with_delay(self) -> None:
-        """Test score calculation with delay."""
+    def test_score_different_priorities(self) -> None:
+        """Test score calculation with different priorities."""
         now = time.time()
-        delay = 60.0
-        score = _queue_score(priority=0, timestamp=now, delay_seconds=delay)
-        expected = 255 * PRIORITY_SCORE_MULTIPLIER + int((now + delay) * 1000)
-        assert score == expected
+        # Priority 0 (lowest) = highest score
+        low_pri_score = _queue_score(priority=0, timestamp=now)
+        # Priority 255 (highest) = lowest score
+        high_pri_score = _queue_score(priority=255, timestamp=now)
+        assert high_pri_score < low_pri_score
+        expected_low = 255 * PRIORITY_SCORE_MULTIPLIER + int(now * 1000)
+        expected_high = 0 * PRIORITY_SCORE_MULTIPLIER + int(now * 1000)
+        assert low_pri_score == expected_low
+        assert high_pri_score == expected_high
 
     def test_higher_priority_lower_score(self) -> None:
         """Test that higher priority (higher number) results in lower score (RabbitMQ semantics)."""
@@ -479,8 +484,10 @@ class TestChannel:
         assert mock_pipe.zadd.call_count == 2
         mock_pipe.execute.assert_called_once()
 
-    def test_put_with_delay_uses_future_score(self) -> None:
-        """Test that messages with delay header get future score."""
+    def test_put_with_long_delay_goes_to_delayed_queue(self) -> None:
+        """Test that messages with delay > DEFAULT_DELAYED_CHECK_INTERVAL go to delayed queue."""
+        from celery_redis_plus.constants import DEFAULT_DELAYED_CHECK_INTERVAL, DELAYED_QUEUE_SUFFIX
+
         channel = object.__new__(Channel)
         channel.messages_key = "messages"
         channel.messages_index_key = "messages_index"
@@ -498,7 +505,8 @@ class TestChannel:
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
         channel._get_message_priority = MagicMock(return_value=0)
 
-        delay_seconds = 60.0
+        # Use delay > DEFAULT_DELAYED_CHECK_INTERVAL
+        delay_seconds = DEFAULT_DELAYED_CHECK_INTERVAL + 10.0
         message = {
             "body": '{"task": "test"}',
             "properties": {
@@ -512,16 +520,70 @@ class TestChannel:
         channel._put("my_queue", message)
         after = time.time()
 
-        # Get the score that was passed to zadd for the queue
+        # Get the score that was passed to zadd for the delayed queue
+        zadd_calls = mock_pipe.zadd.call_args_list
+        # Second zadd call is for the queue (delayed queue in this case)
+        queue_zadd_call = zadd_calls[1]
+        queue_name, score_dict = queue_zadd_call[0]
+        score = list(score_dict.values())[0]
+
+        # Queue name should be the delayed queue
+        assert queue_name == "my_queue" + DELAYED_QUEUE_SUFFIX
+
+        # Score should be eta timestamp (not priority+timestamp format)
+        expected_min = before + delay_seconds
+        expected_max = after + delay_seconds
+        assert expected_min <= score <= expected_max
+
+    def test_put_with_short_delay_goes_to_main_queue(self) -> None:
+        """Test that messages with delay <= DEFAULT_DELAYED_CHECK_INTERVAL go to main queue."""
+        from celery_redis_plus.constants import DEFAULT_DELAYED_CHECK_INTERVAL
+
+        channel = object.__new__(Channel)
+        channel.messages_key = "messages"
+        channel.messages_index_key = "messages_index"
+        channel.global_keyprefix = ""
+
+        mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        channel._get_message_priority = MagicMock(return_value=0)
+
+        # Use delay = DEFAULT_DELAYED_CHECK_INTERVAL (boundary case)
+        delay_seconds = float(DEFAULT_DELAYED_CHECK_INTERVAL)
+        message = {
+            "body": '{"task": "test"}',
+            "properties": {
+                "delivery_tag": "tag123",
+                "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                "headers": {DELAY_HEADER: delay_seconds},
+            },
+        }
+
+        before = time.time()
+        channel._put("my_queue", message)
+        after = time.time()
+
+        # Get the score that was passed to zadd for the main queue
         zadd_calls = mock_pipe.zadd.call_args_list
         # Second zadd call is for the queue
         queue_zadd_call = zadd_calls[1]
         queue_name, score_dict = queue_zadd_call[0]
         score = list(score_dict.values())[0]
 
-        # Score should reflect the delay
-        expected_min = 255 * PRIORITY_SCORE_MULTIPLIER + int((before + delay_seconds) * 1000)
-        expected_max = 255 * PRIORITY_SCORE_MULTIPLIER + int((after + delay_seconds) * 1000)
+        # Queue name should be the main queue (not delayed)
+        assert queue_name == "my_queue"
+
+        # Score should be in priority+timestamp format with delay added to timestamp
+        expected_min = _queue_score(0, before + delay_seconds)
+        expected_max = _queue_score(0, after + delay_seconds)
         assert expected_min <= score <= expected_max
 
     def test_put_with_zero_delay(self) -> None:
@@ -703,7 +765,7 @@ class TestChannel:
         mock_client = MagicMock()
         # zpopmin returns [(delivery_tag, score)]
         mock_client.zpopmin.return_value = [(b"tag123", 100.0)]
-        mock_client.hget.return_value = b'[{"body": "test"}, "exchange", "routing_key"]'
+        mock_client.hget.return_value = b'[{"body": "test"}, "exchange", "routing_key", 0]'
 
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
@@ -1386,28 +1448,46 @@ class TestTransportIntegration:
         result = redis_client.zpopmin(queue_name, 1)
         assert result[0][0] == b"low_pri"  # Priority 0 has highest score, processed last
 
-    def test_delayed_message_not_visible_until_time(self, redis_client: Any) -> None:
-        """Test that delayed messages have future scores."""
+    def test_delayed_message_in_separate_queue(self, redis_client: Any) -> None:
+        """Test that delayed messages go to a separate delayed queue.
+
+        With the two-queue delayed delivery architecture:
+        - Immediate messages go to {queue} with priority+timestamp score
+        - Delayed messages go to {queue}:delayed with eta timestamp as score
+        - A background process moves ready messages from delayed to ready queue
+        """
+        from celery_redis_plus.constants import DELAYED_QUEUE_SUFFIX
+
         queue_name = "test_queue_delayed"
+        delayed_queue_name = queue_name + DELAYED_QUEUE_SUFFIX
 
         now = time.time()
-        delay = 60.0  # 60 second delay
+        eta_future = now + 60.0  # 60 seconds in the future
+        eta_past = now - 10.0  # 10 seconds in the past (already ready)
 
-        # Message without delay (use priority 0, lowest priority = highest score)
+        # Immediate message goes to main queue with priority+timestamp score
         immediate_score = _queue_score(0, now)
-        # Message with delay
-        delayed_score = _queue_score(0, now, delay_seconds=delay)
-
         redis_client.zadd(queue_name, {"immediate": immediate_score})
-        redis_client.zadd(queue_name, {"delayed": delayed_score})
 
-        # When we pop with a max score of "now", only immediate should be returned
-        # Use priority 0 (lowest priority = highest score) to get max possible score for current time
-        current_max_score = _queue_score(0, now)
-        result = redis_client.zrangebyscore(queue_name, "-inf", current_max_score)
+        # Delayed messages go to delayed queue with eta timestamp as score
+        redis_client.zadd(delayed_queue_name, {"delayed_future": eta_future})
+        redis_client.zadd(delayed_queue_name, {"delayed_past": eta_past})
 
-        assert b"immediate" in result
-        assert b"delayed" not in result
+        # Main queue should only have immediate message
+        main_result = redis_client.zrange(queue_name, 0, -1)
+        assert b"immediate" in main_result
+        assert b"delayed_future" not in main_result
+        assert b"delayed_past" not in main_result
+
+        # Delayed queue should have both delayed messages
+        delayed_result = redis_client.zrange(delayed_queue_name, 0, -1)
+        assert b"delayed_future" in delayed_result
+        assert b"delayed_past" in delayed_result
+
+        # Query delayed queue for messages ready now (score <= now)
+        ready_result = redis_client.zrangebyscore(delayed_queue_name, "-inf", now)
+        assert b"delayed_past" in ready_result  # Past eta is ready
+        assert b"delayed_future" not in ready_result  # Future eta is not ready yet
 
     def test_bzmpop_with_sorted_set(self, redis_client: Any) -> None:
         """Test BZMPOP command with sorted sets (requires Redis 7.0+)."""
@@ -1949,10 +2029,11 @@ class TestMessagePublishing:
         # Parse the payload
         data = json.loads(payload.decode() if isinstance(payload, bytes) else payload)
         assert isinstance(data, list)
-        assert len(data) == 3  # [message, exchange, routing_key]
+        assert len(data) == 4  # [message, exchange, routing_key, priority]
 
-        message, exchange, routing_key = data
+        message, exchange, routing_key, priority = data
         assert "body" in message or "args" in str(message)
+        assert isinstance(priority, int)
 
     def test_queue_purge_removes_messages(
         self,
@@ -2200,44 +2281,87 @@ class TestDelayedMessageStorage:
     worker task publish.
     """
 
-    def test_message_with_delay_header_has_future_score(
+    def test_message_with_long_delay_goes_to_delayed_queue(
         self,
         celery_app: Celery,
         redis_client: Any,
     ) -> None:
-        """Test that messages with x-celery-delay-seconds header have future scores."""
+        """Test that messages with delay > DEFAULT_DELAYED_CHECK_INTERVAL go to delayed queue."""
+        from celery_redis_plus.constants import DEFAULT_DELAYED_CHECK_INTERVAL, DELAYED_QUEUE_SUFFIX
+
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
             # Clear existing messages
-            redis_client.delete("celery", "messages", "messages_index")
+            redis_client.delete("celery", "celery:delayed", "messages", "messages_index")
 
             before_time = time.time()
+            # Use delay longer than DEFAULT_DELAYED_CHECK_INTERVAL (61 > 60)
+            delay = DEFAULT_DELAYED_CHECK_INTERVAL + 1
 
-            # Create a message with the delay header directly
+            # Create a message with long delay
             message = {
                 "body": '{"task": "test.add", "args": [1, 2]}',
                 "properties": {
                     "delivery_tag": f"test-delay-{time.time()}",
                     "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                    "headers": {DELAY_HEADER: 60.0},  # 60 second delay
+                    "headers": {DELAY_HEADER: float(delay)},
                 },
             }
 
             # Publish directly via _put
             channel._put("celery", message)
 
-            # Get the message score
-            messages = redis_client.zrange("celery", 0, -1, withscores=True)
-            assert len(messages) == 1
-            _tag, actual_score = messages[0]
+            # Message should NOT be in the main queue
+            main_messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            assert len(main_messages) == 0
 
-            # Calculate expected score with 60 second delay
-            delayed_score = _queue_score(0, before_time, 60)
+            # Message SHOULD be in the delayed queue
+            delayed_messages = redis_client.zrange("celery" + DELAYED_QUEUE_SUFFIX, 0, -1, withscores=True)
+            assert len(delayed_messages) == 1
+            _tag, actual_score = delayed_messages[0]
 
-            # The actual score should be close to the delayed score
-            # Allow tolerance for timing differences (within 5 seconds)
-            assert abs(actual_score - delayed_score) < 5000  # 5 seconds in milliseconds
+            # Score should be the eta timestamp
+            expected_eta = before_time + delay
+            assert actual_score == pytest.approx(expected_eta, abs=5.0)
+
+    def test_message_with_short_delay_goes_to_main_queue(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that messages with delay <= DEFAULT_DELAYED_CHECK_INTERVAL go to main queue."""
+        from celery_redis_plus.constants import DEFAULT_DELAYED_CHECK_INTERVAL, DELAYED_QUEUE_SUFFIX
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Clear existing messages
+            redis_client.delete("celery", "celery:delayed", "messages", "messages_index")
+
+            # Use delay equal to DEFAULT_DELAYED_CHECK_INTERVAL (60 <= 60)
+            delay = DEFAULT_DELAYED_CHECK_INTERVAL
+
+            # Create a message with short delay
+            message = {
+                "body": '{"task": "test.add", "args": [1, 2]}',
+                "properties": {
+                    "delivery_tag": f"test-delay-{time.time()}",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {DELAY_HEADER: float(delay)},
+                },
+            }
+
+            # Publish directly via _put
+            channel._put("celery", message)
+
+            # Message SHOULD be in the main queue (short delay goes to main queue)
+            main_messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            assert len(main_messages) == 1
+
+            # Message should NOT be in the delayed queue
+            delayed_messages = redis_client.zrange("celery" + DELAYED_QUEUE_SUFFIX, 0, -1, withscores=True)
+            assert len(delayed_messages) == 0
 
     def test_message_without_delay_header_has_current_score(
         self,
@@ -2273,23 +2397,29 @@ class TestDelayedMessageStorage:
             _tag, actual_score = messages[0]
 
             # Calculate expected score range (no delay, priority 0)
-            min_score = _queue_score(0, before_time, 0)
-            max_score = _queue_score(0, after_time, 0)
+            min_score = _queue_score(0, before_time)
+            max_score = _queue_score(0, after_time)
 
             # The actual score should be within the expected range
             assert min_score <= actual_score <= max_score
 
-    def test_delayed_vs_immediate_message_score_difference(
+    def test_delayed_vs_immediate_messages_in_separate_queues(
         self,
         celery_app: Celery,
         redis_client: Any,
     ) -> None:
-        """Test that delayed messages have higher scores than immediate ones."""
+        """Test that long-delayed and immediate messages go to separate queues."""
+        from celery_redis_plus.constants import DEFAULT_DELAYED_CHECK_INTERVAL, DELAYED_QUEUE_SUFFIX
+
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
             # Clear existing messages
-            redis_client.delete("celery", "messages", "messages_index")
+            redis_client.delete("celery", "celery:delayed", "messages", "messages_index")
+
+            before_time = time.time()
+            # Use delay > DEFAULT_DELAYED_CHECK_INTERVAL to go to delayed queue
+            delay = DEFAULT_DELAYED_CHECK_INTERVAL + 10
 
             # Create an immediate message (no delay)
             immediate_msg = {
@@ -2302,78 +2432,97 @@ class TestDelayedMessageStorage:
             }
             channel._put("celery", immediate_msg)
 
-            # Create a delayed message
+            # Create a delayed message (long delay > DEFAULT_DELAYED_CHECK_INTERVAL)
             delayed_msg = {
                 "body": '{"task": "test.add", "args": [3, 4]}',
                 "properties": {
                     "delivery_tag": f"delayed-{time.time()}",
                     "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                    "headers": {DELAY_HEADER: 60.0},
+                    "headers": {DELAY_HEADER: float(delay)},
                 },
             }
             channel._put("celery", delayed_msg)
 
-            # Get messages ordered by score
-            messages = redis_client.zrange("celery", 0, -1, withscores=True)
-            assert len(messages) == 2
+            # Immediate message should be in main queue with priority+timestamp score
+            main_messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            assert len(main_messages) == 1
+            immediate_score = main_messages[0][1]
+            # Score should be in the priority+timestamp format (very large number)
+            assert immediate_score > 1e12  # Score includes priority multiplier
 
-            # The first message (lowest score) should be the immediate one
-            immediate_score = messages[0][1]
-            delayed_score = messages[1][1]
+            # Delayed message should be in delayed queue with eta timestamp score
+            delayed_messages = redis_client.zrange("celery" + DELAYED_QUEUE_SUFFIX, 0, -1, withscores=True)
+            assert len(delayed_messages) == 1
+            delayed_score = delayed_messages[0][1]
+            # Score should be eta timestamp
+            expected_eta = before_time + delay
+            assert delayed_score == pytest.approx(expected_eta, abs=5.0)
 
-            # The delayed message should have a higher score
-            assert delayed_score > immediate_score
-
-            # The difference should be approximately 60 seconds (60000 ms)
-            score_diff = delayed_score - immediate_score
-            assert 55000 < score_diff < 65000  # Within 5 seconds tolerance
-
-    def test_priority_affects_score_with_delay(
+    def test_delayed_messages_ordered_by_eta_not_priority(
         self,
         celery_app: Celery,
         redis_client: Any,
     ) -> None:
-        """Test that priority still affects score even with delay."""
+        """Test that delayed messages are ordered by eta in the delayed queue.
+
+        In the delayed queue, messages are ordered by eta timestamp, not priority.
+        Priority is stored with the message and used when moving to the ready queue.
+        """
+        from celery_redis_plus.constants import DEFAULT_DELAYED_CHECK_INTERVAL, DELAYED_QUEUE_SUFFIX
+
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
             # Clear existing messages
-            redis_client.delete("celery", "messages", "messages_index")
+            redis_client.delete("celery", "celery:delayed", "messages", "messages_index")
 
-            # Create low priority message with delay
-            low_priority_msg = {
-                "body": '{"task": "test.add", "args": [1, 1]}',
-                "properties": {
-                    "delivery_tag": f"low-pri-{time.time()}",
-                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                    "headers": {DELAY_HEADER: 10.0},
-                    "priority": 0,  # Low priority
-                },
-            }
-            channel._put("celery", low_priority_msg)
+            now = time.time()
+            # Use delays > DEFAULT_DELAYED_CHECK_INTERVAL to go to delayed queue
+            shorter_delay = DEFAULT_DELAYED_CHECK_INTERVAL + 10  # 70 seconds
+            longer_delay = DEFAULT_DELAYED_CHECK_INTERVAL + 30   # 90 seconds
 
-            time.sleep(0.01)
-
-            # Create high priority message with same delay
+            # Create high priority message with LONGER delay (will be second in delayed queue)
             high_priority_msg = {
                 "body": '{"task": "test.add", "args": [2, 2]}',
                 "properties": {
                     "delivery_tag": f"high-pri-{time.time()}",
                     "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                    "headers": {DELAY_HEADER: 10.0},
+                    "headers": {DELAY_HEADER: float(longer_delay)},
                     "priority": 9,  # High priority
                 },
             }
             channel._put("celery", high_priority_msg)
 
-            messages = redis_client.zrange("celery", 0, -1, withscores=True)
-            assert len(messages) == 2
+            # Create low priority message with SHORTER delay (will be first in delayed queue)
+            low_priority_msg = {
+                "body": '{"task": "test.add", "args": [1, 1]}',
+                "properties": {
+                    "delivery_tag": f"low-pri-{time.time()}",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {DELAY_HEADER: float(shorter_delay)},
+                    "priority": 0,  # Low priority
+                },
+            }
+            channel._put("celery", low_priority_msg)
 
-            # High priority (9) should have lower score even with delay
-            high_priority_score = messages[0][1]  # First = lowest score
-            low_priority_score = messages[1][1]  # Second = higher score
+            # In the delayed queue, messages are ordered by eta (earlier = lower score)
+            delayed_messages = redis_client.zrange(
+                "celery" + DELAYED_QUEUE_SUFFIX, 0, -1, withscores=True
+            )
+            assert len(delayed_messages) == 2
 
-            assert high_priority_score < low_priority_score
+            # First message should be the one with shorter delay (lower eta score)
+            first_tag = delayed_messages[0][0].decode() if isinstance(delayed_messages[0][0], bytes) else delayed_messages[0][0]
+            second_tag = delayed_messages[1][0].decode() if isinstance(delayed_messages[1][0], bytes) else delayed_messages[1][0]
+
+            assert "low-pri" in first_tag  # Shorter delay comes first
+            assert "high-pri" in second_tag  # Longer delay comes second
+
+            # Verify scores are eta timestamps
+            first_score = delayed_messages[0][1]
+            second_score = delayed_messages[1][1]
+            assert first_score == pytest.approx(now + shorter_delay, abs=5.0)
+            assert second_score == pytest.approx(now + longer_delay, abs=5.0)
 
 
 @pytest.mark.integration
@@ -2404,7 +2553,7 @@ class TestMessageRestoration:
             delivery_tag = "unacked-msg-123"
             payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
 
-            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery", 0]))  # type: ignore[call-arg]
 
             # Set index score to old timestamp (visibility expired)
             # Use timestamp older than DEFAULT_VISIBILITY_TIMEOUT
@@ -2439,7 +2588,7 @@ class TestMessageRestoration:
             delivery_tag = "queued-msg-456"
             payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
 
-            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery", 0]))  # type: ignore[call-arg]
 
             # Set index score to old timestamp (> visibility_timeout)
             old_timestamp = time.time() - DEFAULT_VISIBILITY_TIMEOUT - 100
@@ -2505,7 +2654,7 @@ class TestMessageRestoration:
             delivery_tag = "restore-tag-test"
             payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
 
-            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery", 0]))  # type: ignore[call-arg]
 
             # Message is not in queue
             assert client.zscore("celery", delivery_tag) is None
@@ -2608,7 +2757,7 @@ class TestMessageRestoration:
             }
 
             # Store the message
-            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery", 0]))  # type: ignore[call-arg]
 
             # Create a mock message object
             message = MagicMock()
@@ -2645,7 +2794,7 @@ class TestMessageRestoration:
             }
 
             # Store the message
-            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery", 0]))  # type: ignore[call-arg]
 
             # Create a mock message object
             message = MagicMock()
@@ -2871,7 +3020,7 @@ class TestSynchronousGet:
             }
 
             # Store message
-            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery", 0]))  # type: ignore[call-arg]
             client.zadd("celery", {delivery_tag: 100.0})
 
             # Use synchronous _get
