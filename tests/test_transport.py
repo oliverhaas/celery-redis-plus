@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from celery import Celery
 
 from celery_redis_plus.constants import (
+    DEFAULT_VISIBILITY_TIMEOUT,
     DELAY_HEADER,
     PRIORITY_SCORE_MULTIPLIER,
 )
@@ -624,10 +625,9 @@ class TestChannel:
     def test_fanout_consumer_group(self) -> None:
         """Test fanout consumer group name generation."""
         channel = object.__new__(Channel)
-        channel.consumer_group_prefix = "celery-redis-plus"
 
         group = channel._fanout_consumer_group("myqueue")
-        assert group == "celery-redis-plus-fanout-myqueue"
+        assert group == "celery-myqueue"
 
     def test_prepare_virtual_host_with_slash(self) -> None:
         """Test _prepare_virtual_host with '/' returns default db."""
@@ -1127,7 +1127,7 @@ class TestQoS:
         mock_conn.__exit__ = MagicMock(return_value=False)
         mock_channel.conn_or_acquire.return_value = mock_conn
         qos.channel = mock_channel
-        qos.__dict__["visibility_timeout"] = 3600
+        qos.__dict__["visibility_timeout"] = DEFAULT_VISIBILITY_TIMEOUT
 
         # Run twice to get to a skip scenario
         qos._vrestore_count = 1  # After this call, count will be 2, (2-1) % 10 = 1, skips
@@ -1153,7 +1153,7 @@ class TestQoS:
         mock_channel = MagicMock()
         mock_channel.conn_or_acquire.return_value = mock_conn
         qos.channel = mock_channel
-        qos.__dict__["visibility_timeout"] = 3600
+        qos.__dict__["visibility_timeout"] = DEFAULT_VISIBILITY_TIMEOUT
         qos.__dict__["messages_mutex_key"] = "messages_mutex"
         qos.__dict__["messages_mutex_expire"] = 300
         qos.__dict__["messages_index_key"] = "messages_index"
@@ -2335,10 +2335,9 @@ class TestFanoutMessaging:
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
-            # Test consumer group name generation
+            # Test consumer group name generation - format is "celery-{queue}"
             group_name = channel._fanout_consumer_group("my_queue")
-            assert "my_queue" in group_name
-            assert "fanout" in group_name
+            assert group_name == "celery-my_queue"
 
     def test_fanout_exchange_declaration(
         self,
@@ -2582,8 +2581,8 @@ class TestMessageRestoration:
             client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
 
             # Set index score to old timestamp (visibility expired)
-            # Default visibility_timeout is 3600s, so we need a timestamp older than that
-            old_timestamp = time.time() - 5000  # 5000 seconds ago (> 3600s timeout)
+            # Use timestamp older than DEFAULT_VISIBILITY_TIMEOUT
+            old_timestamp = time.time() - DEFAULT_VISIBILITY_TIMEOUT - 100
             client.zadd("messages_index", {delivery_tag: old_timestamp})
 
             # Message is NOT in the queue (simulates it was consumed)
@@ -2616,8 +2615,8 @@ class TestMessageRestoration:
 
             client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
 
-            # Set index score to old timestamp (> visibility_timeout of 3600s)
-            old_timestamp = time.time() - 5000
+            # Set index score to old timestamp (> visibility_timeout)
+            old_timestamp = time.time() - DEFAULT_VISIBILITY_TIMEOUT - 100
             client.zadd("messages_index", {delivery_tag: old_timestamp})
 
             # Message IS in the queue (not yet consumed)
@@ -2648,8 +2647,8 @@ class TestMessageRestoration:
             delivery_tag = "acked-msg-789"
 
             # Message is in index but NOT in messages hash (already acked)
-            # Use timestamp older than visibility_timeout (3600s)
-            old_timestamp = time.time() - 5000
+            # Use timestamp older than visibility_timeout
+            old_timestamp = time.time() - DEFAULT_VISIBILITY_TIMEOUT - 100
             client.zadd("messages_index", {delivery_tag: old_timestamp})
 
             # Verify it's in the index
@@ -3109,7 +3108,7 @@ class TestBzmpopEdgeCases:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
             # Clear active queues and reset queue cycle
-            channel.active_queues.clear()
+            channel._active_queues.clear()
             channel._update_queue_cycle()
 
             # Should return without error (early return when no queues)
@@ -3142,9 +3141,7 @@ class TestBzmpopEdgeCases:
             # Verify global_keyprefix is set
             assert channel.global_keyprefix == "prefix:"
 
-            # Add an active queue
-            channel.active_queues.add("celery")
-            channel._queue_cycle.consume(0)  # Reset
+            # The _queue_cycle is now a simple list
             channel._update_queue_cycle()
 
             # We can verify the channel has global_keyprefix set
@@ -3157,13 +3154,9 @@ class TestBzmpopEdgeCases:
 class TestPollingInterval:
     """Tests for polling_interval setting."""
 
-    def test_transport_default_polling_interval_is_none(self) -> None:
-        """Test Transport default polling_interval is None."""
-        assert Transport.polling_interval is None
-
-    def test_transport_default_brpop_timeout(self) -> None:
-        """Test Transport default brpop_timeout is 1."""
-        assert Transport.brpop_timeout == 1
+    def test_transport_default_polling_interval(self) -> None:
+        """Test Transport default polling_interval is 1."""
+        assert Transport.polling_interval == 1
 
 
 @pytest.mark.unit

@@ -17,9 +17,8 @@ Connection string has the following format:
 
 Transport Options
 =================
-* ``visibility_timeout``: Time in seconds before unacked messages are restored (default: 3600)
+* ``visibility_timeout``: Time in seconds before unacked messages are restored (default: 300)
 * ``stream_maxlen``: Maximum stream length for fanout streams (default: 10000)
-* ``consumer_group_prefix``: Prefix for consumer groups (default: 'celery-redis-plus')
 * ``global_keyprefix``: Global prefix for all Redis keys
 * ``socket_timeout``: Socket timeout in seconds
 * ``socket_connect_timeout``: Socket connection timeout in seconds
@@ -49,12 +48,11 @@ from kombu.utils.eventio import ERR, READ, poll
 from kombu.utils.functional import accepts_argument
 from kombu.utils.json import dumps, loads
 from kombu.utils.objects import cached_property
-from kombu.utils.scheduling import cycle_by_name
 from kombu.utils.url import _parse_url
 from vine import promise
 
 from .constants import (
-    DEFAULT_CONSUMER_GROUP_PREFIX,
+    DEFAULT_CONSUMER_GROUP,
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
@@ -656,7 +654,6 @@ class Channel(virtual.Channel):
 
     # Streams configuration
     stream_maxlen = DEFAULT_STREAM_MAXLEN
-    consumer_group_prefix = DEFAULT_CONSUMER_GROUP_PREFIX
 
     # Global key prefix
     global_keyprefix = ""
@@ -664,9 +661,6 @@ class Channel(virtual.Channel):
     # Fanout settings
     fanout_prefix: bool | str = True
     fanout_patterns = True
-
-    # Queue ordering
-    queue_order_strategy = "round_robin"
 
     _async_pool: Any = None
     _pool: Any = None
@@ -685,13 +679,11 @@ class Channel(virtual.Channel):
         "socket_connect_timeout",
         "socket_keepalive",
         "socket_keepalive_options",
-        "queue_order_strategy",
         "max_connections",
         "health_check_interval",
         "retry_on_timeout",
         "client_name",
         "stream_maxlen",
-        "consumer_group_prefix",
     )
 
     connection_class = redis.Connection if redis else None
@@ -701,14 +693,13 @@ class Channel(virtual.Channel):
         super().__init__(*args, **kwargs)
 
         self._registered = False
-        self._queue_cycle = cycle_by_name(self.queue_order_strategy)()
+        self._queue_cycle: list[str] = []
         self.Client = self._get_client()
         self.ResponseError = self._get_response_error()
         self.active_fanout_queues: set[str] = set()
         self.auto_delete_queues: set[str] = set()
         self._fanout_to_queue: dict[str, str] = {}
         self.handlers = {"BZMPOP": self._bzmpop_read, "XREADGROUP": self._xreadgroup_read}
-        self.brpop_timeout = self.connection.brpop_timeout
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -834,11 +825,10 @@ class Channel(virtual.Channel):
 
     def _bzmpop_start(self, timeout: float | None = None) -> None:
         if timeout is None:
-            timeout = self.brpop_timeout
-        queues = self._queue_cycle.consume(len(self.active_queues))
-        if not queues:
+            timeout = self.connection.polling_interval or 1
+        if not self._queue_cycle:
             return
-        keys = list(queues)
+        keys = list(self._queue_cycle)
         self._in_poll = self.client.connection
 
         command_args: list[Any] = ["BZMPOP", timeout or 0, len(keys), *keys, "MIN"]
@@ -859,7 +849,6 @@ class Channel(virtual.Channel):
                 dest = bytes_to_str(dest)
                 delivery_tag, _score = members[0]
                 delivery_tag = bytes_to_str(delivery_tag)
-                self._queue_cycle.rotate(dest)
                 payload = self.client.hget(self.messages_key, delivery_tag)
                 if payload:
                     message, _, _ = loads(bytes_to_str(payload))  # type: ignore[call-arg]
@@ -880,7 +869,7 @@ class Channel(virtual.Channel):
 
     def _fanout_consumer_group(self, queue: str) -> str:
         """Get consumer group name for fanout queue."""
-        return f"{self.consumer_group_prefix}-fanout-{queue}"
+        return f"{DEFAULT_CONSUMER_GROUP}-{queue}"
 
     @cached_property
     def consumer_id(self) -> str:
@@ -893,10 +882,8 @@ class Channel(virtual.Channel):
         thread_id = threading.get_ident()
         return f"{hostname}-{pid}-{thread_id}"
 
-    def _ensure_consumer_group(self, stream: str, group: str | None = None) -> None:
+    def _ensure_consumer_group(self, stream: str, group: str) -> None:
         """Ensure consumer group exists for stream."""
-        if group is None:
-            group = f"{self.consumer_group_prefix}-default"
         try:
             self.client.xgroup_create(name=stream, groupname=group, id="0", mkstream=True)
         except self.ResponseError as e:
@@ -906,7 +893,7 @@ class Channel(virtual.Channel):
     def _xreadgroup_start(self, timeout: float | None = None) -> None:
         """Start XREADGROUP for fanout streams."""
         if timeout is None:
-            timeout = self.brpop_timeout
+            timeout = self.connection.polling_interval or 1
 
         streams: dict[str, str] = {}
         self._pending_fanout_groups: dict[str, str] = {}
@@ -1284,7 +1271,7 @@ class Channel(virtual.Channel):
         return self._create_client(asynchronous=True)
 
     def _update_queue_cycle(self) -> None:
-        self._queue_cycle.update(self.active_queues)
+        self._queue_cycle = list(self.active_queues)
 
     def _get_response_error(self) -> type[Exception]:
         from redis import exceptions
@@ -1310,8 +1297,7 @@ class Transport(virtual.Transport):
 
     Channel = Channel
 
-    polling_interval = None  # Disable sleep between unsuccessful polls
-    brpop_timeout = 1
+    polling_interval = 1  # Timeout for blocking BZMPOP/XREADGROUP calls in seconds
     default_port = DEFAULT_PORT
     driver_type = "redis"
     driver_name = "redis"
@@ -1334,8 +1320,6 @@ class Transport(virtual.Transport):
         super().__init__(*args, **kwargs)
 
         self.cycle = MultiChannelPoller()
-        if self.polling_interval is not None:
-            self.brpop_timeout = self.polling_interval
 
     def driver_version(self) -> str:
         return redis.__version__
