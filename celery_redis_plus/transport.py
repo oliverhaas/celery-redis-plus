@@ -978,44 +978,57 @@ class Channel(virtual.Channel):
             return client.zcard(queue)
 
     # Lua script for atomically moving ready delayed messages to main queue
-    # KEYS: [1] = delayed_queue, [2] = main_queue, [3] = delayed_score_hash
-    # ARGV: [1] = current_time
-    # Returns: number of messages moved
+    # KEYS: [1] = delayed_score_hash, [2..n] = queue names (main queues)
+    # ARGV: [1] = threshold_time, [2] = delayed_queue_suffix, [3] = batch_limit
+    # Returns: array of [total_moved, queue1_moved, queue2_moved, ...]
     _move_ready_delayed_lua = """
-    local delayed_queue = KEYS[1]
-    local main_queue = KEYS[2]
-    local score_hash = KEYS[3]
-    local now = tonumber(ARGV[1])
+    local score_hash = KEYS[1]
+    local threshold = tonumber(ARGV[1])
+    local delayed_suffix = ARGV[2]
+    local batch_limit = tonumber(ARGV[3])
+    local results = {0}  -- results[1] = total moved
 
-    -- Get all ready messages (score <= now)
-    local ready = redis.call('ZRANGEBYSCORE', delayed_queue, '-inf', now)
-    local moved = 0
+    -- Process each queue (KEYS[2] onwards are main queue names)
+    for i = 2, #KEYS do
+        local main_queue = KEYS[i]
+        local delayed_queue = main_queue .. delayed_suffix
+        local queue_moved = 0
 
-    for _, tag in ipairs(ready) do
-        -- Get precomputed score
-        local score = redis.call('HGET', score_hash, tag)
-        if score then
-            -- Move to main queue with precomputed score
-            redis.call('ZREM', delayed_queue, tag)
-            redis.call('ZADD', main_queue, score, tag)
-            redis.call('HDEL', score_hash, tag)
-            moved = moved + 1
-        else
-            -- No score found, message was deleted - just clean up
-            redis.call('ZREM', delayed_queue, tag)
+        -- Get ready messages with limit (score <= threshold)
+        local ready = redis.call('ZRANGEBYSCORE', delayed_queue, '-inf', threshold, 'LIMIT', 0, batch_limit)
+
+        for _, tag in ipairs(ready) do
+            -- Get precomputed score
+            local score = redis.call('HGET', score_hash, tag)
+            if score then
+                -- Move to main queue with precomputed score
+                redis.call('ZREM', delayed_queue, tag)
+                redis.call('ZADD', main_queue, score, tag)
+                redis.call('HDEL', score_hash, tag)
+                queue_moved = queue_moved + 1
+            else
+                -- No score found, message was deleted - just clean up
+                redis.call('ZREM', delayed_queue, tag)
+            end
         end
+
+        results[1] = results[1] + queue_moved
+        results[i] = queue_moved
     end
 
-    return moved
+    return results
     """
+
+    # Maximum messages to move per queue per check cycle
+    _move_ready_delayed_batch_limit = 1000
 
     def move_ready_delayed_messages(self) -> int:
         """Move messages from delayed queues to ready queues when their eta has passed.
 
         Uses a Lua script for atomic, efficient batch moves without round-trips.
         For each active queue, checks the corresponding {queue}:delayed sorted set
-        for messages with score <= current time. Those messages are moved to the
-        main queue using their precomputed priority+eta score.
+        for messages with score <= threshold. The threshold is current time plus
+        the check interval, so we move messages that will be ready by the next check.
 
         Returns:
             Number of messages moved.
@@ -1023,22 +1036,38 @@ class Channel(virtual.Channel):
         if not self.active_queues:
             return 0
 
-        now = time()
-        moved = 0
+        # Move messages that will be ready by the next check interval
+        threshold = time() + DEFAULT_DELAYED_CHECK_INTERVAL
+        queues = list(self.active_queues)
 
         with self.conn_or_acquire() as client:
             # Register the Lua script (cached after first call)
             move_script = client.register_script(self._move_ready_delayed_lua)
 
-            for queue in list(self.active_queues):
-                delayed_queue = queue + DELAYED_QUEUE_SUFFIX
-                result = move_script(
-                    keys=[delayed_queue, queue, self.messages_delayed_score_key],
-                    args=[now],
-                )
-                moved += result or 0
+            # Pass all queue names to Lua: KEYS[1] = score_hash, KEYS[2..n] = queues
+            keys = [self.messages_delayed_score_key, *queues]
+            results = move_script(
+                keys=keys,
+                args=[threshold, DELAYED_QUEUE_SUFFIX, self._move_ready_delayed_batch_limit],
+            )
 
-        return moved
+        if not results:
+            return 0
+
+        total_moved = results[0]
+
+        # Check if any queue hit the batch limit and log a warning
+        for i, queue in enumerate(queues):
+            queue_moved = results[i + 1] if i + 1 < len(results) else 0
+            if queue_moved >= self._move_ready_delayed_batch_limit:
+                warning(
+                    "Delayed message queue %r hit batch limit of %d. "
+                    "There may be more messages waiting to be moved.",
+                    queue,
+                    self._move_ready_delayed_batch_limit,
+                )
+
+        return total_moved
 
     def _put(self, queue: str, message: dict[str, Any], **kwargs: Any) -> None:
         """Deliver message to queue using sorted set.
