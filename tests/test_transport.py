@@ -14,7 +14,6 @@ if TYPE_CHECKING:
 
 from celery_redis_plus.constants import (
     DEFAULT_VISIBILITY_TIMEOUT,
-    DELAY_HEADER,
     PRIORITY_SCORE_MULTIPLIER,
 )
 from celery_redis_plus.transport import (
@@ -507,16 +506,17 @@ class TestChannel:
 
         # Use delay > DEFAULT_DELAYED_CHECK_INTERVAL
         delay_seconds = DEFAULT_DELAYED_CHECK_INTERVAL + 10.0
+        before = time.time()
+        eta = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
         message = {
             "body": '{"task": "test"}',
             "properties": {
                 "delivery_tag": "tag123",
                 "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                "headers": {DELAY_HEADER: delay_seconds},
+                "headers": {"eta": eta},
             },
         }
 
-        before = time.time()
         channel._put("my_queue", message)
         after = time.time()
 
@@ -558,12 +558,13 @@ class TestChannel:
 
         # Use delay = DEFAULT_DELAYED_CHECK_INTERVAL (boundary case)
         delay_seconds = float(DEFAULT_DELAYED_CHECK_INTERVAL)
+        eta = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
         message = {
             "body": '{"task": "test"}',
             "properties": {
                 "delivery_tag": "tag123",
                 "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                "headers": {DELAY_HEADER: delay_seconds},
+                "headers": {"eta": eta},
             },
         }
 
@@ -586,8 +587,8 @@ class TestChannel:
         expected_max = _queue_score(0, after + delay_seconds)
         assert expected_min <= score <= expected_max
 
-    def test_put_with_zero_delay(self) -> None:
-        """Test that zero delay doesn't add to score."""
+    def test_put_with_no_eta(self) -> None:
+        """Test that no eta means immediate delivery (no delay)."""
         channel = object.__new__(Channel)
         channel.messages_key = "messages"
         channel.messages_index_key = "messages_index"
@@ -610,7 +611,7 @@ class TestChannel:
             "properties": {
                 "delivery_tag": "tag123",
                 "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                "headers": {DELAY_HEADER: 0},
+                "headers": {},
             },
         }
 
@@ -628,8 +629,8 @@ class TestChannel:
         expected_max = 255 * PRIORITY_SCORE_MULTIPLIER + int(after * 1000)
         assert expected_min <= score <= expected_max
 
-    def test_put_with_negative_delay_treated_as_zero(self) -> None:
-        """Test that negative delay is treated as zero."""
+    def test_put_with_eta_in_past_treated_as_immediate(self) -> None:
+        """Test that eta in the past is treated as immediate delivery."""
         channel = object.__new__(Channel)
         channel.messages_key = "messages"
         channel.messages_index_key = "messages_index"
@@ -647,12 +648,14 @@ class TestChannel:
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
         channel._get_message_priority = MagicMock(return_value=0)
 
+        # eta 10 seconds in the past
+        eta = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
         message = {
             "body": '{"task": "test"}',
             "properties": {
                 "delivery_tag": "tag123",
                 "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                "headers": {DELAY_HEADER: -10},
+                "headers": {"eta": eta},
             },
         }
 
@@ -2286,7 +2289,7 @@ class TestDelayedMessageStorage:
         celery_app: Celery,
         redis_client: Any,
     ) -> None:
-        """Test that messages with delay > DEFAULT_DELAYED_CHECK_INTERVAL go to delayed queue."""
+        """Test that messages with eta > DEFAULT_DELAYED_CHECK_INTERVAL go to delayed queue."""
         from celery_redis_plus.constants import DEFAULT_DELAYED_CHECK_INTERVAL, DELAYED_QUEUE_SUFFIX
 
         with celery_app.connection() as conn:
@@ -2295,17 +2298,18 @@ class TestDelayedMessageStorage:
             # Clear existing messages
             redis_client.delete("celery", "celery:delayed", "messages", "messages_index")
 
-            before_time = time.time()
             # Use delay longer than DEFAULT_DELAYED_CHECK_INTERVAL (61 > 60)
-            delay = DEFAULT_DELAYED_CHECK_INTERVAL + 1
+            delay_seconds = DEFAULT_DELAYED_CHECK_INTERVAL + 1
+            eta = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
+            before_time = time.time()
 
-            # Create a message with long delay
+            # Create a message with long delay via eta header
             message = {
                 "body": '{"task": "test.add", "args": [1, 2]}',
                 "properties": {
                     "delivery_tag": f"test-delay-{time.time()}",
                     "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                    "headers": {DELAY_HEADER: float(delay)},
+                    "headers": {"eta": eta},
                 },
             }
 
@@ -2322,7 +2326,7 @@ class TestDelayedMessageStorage:
             _tag, actual_score = delayed_messages[0]
 
             # Score should be the eta timestamp
-            expected_eta = before_time + delay
+            expected_eta = before_time + delay_seconds
             assert actual_score == pytest.approx(expected_eta, abs=5.0)
 
     def test_message_with_short_delay_goes_to_main_queue(
@@ -2330,7 +2334,7 @@ class TestDelayedMessageStorage:
         celery_app: Celery,
         redis_client: Any,
     ) -> None:
-        """Test that messages with delay <= DEFAULT_DELAYED_CHECK_INTERVAL go to main queue."""
+        """Test that messages with eta <= DEFAULT_DELAYED_CHECK_INTERVAL go to main queue."""
         from celery_redis_plus.constants import DEFAULT_DELAYED_CHECK_INTERVAL, DELAYED_QUEUE_SUFFIX
 
         with celery_app.connection() as conn:
@@ -2340,15 +2344,16 @@ class TestDelayedMessageStorage:
             redis_client.delete("celery", "celery:delayed", "messages", "messages_index")
 
             # Use delay equal to DEFAULT_DELAYED_CHECK_INTERVAL (60 <= 60)
-            delay = DEFAULT_DELAYED_CHECK_INTERVAL
+            delay_seconds = DEFAULT_DELAYED_CHECK_INTERVAL
+            eta = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
 
-            # Create a message with short delay
+            # Create a message with short delay via eta header
             message = {
                 "body": '{"task": "test.add", "args": [1, 2]}',
                 "properties": {
                     "delivery_tag": f"test-delay-{time.time()}",
                     "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                    "headers": {DELAY_HEADER: float(delay)},
+                    "headers": {"eta": eta},
                 },
             }
 
@@ -2417,11 +2422,12 @@ class TestDelayedMessageStorage:
             # Clear existing messages
             redis_client.delete("celery", "celery:delayed", "messages", "messages_index")
 
-            before_time = time.time()
             # Use delay > DEFAULT_DELAYED_CHECK_INTERVAL to go to delayed queue
-            delay = DEFAULT_DELAYED_CHECK_INTERVAL + 10
+            delay_seconds = DEFAULT_DELAYED_CHECK_INTERVAL + 10
+            eta = (datetime.now(UTC) + timedelta(seconds=delay_seconds)).isoformat()
+            before_time = time.time()
 
-            # Create an immediate message (no delay)
+            # Create an immediate message (no eta)
             immediate_msg = {
                 "body": '{"task": "test.add", "args": [1, 2]}',
                 "properties": {
@@ -2432,13 +2438,13 @@ class TestDelayedMessageStorage:
             }
             channel._put("celery", immediate_msg)
 
-            # Create a delayed message (long delay > DEFAULT_DELAYED_CHECK_INTERVAL)
+            # Create a delayed message (eta > DEFAULT_DELAYED_CHECK_INTERVAL in the future)
             delayed_msg = {
                 "body": '{"task": "test.add", "args": [3, 4]}',
                 "properties": {
                     "delivery_tag": f"delayed-{time.time()}",
                     "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                    "headers": {DELAY_HEADER: float(delay)},
+                    "headers": {"eta": eta},
                 },
             }
             channel._put("celery", delayed_msg)
@@ -2455,7 +2461,7 @@ class TestDelayedMessageStorage:
             assert len(delayed_messages) == 1
             delayed_score = delayed_messages[0][1]
             # Score should be eta timestamp
-            expected_eta = before_time + delay
+            expected_eta = before_time + delay_seconds
             assert delayed_score == pytest.approx(expected_eta, abs=5.0)
 
     def test_delayed_messages_ordered_by_eta_not_priority(
@@ -2481,13 +2487,16 @@ class TestDelayedMessageStorage:
             shorter_delay = DEFAULT_DELAYED_CHECK_INTERVAL + 10  # 70 seconds
             longer_delay = DEFAULT_DELAYED_CHECK_INTERVAL + 30   # 90 seconds
 
+            shorter_eta = (datetime.now(UTC) + timedelta(seconds=shorter_delay)).isoformat()
+            longer_eta = (datetime.now(UTC) + timedelta(seconds=longer_delay)).isoformat()
+
             # Create high priority message with LONGER delay (will be second in delayed queue)
             high_priority_msg = {
                 "body": '{"task": "test.add", "args": [2, 2]}',
                 "properties": {
                     "delivery_tag": f"high-pri-{time.time()}",
                     "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                    "headers": {DELAY_HEADER: float(longer_delay)},
+                    "headers": {"eta": longer_eta},
                     "priority": 9,  # High priority
                 },
             }
@@ -2499,7 +2508,7 @@ class TestDelayedMessageStorage:
                 "properties": {
                     "delivery_tag": f"low-pri-{time.time()}",
                     "delivery_info": {"exchange": "celery", "routing_key": "celery"},
-                    "headers": {DELAY_HEADER: float(shorter_delay)},
+                    "headers": {"eta": shorter_eta},
                     "priority": 0,  # Low priority
                 },
             }

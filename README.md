@@ -172,10 +172,6 @@ Celery bootstep that starts background threads for:
 
 Helper function to register the bootstep with a Celery application.
 
-### `celery_redis_plus.DELAY_HEADER`
-
-The header name used for delay information (`x-delay`).
-
 ## Requirements
 
 - Python >= 3.13

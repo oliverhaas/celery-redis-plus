@@ -13,10 +13,10 @@ uv sync --group dev
 uv run pytest
 
 # Run a single test file
-uv run pytest tests/test_signals.py
+uv run pytest tests/test_transport.py
 
 # Run a specific test
-uv run pytest tests/test_signals.py::TestAddDelayHeader::test_eta_in_future_iso_string
+uv run pytest tests/test_transport.py::TestDelayedDeliveryQueues::test_message_with_long_delay_goes_to_delayed_queue
 
 # Run linter
 uv run ruff check
@@ -37,9 +37,9 @@ celery-redis-plus is a drop-in replacement Redis transport for Celery that uses:
 
 ### Message Flow
 
-1. **Signal Handler** (`signals.py`): The `before_task_publish` signal intercepts tasks with `eta` or `countdown` and adds an `x-delay` header with the computed delay in seconds
-2. **Custom Transport** (`transport.py`): The `Channel._put` method checks for the delay header and encodes it into the sorted set score, so delayed messages are automatically delivered when their time comes
-3. **Sorted Set Scoring**: Messages are stored in sorted sets with score = `(255 - priority) × 10¹⁰ + timestamp_ms + delay_ms`. Lower score = higher priority = delivered first
+1. **Custom Transport** (`transport.py`): The `Channel._put` method parses the `eta` header (ISO datetime) to compute delay. Messages with long delays (> 60s) go to a separate delayed queue; short delays use timing in the sorted set score
+2. **Two-Queue System**: `{queue}` for immediate/short delays, `{queue}:delayed` for long delays. A background thread moves ready messages from delayed to main queue
+3. **Sorted Set Scoring**: Messages are stored in sorted sets with score = `(255 - priority) × 10¹⁰ + timestamp_ms`. Lower score = higher priority = delivered first
 
 ### Key Components
 
@@ -57,9 +57,10 @@ celery_redis_plus.transport:Transport://localhost:6379/0
 
 ### Constants
 
-- `DELAY_HEADER`: `"x-delay"` - header name for delay value in seconds
 - `PRIORITY_SCORE_MULTIPLIER`: `10¹⁰` - multiplier for priority in score calculation
 - `DEFAULT_VISIBILITY_TIMEOUT`: `300` - seconds before unacked messages are restored
+- `DEFAULT_DELAYED_CHECK_INTERVAL`: `60` - threshold in seconds for routing to delayed queue
+- `DELAYED_QUEUE_SUFFIX`: `":delayed"` - suffix for delayed message queues
 
 ## Testing
 

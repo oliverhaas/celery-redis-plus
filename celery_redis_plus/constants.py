@@ -1,8 +1,5 @@
 """Shared constants for celery-redis-plus."""
 
-# Header key for delay seconds in messages
-DELAY_HEADER = "x-delay"
-
 # Suffix for the messages index sorted set (tracks message visibility)
 MESSAGES_INDEX_SUFFIX = ":index"
 

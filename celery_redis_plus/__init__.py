@@ -40,10 +40,9 @@ from importlib.metadata import version
 from typing import Any
 
 from .bootstep import DelayedDeliveryBootstep
-from .constants import DELAY_HEADER
 from .transport import Transport
 
-__all__ = ["DELAY_HEADER", "DelayedDeliveryBootstep", "Transport", "__version__", "configure_app"]
+__all__ = ["DelayedDeliveryBootstep", "Transport", "__version__", "configure_app"]
 
 __version__ = version("celery-redis-plus")
 

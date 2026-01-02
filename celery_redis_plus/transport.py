@@ -35,6 +35,7 @@ import numbers
 import socket as socket_module
 from collections import namedtuple
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from queue import Empty
 from time import time
 from typing import TYPE_CHECKING, Any
@@ -56,7 +57,6 @@ from .constants import (
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
-    DELAY_HEADER,
     DELAYED_QUEUE_SUFFIX,
     PRIORITY_SCORE_MULTIPLIER,
 )
@@ -1035,11 +1035,26 @@ class Channel(virtual.Channel):
         exchange = delivery_info["exchange"]
         routing_key = delivery_info["routing_key"]
 
-        # Check for delay header
-        headers = props.get("headers", {})
-        delay_seconds = headers.get(DELAY_HEADER, 0.0)
-        if delay_seconds is None or delay_seconds < 0:
-            delay_seconds = 0.0
+        # Parse eta header to compute delay
+        delay_seconds = 0.0
+        headers = props.get("headers") or {}
+        eta = headers.get("eta")
+        if eta is not None:
+            try:
+                if isinstance(eta, str):
+                    eta_dt = datetime.fromisoformat(eta)
+                elif isinstance(eta, datetime):
+                    eta_dt = eta
+                else:
+                    eta_dt = None
+
+                if eta_dt is not None:
+                    # Ensure eta is timezone-aware
+                    if eta_dt.tzinfo is None:
+                        eta_dt = eta_dt.replace(tzinfo=UTC)
+                    delay_seconds = max(0.0, (eta_dt - datetime.now(UTC)).total_seconds())
+            except (ValueError, TypeError):
+                pass
 
         now = time()
 
@@ -1344,9 +1359,6 @@ class Transport(virtual.Transport):
         if redis is None:
             raise ImportError("Missing redis library (pip install redis)")
         super().__init__(*args, **kwargs)
-
-        # Register signal handlers on first transport init
-        from . import signals as _signals  # noqa: F401
 
         self.cycle = MultiChannelPoller()
 
