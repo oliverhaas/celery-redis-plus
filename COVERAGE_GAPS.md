@@ -1,6 +1,6 @@
 # Coverage Gaps in transport.py
 
-Current coverage: 74% (839 statements, 179 missing, 258 branches, 44 partial)
+Current coverage: 84% (839 statements, 104 missing, 258 branches, 40 partial)
 
 ## Analysis of Missing Lines
 
@@ -14,9 +14,8 @@ def _after_fork_cleanup_channel(channel: Channel) -> None:
 
 ---
 
-### Lines 261-269, 272: `GlobalKeyPrefixMixin.parse_response` BZMPOP path
+### Lines 264-268: `GlobalKeyPrefixMixin.parse_response` BZMPOP path
 ```python
-ret = super().parse_response(connection, command_name, **options)
 if command_name == "BZMPOP" and ret:
     key, members = ret
     if isinstance(key, bytes):
@@ -26,18 +25,6 @@ if command_name == "BZMPOP" and ret:
 ```
 **Why uncovered**: Requires `global_keyprefix` to be set AND BZMPOP to return results through the prefixed client.
 **Difficulty**: Medium - need integration test with global_keyprefix config
-
----
-
-### Lines 416-435: `QoS.restore_visible` message restoration loop
-**Why uncovered**: Only runs when messages are in the index but not acked (visibility timeout expired).
-**Difficulty**: Hard - requires simulating message consumption without ack, then waiting for visibility timeout
-
----
-
-### Lines 440-448: `QoS.restore_by_tag`
-**Why uncovered**: Called by restore_visible when restoring unacked messages.
-**Difficulty**: Hard - same as above
 
 ---
 
@@ -86,9 +73,9 @@ except Exception:
 
 ---
 
-### Lines 766-780, 783-793, 796: `_do_restore_message`, `_restore`, `_restore_at_beginning`
-**Why uncovered**: Message restoration on nack/reject. Only runs when messages are rejected.
-**Difficulty**: Medium - test with task that raises exception and requeue=True
+### Lines 773, 779-780, 788: `_do_restore_message` edge cases
+**Why uncovered**: Some edge cases in message restoration not hit (e.g., specific error paths).
+**Difficulty**: Medium
 
 ---
 
@@ -116,21 +103,9 @@ except Exception:
 
 ---
 
-### Lines 1005, 1009-1018: `_poll_error` and synchronous `_get`
-**Why uncovered**: Sync `_get` not used when async polling is available.
+### Lines 1005, 1015: `_poll_error` and synchronous `_get` edge cases
+**Why uncovered**: Sync `_get` edge cases not used when async polling is available.
 **Difficulty**: Easy - call `_get` directly
-
----
-
-### Lines 1050-1056: `_put_fanout`
-**Why uncovered**: Publishing to fanout exchanges not tested.
-**Difficulty**: Easy - test fanout publish
-
----
-
-### Lines 1107: `get_table` empty return
-**Why uncovered**: Always have bindings in tests.
-**Difficulty**: Easy - query empty exchange
 
 ---
 
@@ -140,21 +115,15 @@ except Exception:
 
 ---
 
-### Lines 1149-1158: `_prepare_virtual_host` edge cases
-**Why uncovered**: Standard vhost paths not exercised.
-**Difficulty**: Easy - test with "/" and "/0" vhosts
-
----
-
 ### Lines 1180-1188: `_connparams` health_check_interval removal
 **Why uncovered**: Connection class always supports health_check_interval.
 **Difficulty**: Medium - mock connection class without health_check_interval
 
 ---
 
-### Lines 1192-1202: `_connparams` SSL config
-**Why uncovered**: SSL not tested.
-**Difficulty**: Easy - test with SSL transport options
+### Lines 1201-1202: `_connparams` SSL config edge cases
+**Why uncovered**: Some SSL config paths not tested.
+**Difficulty**: Easy - test with additional SSL transport options
 
 ---
 
@@ -164,27 +133,21 @@ except Exception:
 
 ---
 
-### Lines 1253, 1258: `_get_client` version check and prefix client
-**Why uncovered**:
-- Line 1253: Redis version always >= 3.2.0
-- Line 1258: `global_keyprefix` not set in most tests
-**Difficulty**: Easy for 1258 (test with prefix), impossible for 1253 without old redis
+### Lines 1253: `_get_client` version check
+**Why uncovered**: Redis version always >= 3.2.0
+**Difficulty**: Impossible without old redis
 
 ---
 
 ### Lines 1328-1341, 1352-1353: Transport init branches
-**Analysis**: You're right! These are mutually exclusive:
+**Analysis**:
 - Line 1328: `if redis:` - always true since redis is imported
 - Line 1333: `if redis is None:` - never true since we import redis
 - Line 1338: `if self.polling_interval is not None:` - polling_interval is None by default
-- Line 1341: `return redis.__version__` - `driver_version()` method not called
 - Lines 1352-1353: Event loop disconnect callback - async only
-
-The 1328 vs 1333 shows coverage reporting partial branches. Line 1328's `if redis:` branch is always taken, but the implicit `else` (line 1333's path) is never taken - that's expected and correct.
 
 **Difficulty**:
 - 1338: Easy - set polling_interval
-- 1341: Easy - call driver_version()
 - 1352-1353: Hard - async event loop
 
 ---
@@ -192,20 +155,18 @@ The 1328 vs 1333 shows coverage reporting partial branches. Line 1328's `if redi
 ## Priority Order for Testing
 
 ### Easy (unit tests, no special setup):
-1. Line 1341: Call `driver_version()`
-2. Line 1107: Query empty exchange binding table
-3. Lines 1009-1018: Call `_get` directly
-4. Lines 1050-1056: Test fanout publish
-5. Lines 1149-1158: Test vhost parsing edge cases
-6. Line 1258: Test with `global_keyprefix`
-7. Lines 1192-1202: Test SSL config parsing
+1. Lines 715-717: String fanout_prefix
+2. Lines 1005, 1015: Call `_get` directly with edge cases
+3. Lines 1132-1136: Create auto-delete fanout queue
+4. Lines 1201-1202: Test additional SSL config paths
+5. Line 1338: Set polling_interval
 
 ### Medium (requires mocking or special config):
-1. Lines 715-717: String fanout_prefix
-2. Lines 722-724: Mock Redis ping failure
-3. Lines 854-856: Mock connection errors
-4. Lines 766-796: Message restoration (nack/requeue)
-5. Lines 261-269, 272: Global keyprefix with BZMPOP
+1. Lines 722-724: Mock Redis ping failure
+2. Lines 854-856: Mock connection errors
+3. Lines 264-268: Global keyprefix with BZMPOP (needs actual BZMPOP call)
+4. Lines 773, 779-780, 788: Message restoration edge cases
+5. Lines 836, 840, 846: _bzmpop_start edge cases
 
 ### Hard (async/multiprocessing):
 1. Lines 167, 731, 735: Fork handling
