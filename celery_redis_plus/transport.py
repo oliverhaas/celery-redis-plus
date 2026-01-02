@@ -35,7 +35,6 @@ import numbers
 import socket as socket_module
 from collections import namedtuple
 from contextlib import contextmanager
-from datetime import UTC, datetime
 from queue import Empty
 from time import time
 from typing import TYPE_CHECKING, Any
@@ -345,7 +344,12 @@ class QoS(virtual.QoS):
 
     def _remove_from_indices(self, delivery_tag: str, pipe: Any = None) -> Any:
         with self.pipe_or_acquire(pipe) as pipe:
-            return pipe.zrem(self.messages_index_key, delivery_tag).hdel(self.messages_key, delivery_tag)
+            # Also clean up delayed score hash (no-op if not a delayed message)
+            return (
+                pipe.zrem(self.messages_index_key, delivery_tag)
+                .hdel(self.messages_key, delivery_tag)
+                .hdel(self.messages_delayed_score_key, delivery_tag)
+            )
 
     def maybe_update_messages_index(self) -> None:
         """Update scores of delivered messages to current time.
@@ -430,6 +434,10 @@ class QoS(virtual.QoS):
     @cached_property
     def messages_mutex_expire(self) -> int:
         return self.channel.messages_mutex_expire
+
+    @cached_property
+    def messages_delayed_score_key(self) -> str:
+        return self.channel.messages_delayed_score_key
 
     @cached_property
     def visibility_timeout(self) -> float:
@@ -622,6 +630,7 @@ class Channel(virtual.Channel):
     messages_index_key = "messages_index"
     messages_mutex_key = "messages_mutex"
     messages_mutex_expire = 300  # 5 minutes
+    messages_delayed_score_key = "messages_delayed_score"  # Precomputed scores for delayed msgs
 
     # Visibility and timeout settings
     visibility_timeout: float = DEFAULT_VISIBILITY_TIMEOUT
@@ -968,12 +977,45 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             return client.zcard(queue)
 
+    # Lua script for atomically moving ready delayed messages to main queue
+    # KEYS: [1] = delayed_queue, [2] = main_queue, [3] = delayed_score_hash
+    # ARGV: [1] = current_time
+    # Returns: number of messages moved
+    _move_ready_delayed_lua = """
+    local delayed_queue = KEYS[1]
+    local main_queue = KEYS[2]
+    local score_hash = KEYS[3]
+    local now = tonumber(ARGV[1])
+
+    -- Get all ready messages (score <= now)
+    local ready = redis.call('ZRANGEBYSCORE', delayed_queue, '-inf', now)
+    local moved = 0
+
+    for _, tag in ipairs(ready) do
+        -- Get precomputed score
+        local score = redis.call('HGET', score_hash, tag)
+        if score then
+            -- Move to main queue with precomputed score
+            redis.call('ZREM', delayed_queue, tag)
+            redis.call('ZADD', main_queue, score, tag)
+            redis.call('HDEL', score_hash, tag)
+            moved = moved + 1
+        else
+            -- No score found, message was deleted - just clean up
+            redis.call('ZREM', delayed_queue, tag)
+        end
+    end
+
+    return moved
+    """
+
     def move_ready_delayed_messages(self) -> int:
         """Move messages from delayed queues to ready queues when their eta has passed.
 
+        Uses a Lua script for atomic, efficient batch moves without round-trips.
         For each active queue, checks the corresponding {queue}:delayed sorted set
         for messages with score <= current time. Those messages are moved to the
-        main queue with the correct priority+timestamp score.
+        main queue using their precomputed priority+eta score.
 
         Returns:
             Number of messages moved.
@@ -985,38 +1027,16 @@ class Channel(virtual.Channel):
         moved = 0
 
         with self.conn_or_acquire() as client:
+            # Register the Lua script (cached after first call)
+            move_script = client.register_script(self._move_ready_delayed_lua)
+
             for queue in list(self.active_queues):
                 delayed_queue = queue + DELAYED_QUEUE_SUFFIX
-
-                # Get messages that are ready (score <= now)
-                # Use ZRANGEBYSCORE to get messages with score <= current time
-                ready_tags = client.zrangebyscore(delayed_queue, "-inf", now, withscores=False)
-
-                if not ready_tags:
-                    continue
-
-                with client.pipeline() as pipe:
-                    for tag_bytes in ready_tags:
-                        tag = bytes_to_str(tag_bytes)
-
-                        # Get message data to extract priority
-                        payload = client.hget(self.messages_key, tag)
-                        if not payload:
-                            # Message was deleted, remove from delayed queue
-                            pipe.zrem(delayed_queue, tag)
-                            continue
-
-                        _message, _exchange, _routing_key, priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
-
-                        # Calculate new score with priority and current time
-                        queue_score = _queue_score(priority, now)
-
-                        # Move from delayed queue to ready queue
-                        pipe.zrem(delayed_queue, tag)
-                        pipe.zadd(queue, {tag: queue_score})
-                        moved += 1
-
-                    pipe.execute()
+                result = move_script(
+                    keys=[delayed_queue, queue, self.messages_delayed_score_key],
+                    args=[now],
+                )
+                moved += result or 0
 
         return moved
 
@@ -1024,9 +1044,14 @@ class Channel(virtual.Channel):
         """Deliver message to queue using sorted set.
 
         Messages with short delay (≤ DEFAULT_DELAYED_CHECK_INTERVAL) go to {queue}
-        with a future timestamp in the score. The worker will honor the eta.
+        with a future timestamp in the score.
         Messages with longer delay go to {queue}:delayed with eta as score,
         and are moved to {queue} by a background process when ready.
+
+        Args:
+            queue: Target queue name.
+            message: Message dict with 'properties' containing optional 'eta'
+                     (Unix timestamp float) for delayed delivery.
         """
         priority = self._get_message_priority(message, reverse=False)
         props = message["properties"]
@@ -1035,45 +1060,31 @@ class Channel(virtual.Channel):
         exchange = delivery_info["exchange"]
         routing_key = delivery_info["routing_key"]
 
-        # Parse eta header to compute delay
-        delay_seconds = 0.0
-        headers = props.get("headers") or {}
-        eta = headers.get("eta")
-        if eta is not None:
-            try:
-                if isinstance(eta, str):
-                    eta_dt = datetime.fromisoformat(eta)
-                elif isinstance(eta, datetime):
-                    eta_dt = eta
-                else:
-                    eta_dt = None
-
-                if eta_dt is not None:
-                    # Ensure eta is timezone-aware
-                    if eta_dt.tzinfo is None:
-                        eta_dt = eta_dt.replace(tzinfo=UTC)
-                    delay_seconds = max(0.0, (eta_dt - datetime.now(UTC)).total_seconds())
-            except (ValueError, TypeError):
-                pass
-
         now = time()
+
+        # eta is a Unix timestamp (float) in properties, similar to priority
+        eta_timestamp: float | None = props.get("eta")
+        delay_seconds = max(0.0, eta_timestamp - now) if eta_timestamp else 0.0
 
         with self.conn_or_acquire() as client, client.pipeline() as pipe:
             if delay_seconds > DEFAULT_DELAYED_CHECK_INTERVAL:
                 # Long delay: store in {queue}:delayed with eta timestamp as score
                 # Background process will move it to main queue when ready
-                eta_timestamp = now + delay_seconds
                 delayed_queue = queue + DELAYED_QUEUE_SUFFIX
-                # Store message with priority info for later retrieval
+                # Precompute the final queue score for when message becomes ready
+                # This enables efficient Lua-based move without JSON parsing
+                ready_score = _queue_score(priority, eta_timestamp)
+                # Use eta_timestamp for index so restore_visible won't restore before eta
                 pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key, priority]))  # type: ignore[call-arg]
-                pipe.zadd(self.messages_index_key, {delivery_tag: now})
+                pipe.zadd(self.messages_index_key, {delivery_tag: eta_timestamp})
                 pipe.zadd(delayed_queue, {delivery_tag: eta_timestamp})
+                pipe.hset(self.messages_delayed_score_key, delivery_tag, ready_score)
             else:
                 # Immediate or short delay: store in queue with priority+timestamp score
-                # For short delays, worker will honor the eta when it receives the message
-                queue_score = _queue_score(priority, now + delay_seconds)
+                visible_at = now + delay_seconds
+                queue_score = _queue_score(priority, visible_at)
                 pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key, priority]))  # type: ignore[call-arg]
-                pipe.zadd(self.messages_index_key, {delivery_tag: now})
+                pipe.zadd(self.messages_index_key, {delivery_tag: visible_at})
                 pipe.zadd(queue, {delivery_tag: queue_score})
             pipe.execute()
 
@@ -1359,6 +1370,9 @@ class Transport(virtual.Transport):
         if redis is None:
             raise ImportError("Missing redis library (pip install redis)")
         super().__init__(*args, **kwargs)
+
+        # Import signals module to register signal handlers when transport is used
+        from . import signals as _signals  # noqa: F401
 
         self.cycle = MultiChannelPoller()
 
