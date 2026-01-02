@@ -2549,3 +2549,333 @@ class TestDelayedMessageStorage:
             low_priority_score = messages[1][1]  # Second = higher score
 
             assert high_priority_score < low_priority_score
+
+
+@pytest.mark.integration
+class TestMessageRestoration:
+    """Tests for message restoration functionality."""
+
+    def test_restore_visible_restores_unacked_message(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that restore_visible restores messages that were consumed but not acked."""
+        from kombu.utils.json import dumps  # type: ignore[attr-defined]
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Use channel's client to ensure we use the same key namespace
+            client = channel.client
+
+            # Clear existing data
+            client.delete("celery", "messages", "messages_index")
+
+            # Simulate a message that was consumed but not acked:
+            # 1. Message is in messages hash (payload stored)
+            # 2. Message is in messages_index with old timestamp (visibility expired)
+            # 3. Message is NOT in the queue (was popped)
+            delivery_tag = "unacked-msg-123"
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+
+            # Set index score to old timestamp (visibility expired)
+            # Default visibility_timeout is 3600s, so we need a timestamp older than that
+            old_timestamp = time.time() - 5000  # 5000 seconds ago (> 3600s timeout)
+            client.zadd("messages_index", {delivery_tag: old_timestamp})
+
+            # Message is NOT in the queue (simulates it was consumed)
+            assert client.zscore("celery", delivery_tag) is None
+
+            # Call restore_visible - should restore the message
+            channel.qos._vrestore_count = 0  # Reset counter to ensure it runs
+            channel.qos.restore_visible(interval=1)
+
+            # Message should now be back in the queue
+            assert client.zscore("celery", delivery_tag) is not None
+
+    def test_restore_visible_skips_message_still_in_queue(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that restore_visible skips messages still in queue."""
+        from kombu.utils.json import dumps  # type: ignore[attr-defined]
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+
+            # Clear existing data
+            client.delete("celery", "messages", "messages_index")
+
+            # Simulate a message that is still in the queue (not yet consumed)
+            delivery_tag = "queued-msg-456"
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+
+            # Set index score to old timestamp (> visibility_timeout of 3600s)
+            old_timestamp = time.time() - 5000
+            client.zadd("messages_index", {delivery_tag: old_timestamp})
+
+            # Message IS in the queue (not yet consumed)
+            client.zadd("celery", {delivery_tag: 100.0})
+
+            original_score = client.zscore("celery", delivery_tag)
+
+            # Call restore_visible - should NOT restore (message still in queue)
+            channel.qos._vrestore_count = 0
+            channel.qos.restore_visible(interval=1)
+
+            # Score should be unchanged (not restored)
+            assert client.zscore("celery", delivery_tag) == original_score
+
+    def test_restore_visible_removes_index_for_acked_message(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that restore_visible cleans up index for already-acked messages."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+
+            # Clear existing data
+            client.delete("celery", "messages", "messages_index")
+
+            # Simulate a message that was already acked (removed from messages hash)
+            delivery_tag = "acked-msg-789"
+
+            # Message is in index but NOT in messages hash (already acked)
+            # Use timestamp older than visibility_timeout (3600s)
+            old_timestamp = time.time() - 5000
+            client.zadd("messages_index", {delivery_tag: old_timestamp})
+
+            # Verify it's in the index
+            assert client.zscore("messages_index", delivery_tag) is not None
+
+            # Call restore_visible - should remove from index
+            channel.qos._vrestore_count = 0
+            channel.qos.restore_visible(interval=1)
+
+            # Should be removed from index (cleaned up)
+            assert client.zscore("messages_index", delivery_tag) is None
+
+    def test_restore_by_tag(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test restore_by_tag restores a specific message."""
+        from kombu.utils.json import dumps  # type: ignore[attr-defined]
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+
+            # Clear existing data
+            client.delete("celery", "messages", "messages_index")
+
+            # Set up a message in the messages hash
+            delivery_tag = "restore-tag-test"
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+
+            # Message is not in queue
+            assert client.zscore("celery", delivery_tag) is None
+
+            # Restore the message
+            channel.qos.restore_by_tag(delivery_tag)
+
+            # Message should now be in the queue
+            assert client.zscore("celery", delivery_tag) is not None
+
+    def test_do_restore_message_sets_redelivered_flag(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that _do_restore_message sets the redelivered flag."""
+        from kombu.utils.json import loads  # type: ignore[attr-defined]
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+
+            # Clear existing data
+            client.delete("celery", "messages", "messages_index")
+
+            delivery_tag = "redelivered-test"
+            payload = {
+                "body": "test",
+                "headers": {},
+                "properties": {
+                    "delivery_tag": delivery_tag,
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                },
+            }
+
+            # Restore the message using a pipeline
+            with client.pipeline() as pipe:
+                channel._do_restore_message(payload, "", "celery", pipe, leftmost=False, delivery_tag=delivery_tag)
+                pipe.execute()
+
+            # Check the message was stored with redelivered flag
+            stored = client.hget("messages", delivery_tag)
+            assert stored is not None
+            stored_payload, _, _ = loads(stored)  # type: ignore[call-arg]
+            assert stored_payload["headers"]["redelivered"] is True
+            assert stored_payload["properties"]["delivery_info"]["redelivered"] is True
+
+    def test_do_restore_message_leftmost_uses_zero_score(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that _do_restore_message with leftmost=True uses score 0."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+
+            # Clear existing data
+            client.delete("celery", "messages", "messages_index")
+
+            delivery_tag = "leftmost-test"
+            payload = {
+                "body": "test",
+                "headers": {},
+                "properties": {
+                    "delivery_tag": delivery_tag,
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                },
+            }
+
+            # Restore with leftmost=True
+            with client.pipeline() as pipe:
+                channel._do_restore_message(payload, "", "celery", pipe, leftmost=True, delivery_tag=delivery_tag)
+                pipe.execute()
+
+            # Score should be 0 (highest priority, processed first)
+            score = client.zscore("celery", delivery_tag)
+            assert score == 0
+
+    def test_channel_restore_with_message_object(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test Channel._restore with a message object."""
+        from kombu.utils.json import dumps  # type: ignore[attr-defined]
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+
+            # Clear existing data
+            client.delete("celery", "messages", "messages_index")
+
+            delivery_tag = "message-restore-test"
+            payload = {
+                "body": "test",
+                "headers": {},
+                "properties": {
+                    "delivery_tag": delivery_tag,
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                },
+            }
+
+            # Store the message
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+
+            # Create a mock message object
+            message = MagicMock()
+            message.delivery_tag = delivery_tag
+
+            # Restore the message
+            channel._restore(message)
+
+            # Message should be in the queue
+            assert client.zscore("celery", delivery_tag) is not None
+
+    def test_channel_restore_at_beginning(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test Channel._restore_at_beginning restores with score 0."""
+        from kombu.utils.json import dumps  # type: ignore[attr-defined]
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+
+            # Clear existing data
+            client.delete("celery", "messages", "messages_index")
+
+            delivery_tag = "restore-beginning-test"
+            payload = {
+                "body": "test",
+                "headers": {},
+                "properties": {
+                    "delivery_tag": delivery_tag,
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                },
+            }
+
+            # Store the message
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+
+            # Create a mock message object
+            message = MagicMock()
+            message.delivery_tag = delivery_tag
+
+            # Restore at beginning
+            channel._restore_at_beginning(message)
+
+            # Message should be in queue with score 0
+            score = client.zscore("celery", delivery_tag)
+            assert score == 0
+
+
+@pytest.mark.integration
+class TestGlobalKeyPrefix:
+    """Tests for global key prefix functionality."""
+
+    def test_task_execution_with_global_keyprefix(
+        self,
+        redis_container: tuple[str, int, str],
+    ) -> None:
+        """Test that tasks work correctly with global_keyprefix set."""
+        from celery import Celery
+
+        host, port, _image = redis_container
+
+        # Create app with global_keyprefix
+        app = Celery("test_prefix")
+        app.conf.update(
+            broker_url=f"redis://{host}:{port}/0",
+            broker_transport="celery_redis_plus.transport:Transport",
+            broker_transport_options={"global_keyprefix": "myapp:"},
+            result_backend=f"redis://{host}:{port}/1",
+            task_always_eager=False,
+        )
+
+        @app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Publish a task
+        add.delay(2, 3)
+
+        # Verify the message is stored with the prefix
+        import redis
+
+        client = redis.Redis(host=host, port=port, db=0)
+
+        # The queue should be prefixed
+        prefixed_queue_size: int = client.zcard("myapp:celery")  # type: ignore[assignment]
+
+        assert prefixed_queue_size >= 1
+        # The key point is that our prefixed queue has the message
+
+        # Clean up
+        client.delete("myapp:celery", "myapp:messages", "myapp:messages_index")
+        client.close()
+        app.close()
