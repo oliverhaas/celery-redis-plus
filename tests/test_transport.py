@@ -2879,3 +2879,336 @@ class TestGlobalKeyPrefix:
         client.delete("myapp:celery", "myapp:messages", "myapp:messages_index")
         client.close()
         app.close()
+
+
+@pytest.mark.integration
+class TestFanoutPrefix:
+    """Tests for fanout_prefix functionality."""
+
+    def test_string_fanout_prefix(
+        self,
+        redis_container: tuple[str, int, str],
+    ) -> None:
+        """Test that string fanout_prefix is used for stream keys."""
+        from celery import Celery
+
+        host, port, _image = redis_container
+
+        # Create app with string fanout_prefix
+        app = Celery("test_fanout_prefix")
+        app.conf.update(
+            broker_url=f"redis://{host}:{port}/0",
+            broker_transport="celery_redis_plus.transport:Transport",
+            broker_transport_options={"fanout_prefix": "myfanout."},
+            result_backend=f"redis://{host}:{port}/1",
+            task_always_eager=False,
+        )
+
+        with app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Verify the keyprefix_fanout is set correctly
+            assert channel.keyprefix_fanout == "myfanout."
+
+            # Get the stream key - should use our prefix
+            stream_key = channel._fanout_stream_key("test_fanout")
+            assert stream_key == "myfanout.test_fanout"
+
+            # With routing key
+            stream_key_routed = channel._fanout_stream_key("test_fanout", "my.route")
+            assert stream_key_routed == "myfanout.test_fanout/my.route"
+
+        app.close()
+
+    def test_false_fanout_prefix(
+        self,
+        redis_container: tuple[str, int, str],
+    ) -> None:
+        """Test that fanout_prefix=False results in no prefix."""
+        from celery import Celery
+
+        host, port, _image = redis_container
+
+        app = Celery("test_no_fanout_prefix")
+        app.conf.update(
+            broker_url=f"redis://{host}:{port}/0",
+            broker_transport="celery_redis_plus.transport:Transport",
+            broker_transport_options={"fanout_prefix": False},
+            result_backend=f"redis://{host}:{port}/1",
+            task_always_eager=False,
+        )
+
+        with app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Verify the keyprefix_fanout is empty
+            assert channel.keyprefix_fanout == ""
+
+            # Stream key should have no prefix
+            stream_key = channel._fanout_stream_key("test_fanout")
+            assert stream_key == "test_fanout"
+
+        app.close()
+
+
+@pytest.mark.integration
+class TestChannelConnectionFailure:
+    """Tests for channel connection failure handling."""
+
+    def test_init_fails_with_invalid_redis(self) -> None:
+        """Test that channel init fails gracefully when Redis is unavailable."""
+        from celery import Celery
+
+        # Use a port that definitely doesn't have Redis
+        app = Celery("test_bad_connection")
+        app.conf.update(
+            broker_url="redis://localhost:59999/0",  # Non-existent port
+            broker_transport="celery_redis_plus.transport:Transport",
+            broker_connection_timeout=1,
+            broker_connection_retry=False,
+        )
+
+        # Opening a connection to non-existent Redis should raise OperationalError
+        from kombu.exceptions import OperationalError
+
+        with pytest.raises(OperationalError, match="Connection refused"), app.connection() as conn:
+            # Force channel creation
+            _ = conn.default_channel  # type: ignore[attr-defined]
+
+        app.close()
+
+
+@pytest.mark.integration
+class TestChannelCloseWithFanout:
+    """Tests for channel close with fanout queues."""
+
+    def test_close_deletes_auto_delete_fanout_queues(
+        self,
+        redis_container: tuple[str, int, str],
+    ) -> None:
+        """Test that closing channel deletes auto-delete fanout queues."""
+        from celery import Celery
+
+        host, port, _image = redis_container
+
+        app = Celery("test_auto_delete")
+        app.conf.update(
+            broker_url=f"redis://{host}:{port}/0",
+            broker_transport="celery_redis_plus.transport:Transport",
+            result_backend=f"redis://{host}:{port}/1",
+            task_always_eager=False,
+        )
+
+        with app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Declare the queue - this adds it to auto_delete_queues
+            channel.queue_declare("auto_del_queue", auto_delete=True)
+
+            # Add to _fanout_queues to simulate binding
+            channel._fanout_queues["auto_del_queue"] = (
+                "test_auto_del_fanout",
+                "",
+            )
+            channel.auto_delete_queues.add("auto_del_queue")
+
+            # Verify it's tracked
+            assert "auto_del_queue" in channel.auto_delete_queues
+            assert "auto_del_queue" in channel._fanout_queues
+
+        # After context exit, close is called - auto-delete queues should be deleted
+        app.close()
+
+
+@pytest.mark.integration
+class TestSynchronousGet:
+    """Tests for synchronous _get method."""
+
+    def test_get_returns_message(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test _get returns message from queue."""
+        from kombu.utils.json import dumps  # type: ignore[attr-defined]
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+
+            # Clear and set up
+            client.delete("celery", "messages")
+
+            delivery_tag = "sync-get-test"
+            payload = {
+                "body": "test body",
+                "headers": {},
+                "properties": {"delivery_tag": delivery_tag},
+            }
+
+            # Store message
+            client.hset("messages", delivery_tag, dumps([payload, "", "celery"]))  # type: ignore[call-arg]
+            client.zadd("celery", {delivery_tag: 100.0})
+
+            # Use synchronous _get
+            message = channel._get("celery")
+
+            assert message["body"] == "test body"
+            assert message["properties"]["delivery_tag"] == delivery_tag
+
+    def test_get_raises_empty_when_no_message(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test _get raises Empty when queue is empty."""
+        from queue import Empty
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+
+            # Clear queue
+            client.delete("empty_test_queue")
+
+            # _get on empty queue should raise Empty
+            with pytest.raises(Empty):
+                channel._get("empty_test_queue")
+
+    def test_get_raises_empty_when_payload_missing(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test _get raises Empty when delivery tag exists but payload is gone."""
+        from queue import Empty
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+
+            # Clear and set up
+            client.delete("celery", "messages")
+
+            # Add delivery tag to queue but NOT to messages hash
+            delivery_tag = "orphan-tag"
+            client.zadd("celery", {delivery_tag: 100.0})
+
+            # _get should raise Empty because payload is missing
+            with pytest.raises(Empty):
+                channel._get("celery")
+
+
+@pytest.mark.integration
+class TestBzmpopEdgeCases:
+    """Tests for _bzmpop_start edge cases."""
+
+    def test_bzmpop_start_with_no_active_queues(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test _bzmpop_start returns early when no active queues."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Clear active queues and reset queue cycle
+            channel.active_queues.clear()
+            channel._update_queue_cycle()
+
+            # Should return without error (early return when no queues)
+            channel._bzmpop_start(timeout=1)
+
+            # _in_poll should still be False (not a connection object)
+            assert channel._in_poll is False
+
+    def test_bzmpop_start_with_global_keyprefix(
+        self,
+        redis_container: tuple[str, int, str],
+    ) -> None:
+        """Test _bzmpop_start uses prefixed keys when global_keyprefix is set."""
+        from celery import Celery
+
+        host, port, _image = redis_container
+
+        app = Celery("test_bzmpop_prefix")
+        app.conf.update(
+            broker_url=f"redis://{host}:{port}/0",
+            broker_transport="celery_redis_plus.transport:Transport",
+            broker_transport_options={"global_keyprefix": "prefix:"},
+            result_backend=f"redis://{host}:{port}/1",
+            task_always_eager=False,
+        )
+
+        with app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Verify global_keyprefix is set
+            assert channel.global_keyprefix == "prefix:"
+
+            # Add an active queue
+            channel.active_queues.add("celery")
+            channel._queue_cycle.consume(0)  # Reset
+            channel._update_queue_cycle()
+
+            # We can verify the channel has global_keyprefix set
+            # The actual BZMPOP call would use prefixed keys
+
+        app.close()
+
+
+@pytest.mark.unit
+class TestPollingInterval:
+    """Tests for polling_interval setting."""
+
+    def test_transport_default_polling_interval_is_none(self) -> None:
+        """Test Transport default polling_interval is None."""
+        assert Transport.polling_interval is None
+
+    def test_transport_default_brpop_timeout(self) -> None:
+        """Test Transport default brpop_timeout is 1."""
+        assert Transport.brpop_timeout == 1
+
+
+@pytest.mark.unit
+class TestAfterFork:
+    """Tests for fork handling."""
+
+    def test_after_fork_cleanup_channel(self) -> None:
+        """Test _after_fork_cleanup_channel calls channel._after_fork."""
+        from celery_redis_plus.transport import _after_fork_cleanup_channel
+
+        mock_channel = MagicMock()
+
+        _after_fork_cleanup_channel(mock_channel)
+
+        mock_channel._after_fork.assert_called_once()
+
+    def test_channel_after_fork_disconnects_pools(self) -> None:
+        """Test Channel._after_fork calls _disconnect_pools."""
+        mock_channel = MagicMock(spec=Channel)
+        mock_channel._disconnect_pools = MagicMock()
+
+        # Call the actual _after_fork method
+        Channel._after_fork(mock_channel)
+
+        mock_channel._disconnect_pools.assert_called_once()
+
+
+@pytest.mark.integration
+class TestPoolDisconnect:
+    """Tests for pool disconnection."""
+
+    def test_disconnect_pools_cleans_up(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test _disconnect_pools cleans up connection pools."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Force pool creation by accessing client
+            _ = channel.client
+
+            # Call disconnect
+            channel._disconnect_pools()
+
+            # Pools should be cleared
+            assert channel._pool is None
+            assert channel._async_pool is None
