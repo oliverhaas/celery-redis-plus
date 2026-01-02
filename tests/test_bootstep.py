@@ -93,6 +93,18 @@ class TestDelayedDeliveryBootstep:
         call_args = transport.setup_native_delayed_delivery.call_args
         assert call_args[0][1] == []
 
+    def test_start_transport_supports_but_no_setup_method(self) -> None:
+        """Test start when transport claims support but has no setup method."""
+        consumer = MagicMock()
+        transport = MagicMock(spec=[])  # No methods
+        transport.supports_native_delayed_delivery = True
+        consumer.connection.transport = transport
+
+        bootstep = DelayedDeliveryBootstep(consumer)
+
+        # Should not raise - gracefully handles missing setup method
+        bootstep.start(consumer)
+
     def test_stop_no_connection(self) -> None:
         """Test stop when consumer has no connection."""
         consumer = MagicMock()
