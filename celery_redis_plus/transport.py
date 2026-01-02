@@ -83,12 +83,13 @@ error_classes_t = namedtuple("error_classes_t", ("connection_errors", "channel_e
 def _queue_score(priority: int, timestamp: float | None = None, delay_seconds: float = 0.0) -> float:
     """Compute sorted set score for queue ordering.
 
-    Lower priority number = higher priority = lower score = popped first.
+    Higher priority number = higher priority = lower score = popped first.
+    This matches RabbitMQ semantics where priority 255 is highest, 0 is lowest.
     Within same priority, earlier timestamp = lower score = popped first (FIFO).
     Delayed messages have future timestamps in their score.
 
     Args:
-        priority: Message priority (0-255, lower is higher priority)
+        priority: Message priority (0-255, higher is higher priority, matching RabbitMQ)
         timestamp: Unix timestamp in seconds (defaults to current time)
         delay_seconds: Additional delay in seconds for delayed delivery
 
@@ -97,7 +98,7 @@ def _queue_score(priority: int, timestamp: float | None = None, delay_seconds: f
     """
     if timestamp is None:
         timestamp = time()
-    # Invert priority so lower number = lower score = popped first
+    # Invert priority so higher priority number = lower score = popped first
     # Multiply by large factor to leave room for millisecond timestamps
     return (255 - priority) * PRIORITY_SCORE_MULTIPLIER + int((timestamp + delay_seconds) * 1000)
 
@@ -177,11 +178,9 @@ class GlobalKeyPrefixMixin:
     PREFIXED_SIMPLE_COMMANDS = [
         "HDEL",
         "HGET",
-        "HLEN",
         "HSET",
         "SADD",
         "SREM",
-        "SET",
         "SMEMBERS",
         "ZADD",
         "ZCARD",
@@ -191,19 +190,48 @@ class GlobalKeyPrefixMixin:
         "ZSCORE",
         "XADD",
         "XACK",
-        "XAUTOCLAIM",
         "XGROUP CREATE",
-        "XGROUP DELCONSUMER",
-        "XINFO STREAM",
-        "XINFO CONSUMERS",
-        "XPENDING",
         "XRANGE",
     ]
 
-    PREFIXED_COMPLEX_COMMANDS = {
+    @staticmethod
+    def _prefix_bzmpop_args(args: list[Any], prefix: str) -> list[Any]:
+        """Prefix keys in BZMPOP command.
+
+        BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT count]
+        """
+        numkeys = int(args[1])
+        keys_start = 2
+        keys_end = 2 + numkeys
+        pre_args = args[:keys_start]
+        keys = [prefix + str(arg) for arg in args[keys_start:keys_end]]
+        post_args = args[keys_end:]
+        return pre_args + keys + post_args
+
+    @staticmethod
+    def _prefix_xreadgroup_args(args: list[Any], prefix: str) -> list[Any]:
+        """Prefix keys in XREADGROUP command.
+
+        XREADGROUP GROUP <group> <consumer> [COUNT n] [BLOCK ms] STREAMS <key1> ... <id1> ...
+        """
+        streams_idx = None
+        for i, arg in enumerate(args):
+            if arg in ("STREAMS", b"STREAMS"):
+                streams_idx = i
+                break
+        if streams_idx is not None:
+            after_streams = args[streams_idx + 1 :]
+            num_streams = len(after_streams) // 2
+            prefixed_keys = [prefix + str(k) for k in after_streams[:num_streams]]
+            stream_ids = after_streams[num_streams:]
+            return args[: streams_idx + 1] + prefixed_keys + stream_ids
+        return args
+
+    PREFIXED_COMPLEX_COMMANDS: dict[str, dict[str, int | None] | Any] = {
         "DEL": {"args_start": 0, "args_end": None},
-        "EVALSHA": {"args_start": 2, "args_end": 3},
         "WATCH": {"args_start": 0, "args_end": None},
+        "BZMPOP": _prefix_bzmpop_args,
+        "XREADGROUP": _prefix_xreadgroup_args,
     }
 
     def _prefix_args(self, args: list[Any]) -> list[Any]:
@@ -212,37 +240,19 @@ class GlobalKeyPrefixMixin:
 
         if command in self.PREFIXED_SIMPLE_COMMANDS:
             args[0] = self.global_keyprefix + str(args[0])
-        elif command == "BZMPOP":
-            # BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT count]
-            numkeys = int(args[1])
-            keys_start = 2
-            keys_end = 2 + numkeys
-            pre_args = args[:keys_start]
-            keys = [self.global_keyprefix + str(arg) for arg in args[keys_start:keys_end]]
-            post_args = args[keys_end:]
-            args = pre_args + keys + post_args
-        elif command == "XREADGROUP":
-            # XREADGROUP GROUP <group> <consumer> [COUNT n] [BLOCK ms] STREAMS <key1> ... <id1> ...
-            streams_idx = None
-            for i, arg in enumerate(args):
-                if arg in ("STREAMS", b"STREAMS"):
-                    streams_idx = i
-                    break
-            if streams_idx is not None:
-                after_streams = args[streams_idx + 1 :]
-                num_streams = len(after_streams) // 2
-                prefixed_keys = [self.global_keyprefix + str(k) for k in after_streams[:num_streams]]
-                stream_ids = after_streams[num_streams:]
-                args = args[: streams_idx + 1] + prefixed_keys + stream_ids
         elif command in self.PREFIXED_COMPLEX_COMMANDS:
             spec = self.PREFIXED_COMPLEX_COMMANDS[command]
-            args_start = spec["args_start"]
-            args_end = spec["args_end"]
+            if callable(spec):
+                args = spec(args, self.global_keyprefix)
+            else:
+                # It's a dict with args_start/args_end
+                args_start = spec["args_start"]
+                args_end = spec["args_end"]
 
-            pre_args = args[:args_start] if args_start and args_start > 0 else []
-            post_args = args[args_end:] if args_end is not None else []
+                pre_args = args[:args_start] if args_start and args_start > 0 else []
+                post_args = args[args_end:] if args_end is not None else []
 
-            args = pre_args + [self.global_keyprefix + str(arg) for arg in args[args_start:args_end]] + post_args
+                args = pre_args + [self.global_keyprefix + str(arg) for arg in args[args_start:args_end]] + post_args
 
         return [command, *args]
 

@@ -30,7 +30,7 @@ class TestQueueScore:
         """Test score calculation without delay."""
         now = time.time()
         score = _queue_score(priority=0, timestamp=now)
-        # Priority 0 (highest) -> 255 * MULTIPLIER + timestamp_ms
+        # Priority 0 (lowest) -> 255 * MULTIPLIER + timestamp_ms (highest score)
         expected = 255 * PRIORITY_SCORE_MULTIPLIER + int(now * 1000)
         assert score == expected
 
@@ -43,12 +43,12 @@ class TestQueueScore:
         assert score == expected
 
     def test_higher_priority_lower_score(self) -> None:
-        """Test that higher priority (lower number) results in lower score."""
+        """Test that higher priority (higher number) results in lower score (RabbitMQ semantics)."""
         now = time.time()
-        high_priority_score = _queue_score(priority=0, timestamp=now)  # Highest priority
-        low_priority_score = _queue_score(priority=255, timestamp=now)  # Lowest priority
-        # Lower score = popped first
-        assert high_priority_score > low_priority_score
+        low_priority_score = _queue_score(priority=0, timestamp=now)  # Lowest priority
+        high_priority_score = _queue_score(priority=255, timestamp=now)  # Highest priority
+        # Lower score = popped first, so high priority should have lower score
+        assert high_priority_score < low_priority_score
 
     def test_earlier_timestamp_lower_score_same_priority(self) -> None:
         """Test FIFO within same priority."""
@@ -61,9 +61,10 @@ class TestQueueScore:
     def test_default_timestamp_uses_current_time(self) -> None:
         """Test that None timestamp uses current time."""
         before = time.time()
-        score = _queue_score(priority=0)
+        score = _queue_score(priority=0)  # priority 0 = lowest priority
         after = time.time()
         # Extract timestamp from score (note: int() truncation may cause small loss)
+        # Priority 0 gives (255 - 0) * MULTIPLIER = 255 * MULTIPLIER base score
         timestamp_ms = score - (255 * PRIORITY_SCORE_MULTIPLIER)
         timestamp = timestamp_ms / 1000
         # Allow small tolerance for int() truncation in _queue_score
@@ -159,30 +160,6 @@ class TestGlobalKeyPrefixMixin:
 
         args = mixin._prefix_args(["ZADD", "myqueue", {"tag1": 100}])
         assert args[1] == "myqueue"
-
-    def test_prefix_evalsha_args(self) -> None:
-        """Test EVALSHA command key prefixing."""
-        mixin = GlobalKeyPrefixMixin()
-        mixin.global_keyprefix = "prefix_"
-
-        # EVALSHA sha numkeys key [key ...] arg [arg ...]
-        prefixed_args = mixin._prefix_args(
-            [
-                "EVALSHA",
-                "not_prefixed",  # sha
-                "1",  # numkeys
-                "fake_key",  # key
-                "not_prefixed",  # arg
-            ],
-        )
-
-        assert prefixed_args == [
-            "EVALSHA",
-            "not_prefixed",
-            "1",
-            "prefix_fake_key",
-            "not_prefixed",
-        ]
 
 
 @pytest.mark.unit
@@ -563,38 +540,37 @@ class TestMultiChannelPoller:
         poller._register_XREADGROUP.assert_not_called()  # type: ignore[attr-defined]
 
 
+@pytest.mark.integration
 class TestTransportIntegration:
     """Integration tests for transport with real Redis."""
 
-    @pytest.mark.integration
     def test_sorted_set_message_ordering(self, redis_client: Any) -> None:
-        """Test that messages are ordered by score in sorted set."""
+        """Test that messages are ordered by score in sorted set (RabbitMQ semantics)."""
         queue_name = "test_queue_ordering"
 
         now = time.time()
 
-        # Add messages with different priorities
-        # Lower score = popped first, higher priority (lower number) = lower score component
-        # But we invert: (255 - priority), so priority 0 -> 255, priority 255 -> 0
-        high_pri_score = _queue_score(0, now)  # Highest priority
+        # Add messages with different priorities (RabbitMQ semantics: higher number = higher priority)
+        # Lower score = popped first
+        # Formula: (255 - priority) * MULTIPLIER, so priority 255 -> 0, priority 0 -> 255
+        low_pri_score = _queue_score(0, now)  # Lowest priority (highest score)
         med_pri_score = _queue_score(128, now)  # Medium priority
-        low_pri_score = _queue_score(255, now)  # Lowest priority
+        high_pri_score = _queue_score(255, now)  # Highest priority (lowest score)
 
         redis_client.zadd(queue_name, {"high_pri": high_pri_score})
         redis_client.zadd(queue_name, {"low_pri": low_pri_score})
         redis_client.zadd(queue_name, {"med_pri": med_pri_score})
 
-        # Pop should return lowest score first (lowest priority number = highest priority)
+        # Pop should return lowest score first (highest priority number = highest priority)
         result = redis_client.zpopmin(queue_name, 1)
-        assert result[0][0] == b"low_pri"  # Priority 255 has lowest score
+        assert result[0][0] == b"high_pri"  # Priority 255 has lowest score, processed first
 
         result = redis_client.zpopmin(queue_name, 1)
         assert result[0][0] == b"med_pri"
 
         result = redis_client.zpopmin(queue_name, 1)
-        assert result[0][0] == b"high_pri"
+        assert result[0][0] == b"low_pri"  # Priority 0 has highest score, processed last
 
-    @pytest.mark.integration
     def test_delayed_message_not_visible_until_time(self, redis_client: Any) -> None:
         """Test that delayed messages have future scores."""
         queue_name = "test_queue_delayed"
@@ -602,7 +578,7 @@ class TestTransportIntegration:
         now = time.time()
         delay = 60.0  # 60 second delay
 
-        # Message without delay
+        # Message without delay (use priority 0, lowest priority = highest score)
         immediate_score = _queue_score(0, now)
         # Message with delay
         delayed_score = _queue_score(0, now, delay_seconds=delay)
@@ -611,14 +587,13 @@ class TestTransportIntegration:
         redis_client.zadd(queue_name, {"delayed": delayed_score})
 
         # When we pop with a max score of "now", only immediate should be returned
-        # Use priority 0 (highest priority = highest score) to get max possible score for current time
+        # Use priority 0 (lowest priority = highest score) to get max possible score for current time
         current_max_score = _queue_score(0, now)
         result = redis_client.zrangebyscore(queue_name, "-inf", current_max_score)
 
         assert b"immediate" in result
         assert b"delayed" not in result
 
-    @pytest.mark.integration
     def test_bzmpop_with_sorted_set(self, redis_client: Any) -> None:
         """Test BZMPOP command with sorted sets (requires Redis 7.0+)."""
         queue_name = "test_queue_bzmpop"
@@ -637,7 +612,6 @@ class TestTransportIntegration:
         assert len(members) == 1
         assert members[0][0] == b"message1"
 
-    @pytest.mark.integration
     def test_stream_consumer_group(self, redis_client: Any) -> None:
         """Test Redis Streams with consumer groups."""
         stream_name = "test_stream"
@@ -674,7 +648,6 @@ class TestTransportIntegration:
         ack_count = redis_client.xack(stream_name, group_name, message_id)
         assert ack_count == 1
 
-    @pytest.mark.integration
     def test_message_hash_storage(self, redis_client: Any) -> None:
         """Test that messages can be stored and retrieved from hash."""
         messages_key = "test_messages"
@@ -693,7 +666,6 @@ class TestTransportIntegration:
         result = redis_client.hget(messages_key, delivery_tag)
         assert result is None
 
-    @pytest.mark.integration
     def test_stream_xadd_and_xread(self, redis_client: Any) -> None:
         """Test basic stream XADD and XREAD operations."""
         stream_name = "test_stream_basic"
@@ -711,7 +683,6 @@ class TestTransportIntegration:
         stream, message_list = messages[0]
         assert len(message_list) == 2
 
-    @pytest.mark.integration
     def test_stream_consumer_group_redelivery(self, redis_client: Any) -> None:
         """Test that unacked messages can be reclaimed from PEL."""
         stream_name = "test_stream_pel"
@@ -753,7 +724,6 @@ class TestTransportIntegration:
         )
         assert len(claimed) == 1
 
-    @pytest.mark.integration
     def test_stream_maxlen_trimming(self, redis_client: Any) -> None:
         """Test that stream respects maxlen for trimming."""
         stream_name = "test_stream_maxlen"
