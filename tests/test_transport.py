@@ -16,9 +16,13 @@ from celery_redis_plus.transport import (
     Channel,
     GlobalKeyPrefixMixin,
     MultiChannelPoller,
+    Mutex,
+    MutexHeld,
     QoS,
     Transport,
     _queue_score,
+    get_redis_ConnectionError,
+    get_redis_error_classes,
 )
 
 
@@ -69,6 +73,71 @@ class TestQueueScore:
         timestamp = timestamp_ms / 1000
         # Allow small tolerance for int() truncation in _queue_score
         assert before - 0.001 <= timestamp <= after + 0.001
+
+
+@pytest.mark.unit
+class TestRedisHelpers:
+    """Tests for Redis helper functions."""
+
+    def test_get_redis_error_classes(self) -> None:
+        """Test that get_redis_error_classes returns proper error tuples."""
+        error_classes = get_redis_error_classes()
+        assert hasattr(error_classes, "connection_errors")
+        assert hasattr(error_classes, "channel_errors")
+        assert isinstance(error_classes.connection_errors, tuple)
+        assert isinstance(error_classes.channel_errors, tuple)
+
+    def test_get_redis_connection_error(self) -> None:
+        """Test that get_redis_ConnectionError returns the right exception."""
+        from redis import exceptions
+
+        error_class = get_redis_ConnectionError()
+        assert error_class is exceptions.ConnectionError
+
+
+@pytest.mark.unit
+class TestMutex:
+    """Tests for the Mutex context manager."""
+
+    def test_mutex_acquired_successfully(self) -> None:
+        """Test mutex acquisition when lock is available."""
+        mock_client = MagicMock()
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = True
+        mock_client.lock.return_value = mock_lock
+
+        with Mutex(mock_client, "test_lock", expire=60):
+            pass
+
+        mock_client.lock.assert_called_once_with("test_lock", timeout=60)
+        mock_lock.acquire.assert_called_once_with(blocking=False)
+        mock_lock.release.assert_called_once()
+
+    def test_mutex_raises_when_held(self) -> None:
+        """Test mutex raises MutexHeld when lock is not available."""
+        mock_client = MagicMock()
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = False
+        mock_client.lock.return_value = mock_lock
+
+        with pytest.raises(MutexHeld), Mutex(mock_client, "test_lock", expire=60):
+            pass
+
+        mock_lock.release.assert_not_called()
+
+    def test_mutex_handles_lock_expired(self) -> None:
+        """Test mutex handles LockNotOwnedError on release."""
+        import redis.exceptions
+
+        mock_client = MagicMock()
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = True
+        mock_lock.release.side_effect = redis.exceptions.LockNotOwnedError("Lock expired")
+        mock_client.lock.return_value = mock_lock
+
+        # Should not raise
+        with Mutex(mock_client, "test_lock", expire=60):
+            pass
 
 
 @pytest.mark.unit
