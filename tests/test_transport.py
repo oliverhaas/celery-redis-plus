@@ -629,6 +629,212 @@ class TestChannel:
         group = channel._fanout_consumer_group("myqueue")
         assert group == "celery-redis-plus-fanout-myqueue"
 
+    def test_prepare_virtual_host_with_slash(self) -> None:
+        """Test _prepare_virtual_host with '/' returns default db."""
+        from celery_redis_plus.transport import DEFAULT_DB
+
+        channel = object.__new__(Channel)
+        result = channel._prepare_virtual_host("/")
+        assert result == DEFAULT_DB
+
+    def test_prepare_virtual_host_with_empty(self) -> None:
+        """Test _prepare_virtual_host with empty string returns default db."""
+        from celery_redis_plus.transport import DEFAULT_DB
+
+        channel = object.__new__(Channel)
+        result = channel._prepare_virtual_host("")
+        assert result == DEFAULT_DB
+
+    def test_prepare_virtual_host_with_slash_number(self) -> None:
+        """Test _prepare_virtual_host with '/5' returns 5."""
+        channel = object.__new__(Channel)
+        result = channel._prepare_virtual_host("/5")
+        assert result == 5
+
+    def test_prepare_virtual_host_with_integer(self) -> None:
+        """Test _prepare_virtual_host with integer passthrough."""
+        channel = object.__new__(Channel)
+        result = channel._prepare_virtual_host(3)
+        assert result == 3
+
+    def test_prepare_virtual_host_invalid_raises(self) -> None:
+        """Test _prepare_virtual_host with invalid string raises ValueError."""
+        channel = object.__new__(Channel)
+        with pytest.raises(ValueError, match="Database is int"):
+            channel._prepare_virtual_host("invalid")
+
+    def test_get_table_empty_exchange(self) -> None:
+        """Test get_table returns empty list for exchange with no bindings."""
+        channel = object.__new__(Channel)
+        channel.keyprefix_queue = "_kombu.binding.%s"
+
+        mock_client = MagicMock()
+        mock_client.smembers.return_value = set()
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel.get_table("nonexistent_exchange")
+        assert result == []
+
+    def test_put_fanout(self) -> None:
+        """Test _put_fanout publishes to stream."""
+        channel = object.__new__(Channel)
+        channel.keyprefix_fanout = "/0."
+        channel.fanout_patterns = False
+        channel.stream_maxlen = 1000
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        message = {"body": "test", "properties": {}}
+        channel._put_fanout("myexchange", message, "routing_key")
+
+        mock_client.xadd.assert_called_once()
+        call_kwargs = mock_client.xadd.call_args[1]
+        assert call_kwargs["name"] == "/0.myexchange"
+        assert call_kwargs["maxlen"] == 1000
+        assert "payload" in call_kwargs["fields"]
+
+    def test_get_synchronous(self) -> None:
+        """Test _get retrieves message synchronously."""
+
+        channel = object.__new__(Channel)
+        channel.messages_key = "messages"
+
+        mock_client = MagicMock()
+        # zpopmin returns [(delivery_tag, score)]
+        mock_client.zpopmin.return_value = [(b"tag123", 100.0)]
+        mock_client.hget.return_value = b'[{"body": "test"}, "exchange", "routing_key"]'
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._get("myqueue")
+        assert result == {"body": "test"}
+
+    def test_get_synchronous_empty(self) -> None:
+        """Test _get raises Empty when queue is empty."""
+        from kombu.transport.virtual import Empty
+
+        channel = object.__new__(Channel)
+        channel.messages_key = "messages"
+
+        mock_client = MagicMock()
+        mock_client.zpopmin.return_value = []
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with pytest.raises(Empty):
+            channel._get("myqueue")
+
+    def test_get_client_with_global_keyprefix(self) -> None:
+        """Test _get_client returns PrefixedStrictRedis when global_keyprefix is set."""
+        from celery_redis_plus.transport import PrefixedStrictRedis
+
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = "myprefix:"
+
+        client_factory = channel._get_client()
+
+        # Should return a partial with PrefixedStrictRedis
+        assert client_factory.func is PrefixedStrictRedis
+        assert client_factory.keywords["global_keyprefix"] == "myprefix:"
+
+    def test_get_client_without_global_keyprefix(self) -> None:
+        """Test _get_client returns redis.Redis when no global_keyprefix."""
+        import redis as redis_module
+
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+
+        client_class = channel._get_client()
+
+        assert client_class is redis_module.Redis
+
+    def test_connparams_with_ssl_dict(self) -> None:
+        """Test _connparams applies SSL config from dict."""
+        import redis as redis_module
+
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.max_connections = 10
+        channel.socket_timeout = None
+        channel.socket_connect_timeout = None
+        channel.socket_keepalive = None
+        channel.socket_keepalive_options = None
+        channel.health_check_interval = 25
+        channel.retry_on_timeout = False
+        channel.client_name = None
+        channel.connection_class = redis_module.Connection
+        channel.connection_class_ssl = redis_module.SSLConnection
+
+        # Mock connection with SSL config as dict
+        mock_conninfo = MagicMock()
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 6379
+        mock_conninfo.virtual_host = "0"
+        mock_conninfo.userid = None
+        mock_conninfo.password = None
+        mock_conninfo.ssl = {"ssl_cert_reqs": "required"}
+        mock_conninfo.transport_options = {}
+
+        mock_connection = MagicMock()
+        mock_connection.client = mock_conninfo
+        mock_connection.default_port = 6379
+        channel.connection = mock_connection
+
+        params = channel._connparams()
+
+        assert params["connection_class"] is redis_module.SSLConnection
+        assert params["ssl_cert_reqs"] == "required"
+
+    def test_connparams_with_ssl_true(self) -> None:
+        """Test _connparams applies SSL config when ssl=True."""
+        import redis as redis_module
+
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.max_connections = 10
+        channel.socket_timeout = None
+        channel.socket_connect_timeout = None
+        channel.socket_keepalive = None
+        channel.socket_keepalive_options = None
+        channel.health_check_interval = 25
+        channel.retry_on_timeout = False
+        channel.client_name = None
+        channel.connection_class = redis_module.Connection
+        channel.connection_class_ssl = redis_module.SSLConnection
+
+        # Mock connection with SSL = True
+        mock_conninfo = MagicMock()
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 6379
+        mock_conninfo.virtual_host = "0"
+        mock_conninfo.userid = None
+        mock_conninfo.password = None
+        mock_conninfo.ssl = True
+        mock_conninfo.transport_options = {}
+
+        mock_connection = MagicMock()
+        mock_connection.client = mock_conninfo
+        mock_connection.default_port = 6379
+        channel.connection = mock_connection
+
+        params = channel._connparams()
+
+        assert params["connection_class"] is redis_module.SSLConnection
+
 
 @pytest.mark.unit
 class TestQoS:
@@ -975,6 +1181,21 @@ class TestTransport:
         assert "direct" in Transport.implements.exchange_type
         assert "topic" in Transport.implements.exchange_type
         assert "fanout" in Transport.implements.exchange_type
+
+    def test_driver_version(self) -> None:
+        """Test that driver_version returns redis version string."""
+        import redis as redis_module
+
+        transport = MagicMock(spec=Transport)
+        transport.driver_version = Transport.driver_version
+        version = transport.driver_version(transport)
+        assert version == redis_module.__version__
+
+    def test_connection_errors_defined(self) -> None:
+        """Test that connection and channel errors are defined."""
+        # These are set at class definition time if redis is available
+        assert hasattr(Transport, "connection_errors")
+        assert hasattr(Transport, "channel_errors")
 
 
 @pytest.mark.unit
