@@ -7,12 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 # Create virtual environment and install with development dependencies (using uv)
 uv venv
-uv sync --extra dev
-
-# Or using pip
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+uv sync
 
 # Run all tests
 pytest
