@@ -24,6 +24,3 @@ DEFAULT_HEALTH_CHECK_INTERVAL = 25
 
 # Default stream maximum length for fanout streams
 DEFAULT_STREAM_MAXLEN = 10000
-
-# Default consumer group name for fanout streams
-DEFAULT_CONSUMER_GROUP = "celery"

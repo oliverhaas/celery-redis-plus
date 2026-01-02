@@ -627,7 +627,7 @@ class TestChannel:
         channel = object.__new__(Channel)
 
         group = channel._fanout_consumer_group("myqueue")
-        assert group == "celery-myqueue"
+        assert group == "myqueue"
 
     def test_prepare_virtual_host_with_slash(self) -> None:
         """Test _prepare_virtual_host with '/' returns default db."""
@@ -2335,9 +2335,9 @@ class TestFanoutMessaging:
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
-            # Test consumer group name generation - format is "celery-{queue}"
+            # Test consumer group name generation - uses queue name directly
             group_name = channel._fanout_consumer_group("my_queue")
-            assert group_name == "celery-my_queue"
+            assert group_name == "my_queue"
 
     def test_fanout_exchange_declaration(
         self,

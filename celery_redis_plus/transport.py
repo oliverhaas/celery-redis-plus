@@ -52,7 +52,6 @@ from kombu.utils.url import _parse_url
 from vine import promise
 
 from .constants import (
-    DEFAULT_CONSUMER_GROUP,
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
@@ -869,7 +868,7 @@ class Channel(virtual.Channel):
 
     def _fanout_consumer_group(self, queue: str) -> str:
         """Get consumer group name for fanout queue."""
-        return f"{DEFAULT_CONSUMER_GROUP}-{queue}"
+        return queue
 
     @cached_property
     def consumer_id(self) -> str:
