@@ -132,3 +132,17 @@ markers = [
   "unit: marks tests as unit tests",
   "integration: marks tests as integration tests",
 ]
+
+[tool.coverage.run]
+# Enable thread-based concurrency measurement for Celery worker tests
+concurrency = ["thread"]
+branch = true
+source = ["celery_redis_plus"]
+omit = ["*/__init__.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+]

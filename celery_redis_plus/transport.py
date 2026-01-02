@@ -1371,3 +1371,9 @@ class Transport(virtual.Transport):
     def on_readable(self, fileno: int) -> Any:
         """Handle AIO event for one of our file descriptors."""
         return self.cycle.on_readable(fileno)
+
+    def setup_native_delayed_delivery(self, connection: Connection, queues: list[str]) -> None:
+        """No-op: delayed delivery is handled inline via score-based retrieval."""
+
+    def teardown_native_delayed_delivery(self) -> None:
+        """No-op: no background processing to tear down."""

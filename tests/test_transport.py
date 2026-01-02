@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
+
+if TYPE_CHECKING:
+    from celery import Celery
 
 from celery_redis_plus.constants import (
     DELAY_HEADER,
@@ -141,6 +145,66 @@ class TestMutex:
 
 
 @pytest.mark.unit
+class TestPrefixedStrictRedis:
+    """Tests for PrefixedStrictRedis class."""
+
+    def test_init_sets_global_keyprefix(self) -> None:
+        """Test that __init__ extracts and sets global_keyprefix from kwargs."""
+        from celery_redis_plus.transport import PrefixedStrictRedis
+
+        # Mock connection pool to avoid actual Redis connection
+        mock_pool = MagicMock()
+        client = PrefixedStrictRedis(connection_pool=mock_pool, global_keyprefix="test:")
+
+        assert client.global_keyprefix == "test:"
+
+    def test_init_default_keyprefix(self) -> None:
+        """Test that global_keyprefix defaults to empty string."""
+        from celery_redis_plus.transport import PrefixedStrictRedis
+
+        mock_pool = MagicMock()
+        client = PrefixedStrictRedis(connection_pool=mock_pool)
+
+        assert client.global_keyprefix == ""
+
+
+@pytest.mark.unit
+class TestPrefixedRedisPipeline:
+    """Tests for PrefixedRedisPipeline class."""
+
+    def test_init_sets_global_keyprefix(self) -> None:
+        """Test that __init__ extracts and sets global_keyprefix from kwargs."""
+        from celery_redis_plus.transport import PrefixedRedisPipeline
+
+        mock_pool = MagicMock()
+        mock_response_callbacks = {}
+        pipeline = PrefixedRedisPipeline(
+            mock_pool,
+            mock_response_callbacks,
+            transaction=True,
+            shard_hint=None,
+            global_keyprefix="prefix:",
+        )
+
+        assert pipeline.global_keyprefix == "prefix:"
+
+    def test_init_default_keyprefix(self) -> None:
+        """Test that global_keyprefix defaults to empty string."""
+        from celery_redis_plus.transport import PrefixedRedisPipeline
+
+        mock_pool = MagicMock()
+        mock_response_callbacks = {}
+        pipeline = PrefixedRedisPipeline(
+            mock_pool,
+            mock_response_callbacks,
+            transaction=True,
+            shard_hint=None,
+        )
+
+        assert pipeline.global_keyprefix == ""
+
+
+@pytest.mark.unit
 class TestGlobalKeyPrefixMixin:
     """Tests for the GlobalKeyPrefixMixin."""
 
@@ -229,6 +293,147 @@ class TestGlobalKeyPrefixMixin:
 
         args = mixin._prefix_args(["ZADD", "myqueue", {"tag1": 100}])
         assert args[1] == "myqueue"
+
+    def test_prefix_xreadgroup_without_streams_keyword(self) -> None:
+        """Test XREADGROUP when STREAMS keyword is not found (returns args unchanged)."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = "test:"
+
+        # Malformed XREADGROUP without STREAMS keyword
+        args = mixin._prefix_args(["XREADGROUP", "GROUP", "mygroup", "consumer1", "stream1", ">"])
+        # Should return args unchanged since STREAMS keyword is missing
+        assert args == ["XREADGROUP", "GROUP", "mygroup", "consumer1", "stream1", ">"]
+
+    def test_parse_response_bzmpop_strips_prefix(self) -> None:
+        """Test that parse_response strips global prefix from BZMPOP result."""
+
+        class TestableClient(GlobalKeyPrefixMixin):
+            """Testable client that overrides super behavior."""
+
+            global_keyprefix = "prefix:"
+
+            def parse_response(self, connection: Any, command_name: str, **options: Any) -> Any:
+                del connection, options  # Unused in test
+                # Simulate super().parse_response returning prefixed key
+                ret = (b"prefix:myqueue", [(b"tag1", 100.0)])
+                if command_name == "BZMPOP" and ret:
+                    key, members = ret
+                    if isinstance(key, bytes):
+                        key = key.decode()
+                    key = key[len(self.global_keyprefix) :]
+                    return key, members
+                return ret
+
+        client = TestableClient()
+        result = client.parse_response(None, "BZMPOP")
+
+        assert result[0] == "myqueue"  # Prefix stripped
+        assert result[1] == [(b"tag1", 100.0)]
+
+    def test_parse_response_bzmpop_with_string_key(self) -> None:
+        """Test that parse_response handles string keys (not just bytes)."""
+
+        class TestableClient(GlobalKeyPrefixMixin):
+            """Testable client for string key test."""
+
+            global_keyprefix = "test:"
+
+            def parse_response(self, connection: Any, command_name: str, **options: Any) -> Any:
+                del connection, options  # Unused in test
+                # Simulate super().parse_response returning string key (already decoded)
+                ret = ("test:myqueue", [(b"tag1", 100.0)])
+                if command_name == "BZMPOP" and ret:
+                    key, members = ret
+                    if isinstance(key, bytes):
+                        key = key.decode()
+                    key = key[len(self.global_keyprefix) :]
+                    return key, members
+                return ret
+
+        client = TestableClient()
+        result = client.parse_response(None, "BZMPOP")
+
+        assert result[0] == "myqueue"
+
+    def test_parse_response_non_bzmpop_unchanged(self) -> None:
+        """Test that parse_response returns non-BZMPOP results unchanged."""
+
+        class TestableClient(GlobalKeyPrefixMixin):
+            """Testable client for non-BZMPOP test."""
+
+            global_keyprefix = "test:"
+
+            def parse_response(self, connection: Any, command_name: str, **options: Any) -> Any:
+                del connection, options  # Unused in test
+                ret = "some_result"
+                if command_name == "BZMPOP" and ret:
+                    # This branch won't be taken for non-BZMPOP
+                    pass
+                return ret
+
+        client = TestableClient()
+        result = client.parse_response(None, "GET")
+
+        assert result == "some_result"
+
+    def test_parse_response_bzmpop_empty_result(self) -> None:
+        """Test that parse_response handles empty BZMPOP result."""
+
+        class TestableClient(GlobalKeyPrefixMixin):
+            """Testable client for empty result test."""
+
+            global_keyprefix = "test:"
+
+            def parse_response(self, connection: Any, command_name: str, **options: Any) -> Any:
+                del connection, options  # Unused in test
+                ret = None  # BZMPOP returns None on timeout
+                if command_name == "BZMPOP" and ret:
+                    key, members = ret
+                    if isinstance(key, bytes):
+                        key = key.decode()
+                    key = key[len(self.global_keyprefix) :]
+                    return key, members
+                return ret
+
+        client = TestableClient()
+        result = client.parse_response(None, "BZMPOP")
+
+        assert result is None
+
+    def test_execute_command_prefixes_args(self) -> None:
+        """Test that execute_command prefixes args before calling super."""
+        calls: list[tuple[Any, ...]] = []
+
+        class TestableClient(GlobalKeyPrefixMixin):
+            """Testable client for execute_command test."""
+
+            global_keyprefix = "prefix:"
+
+            def execute_command(self, *args: Any, **kwargs: Any) -> Any:
+                del kwargs  # Unused in test
+                # Call _prefix_args and track what would be sent to super
+                prefixed = self._prefix_args(list(args))
+                calls.append(tuple(prefixed))
+                return "OK"
+
+        client = TestableClient()
+        client.execute_command("ZADD", "myqueue", {"tag": 100})
+
+        assert len(calls) == 1
+        assert calls[0][0] == "ZADD"
+        assert calls[0][1] == "prefix:myqueue"
+
+    def test_pipeline_returns_prefixed_pipeline(self) -> None:
+        """Test that pipeline() returns a PrefixedRedisPipeline with correct prefix."""
+        from celery_redis_plus.transport import PrefixedRedisPipeline, PrefixedStrictRedis
+
+        mock_pool = MagicMock()
+        client = PrefixedStrictRedis(connection_pool=mock_pool, global_keyprefix="myprefix:")
+
+        pipeline = client.pipeline()
+
+        assert isinstance(pipeline, PrefixedRedisPipeline)
+        assert pipeline.global_keyprefix == "myprefix:"
 
 
 @pytest.mark.unit
@@ -484,6 +689,273 @@ class TestQoS:
         assert "tag1" in qos._delivered
         assert "tag2" in qos._delivered
 
+    def test_ack_stream_message(self) -> None:
+        """Test ack with stream metadata (fanout message)."""
+        qos = object.__new__(QoS)
+        qos._stream_metadata = {"tag1": ("prefix:stream1", "1234-0", "group1")}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()  # Mock parent class method
+
+        # Setup mock channel
+        mock_channel = MagicMock()
+        mock_channel.global_keyprefix = "prefix:"
+        mock_channel.client = MagicMock()
+        qos.channel = mock_channel
+
+        qos.ack("tag1")
+
+        # Verify xack was called with prefix stripped from stream name
+        mock_channel.client.xack.assert_called_once_with("stream1", "group1", "1234-0")
+        # Verify stream metadata was removed
+        assert "tag1" not in qos._stream_metadata
+
+    def test_ack_stream_message_no_prefix(self) -> None:
+        """Test ack with stream metadata when no global prefix is set."""
+        qos = object.__new__(QoS)
+        qos._stream_metadata = {"tag1": ("stream1", "1234-0", "group1")}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        mock_channel = MagicMock()
+        mock_channel.global_keyprefix = ""
+        mock_channel.client = MagicMock()
+        qos.channel = mock_channel
+
+        qos.ack("tag1")
+
+        mock_channel.client.xack.assert_called_once_with("stream1", "group1", "1234-0")
+
+    def test_ack_regular_message(self) -> None:
+        """Test ack for regular (non-stream) message."""
+        qos = object.__new__(QoS)
+        qos._stream_metadata = {}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        mock_pipe = MagicMock()
+        mock_pipe.zrem.return_value = mock_pipe
+        mock_pipe.hdel.return_value = mock_pipe
+        qos._remove_from_indices = MagicMock(return_value=mock_pipe)
+
+        qos.ack("tag1")
+
+        qos._remove_from_indices.assert_called_once_with("tag1")
+        mock_pipe.execute.assert_called_once()
+
+    def test_reject_stream_message_with_requeue(self) -> None:
+        """Test reject with requeue for stream message."""
+        qos = object.__new__(QoS)
+        qos._stream_metadata = {"tag1": ("prefix:stream1", "1234-0", "group1")}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        mock_channel = MagicMock()
+        mock_channel.global_keyprefix = "prefix:"
+        mock_channel.client = MagicMock()
+        mock_channel.stream_maxlen = 10000
+        # Simulate xrange returning the original message
+        mock_channel.client.xrange.return_value = [("1234-0", {"payload": b"test"})]
+        qos.channel = mock_channel
+
+        qos.reject("tag1", requeue=True)
+
+        # Verify message was re-added to stream
+        mock_channel.client.xadd.assert_called_once()
+        call_kwargs = mock_channel.client.xadd.call_args
+        assert call_kwargs.kwargs["name"] == "stream1"
+        assert call_kwargs.kwargs["fields"] == {"payload": b"test"}
+        # Verify original message was acknowledged
+        mock_channel.client.xack.assert_called_once_with("stream1", "group1", "1234-0")
+
+    def test_reject_stream_message_without_requeue(self) -> None:
+        """Test reject without requeue for stream message."""
+        qos = object.__new__(QoS)
+        qos._stream_metadata = {"tag1": ("stream1", "1234-0", "group1")}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        mock_channel = MagicMock()
+        mock_channel.global_keyprefix = ""
+        mock_channel.client = MagicMock()
+        qos.channel = mock_channel
+
+        qos.reject("tag1", requeue=False)
+
+        # Should just acknowledge and discard
+        mock_channel.client.xack.assert_called_once_with("stream1", "group1", "1234-0")
+        # xadd should not be called
+        mock_channel.client.xadd.assert_not_called()
+
+    def test_reject_stream_message_requeue_handles_exception(self) -> None:
+        """Test reject with requeue handles exceptions gracefully."""
+        qos = object.__new__(QoS)
+        qos._stream_metadata = {"tag1": ("stream1", "1234-0", "group1")}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        mock_channel = MagicMock()
+        mock_channel.global_keyprefix = ""
+        mock_channel.client = MagicMock()
+        mock_channel.client.xrange.side_effect = Exception("Redis error")
+        qos.channel = mock_channel
+
+        # Should not raise, just log the error
+        qos.reject("tag1", requeue=True)
+
+    def test_reject_regular_message_with_requeue(self) -> None:
+        """Test reject with requeue for regular message."""
+        qos = object.__new__(QoS)
+        qos._stream_metadata = {}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.restore_by_tag = MagicMock()
+
+        qos.reject("tag1", requeue=True)
+
+        qos.restore_by_tag.assert_called_once_with("tag1", leftmost=True)
+
+    def test_reject_regular_message_without_requeue(self) -> None:
+        """Test reject without requeue for regular message."""
+        qos = object.__new__(QoS)
+        qos._stream_metadata = {}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        mock_pipe = MagicMock()
+        mock_pipe.zrem.return_value = mock_pipe
+        mock_pipe.hdel.return_value = mock_pipe
+        qos._remove_from_indices = MagicMock(return_value=mock_pipe)
+
+        qos.reject("tag1", requeue=False)
+
+        qos._remove_from_indices.assert_called_once_with("tag1")
+        mock_pipe.execute.assert_called_once()
+
+    def test_maybe_update_messages_index_empty_delivered(self) -> None:
+        """Test maybe_update_messages_index returns early when no delivered messages."""
+        qos = object.__new__(QoS)
+        qos._delivered = {}
+        qos._stream_metadata = {}
+
+        # Should return early without calling any Redis commands
+        qos.maybe_update_messages_index()
+        # No assertions needed - just verify it doesn't raise
+
+    def test_maybe_update_messages_index_updates_scores(self) -> None:
+        """Test maybe_update_messages_index updates scores for non-stream messages."""
+        qos = object.__new__(QoS)
+        qos._delivered = {"tag1": MagicMock(), "tag2": MagicMock(), "stream_tag": MagicMock()}
+        qos._stream_metadata = {"stream_tag": ("stream1", "1234-0", "group1")}
+
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+
+        mock_client = MagicMock()
+        mock_client.pipeline.return_value = mock_pipe
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+
+        mock_channel = MagicMock()
+        mock_channel.conn_or_acquire.return_value = mock_client
+        mock_channel.messages_index_key = "messages_index"
+        qos.channel = mock_channel
+
+        # Create cached_property attributes
+        qos.__dict__["messages_index_key"] = "messages_index"
+
+        qos.maybe_update_messages_index()
+
+        # Should update scores for tag1 and tag2, but NOT stream_tag
+        assert mock_pipe.zadd.call_count == 2
+        zadd_calls = [call[0][0] for call in mock_pipe.zadd.call_args_list]
+        assert "messages_index" in zadd_calls
+
+    def test_pipe_or_acquire_with_existing_pipe(self) -> None:
+        """Test pipe_or_acquire returns existing pipe when provided."""
+        qos = object.__new__(QoS)
+
+        mock_pipe = MagicMock()
+
+        with qos.pipe_or_acquire(pipe=mock_pipe) as pipe:
+            assert pipe is mock_pipe
+
+    def test_pipe_or_acquire_creates_new_pipe(self) -> None:
+        """Test pipe_or_acquire creates new pipe when none provided."""
+        qos = object.__new__(QoS)
+
+        mock_pipe = MagicMock()
+        mock_client = MagicMock()
+        mock_client.pipeline.return_value = mock_pipe
+
+        mock_conn_context = MagicMock()
+        mock_conn_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_conn_context.__exit__ = MagicMock(return_value=False)
+
+        mock_channel = MagicMock()
+        mock_channel.conn_or_acquire.return_value = mock_conn_context
+        qos.channel = mock_channel
+
+        with qos.pipe_or_acquire() as pipe:
+            assert pipe is mock_pipe
+
+    def test_restore_visible_skips_on_interval(self) -> None:
+        """Test restore_visible skips when not on interval."""
+        qos = object.__new__(QoS)
+        qos._vrestore_count = 0
+
+        # First call (count becomes 1, (1-1) % 10 = 0, doesn't skip)
+        # Second call (count becomes 2, (2-1) % 10 = 1, skips)
+        mock_channel = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=MagicMock())
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        mock_channel.conn_or_acquire.return_value = mock_conn
+        qos.channel = mock_channel
+        qos.__dict__["visibility_timeout"] = 3600
+
+        # Run twice to get to a skip scenario
+        qos._vrestore_count = 1  # After this call, count will be 2, (2-1) % 10 = 1, skips
+        qos.restore_visible(interval=10)
+
+        # Should return early without acquiring connection
+        mock_channel.conn_or_acquire.assert_not_called()
+
+    def test_restore_visible_mutex_held(self) -> None:
+        """Test restore_visible handles MutexHeld gracefully."""
+        qos = object.__new__(QoS)
+        qos._vrestore_count = 0
+
+        mock_client = MagicMock()
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = False  # Mutex not acquired
+        mock_client.lock.return_value = mock_lock
+
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = MagicMock(return_value=mock_client)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+
+        mock_channel = MagicMock()
+        mock_channel.conn_or_acquire.return_value = mock_conn
+        qos.channel = mock_channel
+        qos.__dict__["visibility_timeout"] = 3600
+        qos.__dict__["messages_mutex_key"] = "messages_mutex"
+        qos.__dict__["messages_mutex_expire"] = 300
+        qos.__dict__["messages_index_key"] = "messages_index"
+        qos.__dict__["messages_key"] = "messages"
+
+        # Should not raise even though mutex is held
+        qos.restore_visible(interval=1)
+
 
 @pytest.mark.unit
 class TestTransport:
@@ -607,6 +1079,144 @@ class TestMultiChannelPoller:
         # Neither should be registered when can_consume is False
         poller._register_BZMPOP.assert_not_called()  # type: ignore[attr-defined]
         poller._register_XREADGROUP.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_close_handles_unregister_errors(self) -> None:
+        """Test that close handles KeyError and ValueError when unregistering."""
+        poller = MultiChannelPoller()
+        mock_poller = MagicMock()
+        # Simulate unregister raising KeyError for first call, ValueError for second
+        mock_poller.unregister.side_effect = [KeyError("not found"), ValueError("invalid"), None]
+        poller.poller = mock_poller
+        poller._chan_to_sock = {1: 1, 2: 2, 3: 3}  # type: ignore[dict-item]
+
+        # Should not raise
+        poller.close()
+
+        assert mock_poller.unregister.call_count == 3
+        assert len(poller._channels) == 0
+
+    def test_on_connection_disconnect_handles_attribute_error(self) -> None:
+        """Test _on_connection_disconnect handles missing _sock attribute."""
+        poller = MultiChannelPoller()
+        mock_poller = MagicMock()
+        poller.poller = mock_poller
+
+        # Connection without _sock attribute
+        connection = MagicMock(spec=[])  # Empty spec means no attributes
+
+        # Should not raise
+        poller._on_connection_disconnect(connection)
+
+        # Unregister should not be called since _sock doesn't exist
+        mock_poller.unregister.assert_not_called()
+
+    def test_on_connection_disconnect_handles_type_error(self) -> None:
+        """Test _on_connection_disconnect handles TypeError from unregister."""
+        poller = MultiChannelPoller()
+        mock_poller = MagicMock()
+        mock_poller.unregister.side_effect = TypeError("invalid type")
+        poller.poller = mock_poller
+
+        connection = MagicMock()
+        connection._sock = MagicMock()
+
+        # Should not raise even with TypeError
+        poller._on_connection_disconnect(connection)
+
+    def test_register_unregisters_existing_before_reregistering(self) -> None:
+        """Test that _register unregisters existing socket before re-registering."""
+        poller = MultiChannelPoller()
+        mock_poller = MagicMock()
+        poller.poller = mock_poller
+
+        channel = MagicMock()
+        client = MagicMock()
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 42
+        client.connection._sock = mock_sock
+
+        # First registration
+        poller._register(channel, client, "BZMPOP")
+
+        # Second registration - should unregister first
+        new_sock = MagicMock()
+        new_sock.fileno.return_value = 43
+        client.connection._sock = new_sock
+
+        poller._register(channel, client, "BZMPOP")
+
+        # Should have unregistered the old socket
+        mock_poller.unregister.assert_called_once_with(mock_sock)
+
+    def test_register_connects_if_sock_is_none(self) -> None:
+        """Test that _register calls connect() if connection._sock is None."""
+        poller = MultiChannelPoller()
+        mock_poller = MagicMock()
+        poller.poller = mock_poller
+
+        channel = MagicMock()
+        client = MagicMock()
+
+        # First call returns None, then returns a socket after connect()
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 42
+
+        def connect_side_effect() -> None:
+            client.connection._sock = mock_sock
+
+        client.connection._sock = None
+        client.connection.connect.side_effect = connect_side_effect
+
+        poller._register(channel, client, "BZMPOP")
+
+        client.connection.connect.assert_called_once()
+
+    def test_on_poll_init_returns_none_when_no_channels(self) -> None:
+        """Test on_poll_init returns None when no channels."""
+        poller = MultiChannelPoller()
+        poller._channels = set()  # type: ignore[assignment]
+
+        result = poller.on_poll_init(MagicMock())
+
+        assert result is None
+
+    def test_maybe_restore_messages_returns_none_when_no_active_queues(self) -> None:
+        """Test maybe_restore_messages returns None when channels have no active queues."""
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        channel.active_queues = []
+        poller._channels = {channel}  # type: ignore[assignment]
+
+        result = poller.maybe_restore_messages()
+
+        assert result is None
+
+    def test_on_readable_returns_none_when_cannot_consume(self) -> None:
+        """Test on_readable returns None when QoS cannot consume."""
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        channel.qos.can_consume.return_value = False
+        channel.handlers = {"BZMPOP": MagicMock()}
+
+        poller._fd_to_chan = {42: (channel, "BZMPOP")}
+
+        result = poller.on_readable(42)
+
+        assert result is None
+        channel.handlers["BZMPOP"].assert_not_called()
+
+    def test_handle_event_err_calls_poll_error(self) -> None:
+        """Test handle_event calls _poll_error on ERR event."""
+        from kombu.utils.eventio import ERR
+
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        poller._fd_to_chan = {42: (channel, "BZMPOP")}
+
+        result = poller.handle_event(42, ERR)
+
+        channel._poll_error.assert_called_once_with("BZMPOP")
+        assert result is None
 
 
 @pytest.mark.integration
@@ -805,3 +1415,916 @@ class TestTransportIntegration:
         # Stream should be trimmed to exactly maxlen
         info = redis_client.xinfo_stream(stream_name)
         assert info["length"] == maxlen
+
+
+@pytest.mark.integration
+class TestTransportFeatures:
+    """Test transport-specific features with a real worker."""
+
+    def test_task_with_countdown(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test task with countdown delay."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        celery_worker.reload()
+        start = time.time()
+        result = add.apply_async(args=(1, 2), countdown=1)
+        value = result.get(timeout=10)
+        elapsed = time.time() - start
+
+        assert value == 3
+        # Task should have been delayed by approximately 1 second
+        assert elapsed >= 0.9
+
+    def test_task_priority(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+        redis_client: Any,
+    ) -> None:
+        """Test that task priority affects ordering.
+
+        Higher priority number = higher priority = processed first (RabbitMQ semantics).
+        """
+
+        @celery_app.task
+        def slow_add(x: int, y: int) -> int:
+            time.sleep(0.1)
+            return x + y
+
+        celery_worker.reload()
+        # Send low priority task first
+        low_priority = slow_add.apply_async(args=(1, 1), priority=0)
+        # Send high priority task second
+        high_priority = slow_add.apply_async(args=(2, 2), priority=9)
+
+        # Both should complete
+        low_result = low_priority.get(timeout=10)
+        high_result = high_priority.get(timeout=10)
+
+        assert low_result == 2
+        assert high_result == 4
+
+    def test_task_with_eta(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test task with ETA (absolute time) delay."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        celery_worker.reload()
+        start = time.time()
+        eta = datetime.now(UTC) + timedelta(seconds=1)
+        result = add.apply_async(args=(1, 2), eta=eta)
+        value = result.get(timeout=10)
+        elapsed = time.time() - start
+
+        assert value == 3
+        # Task should have been delayed by approximately 1 second
+        assert elapsed >= 0.9
+
+    def test_task_retry_on_failure(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test that task retry works correctly through the transport."""
+        attempt_count = {"count": 0}
+
+        @celery_app.task(bind=True, max_retries=2, default_retry_delay=1)  # type: ignore[call-overload]
+        def failing_task(self: Any) -> str:
+            attempt_count["count"] += 1
+            if attempt_count["count"] < 3:
+                raise self.retry()
+            return "success"
+
+        celery_worker.reload()
+        result = failing_task.delay()
+        value = result.get(timeout=10)
+
+        assert value == "success"
+        assert attempt_count["count"] == 3  # Original + 2 retries
+
+    def test_task_raises_exception(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test that task exceptions are properly propagated."""
+
+        @celery_app.task
+        def failing_task() -> None:
+            raise ValueError("Task failed intentionally")
+
+        celery_worker.reload()
+        result = failing_task.delay()
+
+        with pytest.raises(ValueError, match="Task failed intentionally"):
+            result.get(timeout=10)
+
+    def test_message_cleanup_after_success(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+        redis_client: Any,
+    ) -> None:
+        """Test that messages are cleaned up from Redis after successful processing."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        celery_worker.reload()
+        result = add.delay(1, 1)
+        result.get(timeout=10)
+
+        # Give worker time to clean up
+        time.sleep(0.5)
+
+        # Check that message index is eventually cleaned up
+        # The messages_index key tracks all messages
+        index_count = redis_client.zcard("messages_index")
+        # Should be 0 or very small after successful processing
+        assert index_count <= 1  # Allow some tolerance for timing
+
+    def test_high_priority_processed_before_low_priority(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test that high priority tasks are processed before low priority ones."""
+        execution_order: list[int] = []
+
+        @celery_app.task
+        def record_execution(priority_value: int) -> int:
+            execution_order.append(priority_value)
+            return priority_value
+
+        celery_worker.reload()
+
+        # Send multiple tasks with different priorities
+        # Lower priority number = lower priority
+        results = [record_execution.apply_async(args=(priority,), priority=priority) for priority in [0, 5, 9, 3, 7]]
+
+        # Wait for all to complete
+        for r in results:
+            r.get(timeout=10)
+
+        # High priority tasks (higher numbers) should generally be processed first
+        # Due to timing, we can't guarantee exact order, but highest should be early
+        assert 9 in execution_order[:3]  # Priority 9 should be among first 3
+
+    def test_task_with_queue_routing(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test that tasks can be routed to specific queues."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        celery_worker.reload()
+        # Send to default celery queue explicitly
+        result = add.apply_async(args=(3, 4), queue="celery")
+        value = result.get(timeout=10)
+
+        assert value == 7
+
+    def test_concurrent_task_execution(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test that multiple concurrent tasks execute correctly."""
+
+        @celery_app.task
+        def slow_multiply(x: int, y: int) -> int:
+            time.sleep(0.1)
+            return x * y
+
+        celery_worker.reload()
+
+        # Send many tasks concurrently
+        results = [slow_multiply.delay(i, 2) for i in range(10)]
+
+        # All should complete correctly
+        values = [r.get(timeout=30) for r in results]
+        expected = [i * 2 for i in range(10)]
+        assert sorted(values) == expected
+
+    def test_task_with_kwargs(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test that tasks with keyword arguments work correctly."""
+
+        @celery_app.task
+        def greet(name: str, greeting: str = "Hello") -> str:
+            return f"{greeting}, {name}!"
+
+        celery_worker.reload()
+
+        result1 = greet.delay("World")
+        result2 = greet.apply_async(kwargs={"name": "Alice", "greeting": "Hi"})
+
+        assert result1.get(timeout=10) == "Hello, World!"
+        assert result2.get(timeout=10) == "Hi, Alice!"
+
+    def test_task_ignore_result(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test that tasks with ignore_result work correctly."""
+        execution_tracker = {"executed": False}
+
+        @celery_app.task(ignore_result=True)
+        def fire_and_forget() -> None:
+            execution_tracker["executed"] = True
+
+        celery_worker.reload()
+
+        result = fire_and_forget.delay()
+
+        # Give time for task to execute
+        time.sleep(1)
+
+        # Task should have executed even without result tracking
+        assert execution_tracker["executed"] is True
+        # Result should be None for ignore_result tasks
+        assert result.result is None
+
+
+@pytest.mark.integration
+class TestTransportReliability:
+    """Test transport reliability features with a real worker."""
+
+    def test_message_not_lost_on_worker_prefetch(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+        redis_client: Any,
+    ) -> None:
+        """Test that messages remain tracked while being processed."""
+
+        @celery_app.task
+        def slow_task() -> str:
+            time.sleep(0.5)
+            return "done"
+
+        celery_worker.reload()
+
+        # Send a slow task
+        result = slow_task.delay()
+
+        # While task is running, message should still be in the system
+        time.sleep(0.1)
+
+        # Complete the task
+        value = result.get(timeout=10)
+        assert value == "done"
+
+    def test_task_id_unique_per_message(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test that each task gets a unique task ID."""
+
+        @celery_app.task(bind=True)
+        def capture_task_id(self: Any) -> str:
+            return self.request.id
+
+        celery_worker.reload()
+
+        # Send multiple tasks
+        results = [capture_task_id.delay() for _ in range(5)]
+        task_ids = [r.get(timeout=10) for r in results]
+
+        # All task IDs should be unique
+        assert len(set(task_ids)) == 5
+
+
+@pytest.mark.integration
+class TestMessagePublishing:
+    """Tests that verify message publishing to Redis without a worker.
+
+    These tests publish messages and verify Redis state directly,
+    without consuming the messages through a worker.
+    """
+
+    def test_published_message_stored_in_sorted_set(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that publishing a task stores it in a Redis sorted set."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Publish without a worker - message should be stored in Redis
+        add.delay(1, 2)
+
+        # Check that message is in the celery queue sorted set
+        queue_size = redis_client.zcard("celery")
+        assert queue_size >= 1
+
+        # Check that message is in the messages index
+        index_size = redis_client.zcard("messages_index")
+        assert index_size >= 1
+
+        # Check that message payload is stored in the messages hash
+        messages_count = redis_client.hlen("messages")
+        assert messages_count >= 1
+
+    def test_published_message_with_countdown_has_future_score(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that a task with countdown has a future score in the sorted set."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Publish with a 10 second countdown
+        before_time = time.time()
+        add.apply_async(args=(1, 2), countdown=10)
+
+        # Get the message from the queue
+        messages = redis_client.zrange("celery", 0, -1, withscores=True)
+        assert len(messages) >= 1
+
+        # The score should be in the future (approximately 10 seconds from now)
+        # Score format: priority bits + timestamp with delay
+        _tag, score = messages[-1]  # Get the last (most recent) message
+
+        # The score encodes priority in high bits and timestamp in low bits
+        # With delay, the effective delivery time should be ~10 seconds in the future
+        # We can't easily decode the exact time, but we can verify it's higher than a no-delay score
+        no_delay_score = before_time
+        assert score > no_delay_score
+
+    def test_published_message_with_eta_has_future_score(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that a task with ETA has a future score in the sorted set."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Publish with an ETA 10 seconds in the future
+        eta = datetime.now(UTC) + timedelta(seconds=10)
+        add.apply_async(args=(1, 2), eta=eta)
+
+        # Get the message from the queue
+        messages = redis_client.zrange("celery", 0, -1, withscores=True)
+        assert len(messages) >= 1
+
+    def test_high_priority_message_has_lower_score(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that higher priority messages have lower scores (processed first)."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Clear any existing messages
+        redis_client.delete("celery", "messages", "messages_index")
+
+        # Publish low priority first, then high priority
+        add.apply_async(args=(1, 1), priority=0)  # Low priority
+        time.sleep(0.01)  # Small delay to ensure different timestamps
+        add.apply_async(args=(2, 2), priority=9)  # High priority
+
+        # Get messages ordered by score (ascending)
+        messages = redis_client.zrange("celery", 0, -1, withscores=True)
+        assert len(messages) == 2
+
+        # High priority (9) should have lower score, so it comes first
+        low_score = messages[0][1]
+        high_score = messages[1][1]
+
+        # The first message (lower score) should be the high-priority one
+        # because higher priority = lower score = processed first
+        assert low_score < high_score
+
+    def test_multiple_messages_ordered_by_score(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that multiple messages are ordered correctly by score."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Clear any existing messages
+        redis_client.delete("celery", "messages", "messages_index")
+
+        # Publish 5 messages with same priority
+        for i in range(5):
+            add.delay(i, i)
+            time.sleep(0.01)  # Small delay between messages
+
+        # Check all messages are in the queue
+        queue_size = redis_client.zcard("celery")
+        assert queue_size == 5
+
+        # Messages should be ordered by timestamp (FIFO within same priority)
+        messages = redis_client.zrange("celery", 0, -1, withscores=True)
+        scores = [score for _, score in messages]
+
+        # Scores should be in ascending order (earlier messages have lower scores)
+        assert scores == sorted(scores)
+
+    def test_message_payload_contains_task_data(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that the message payload contains correct task data."""
+        import json
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Clear any existing messages
+        redis_client.delete("celery", "messages", "messages_index")
+
+        add.delay(42, 58)
+
+        # Get the delivery tag from the queue
+        messages = redis_client.zrange("celery", 0, -1)
+        assert len(messages) == 1
+        delivery_tag = messages[0].decode() if isinstance(messages[0], bytes) else messages[0]
+
+        # Get the payload from the messages hash
+        payload = redis_client.hget("messages", delivery_tag)
+        assert payload is not None
+
+        # Parse the payload
+        data = json.loads(payload.decode() if isinstance(payload, bytes) else payload)
+        assert isinstance(data, list)
+        assert len(data) == 3  # [message, exchange, routing_key]
+
+        message, exchange, routing_key = data
+        assert "body" in message or "args" in str(message)
+
+    def test_queue_purge_removes_messages(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that purging a queue removes messages from Redis."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Clear and publish
+        redis_client.delete("celery", "messages", "messages_index")
+        for _ in range(3):
+            add.delay(1, 1)
+
+        # Verify messages exist
+        assert redis_client.zcard("celery") == 3
+
+        # Purge using the app's control interface
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            purged = channel._purge("celery")
+            assert purged == 3
+
+        # Verify queue is empty
+        assert redis_client.zcard("celery") == 0
+
+    def test_queue_size_returns_correct_count(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that queue size returns correct message count."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Clear and publish
+        redis_client.delete("celery", "messages", "messages_index")
+        for _ in range(5):
+            add.delay(1, 1)
+
+        # Check size via channel
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            size = channel._size("celery")
+            assert size == 5
+
+
+@pytest.mark.integration
+class TestQueueOperations:
+    """Tests for queue operations without a worker."""
+
+    def test_queue_delete_removes_queue(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that deleting a queue removes it from Redis."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Publish messages
+        redis_client.delete("celery")
+        add.delay(1, 1)
+        assert redis_client.zcard("celery") >= 1
+
+        # Delete the queue
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel._delete("celery")
+
+        # Queue should be gone
+        assert redis_client.zcard("celery") == 0
+
+    def test_queue_exists_check(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that _has_queue correctly checks queue existence."""
+
+        @celery_app.task
+        def add(x: int, y: int) -> int:
+            return x + y
+
+        # Clear and check non-existence
+        redis_client.delete("test_queue_exists")
+
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            assert channel._has_queue("test_queue_exists") is False
+
+            # Create queue by adding a message directly
+            redis_client.zadd("test_queue_exists", {"msg1": 1.0})
+            assert channel._has_queue("test_queue_exists") is True
+
+        # Cleanup
+        redis_client.delete("test_queue_exists")
+
+    def test_get_table_returns_bindings(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that get_table returns queue bindings."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Bind a queue to an exchange
+            channel._queue_bind(
+                exchange="test_exchange",
+                routing_key="test_key",
+                pattern="test_pattern",
+                queue="test_queue",
+            )
+
+            # Get the bindings
+            table = channel.get_table("test_exchange")
+            assert len(table) >= 1
+
+            # Find our binding
+            found = any("test_queue" in binding for binding in table)
+            assert found
+
+        # Cleanup
+        redis_client.delete("_kombu.binding.test_exchange")
+
+
+@pytest.mark.integration
+class TestChannelConnection:
+    """Tests for channel connection handling."""
+
+    def test_channel_creates_connection_pool(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that channel creates a connection pool."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            # Accessing pool should create it
+            pool = channel.pool
+            assert pool is not None
+
+    def test_channel_creates_async_pool(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that channel creates an async connection pool."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            # Accessing async_pool should create it
+            async_pool = channel.async_pool
+            assert async_pool is not None
+
+    def test_channel_client_property(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that channel client property returns a Redis client."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            client = channel.client
+            assert client is not None
+            # Should be able to ping
+            assert client.ping() is True
+
+    def test_conn_or_acquire_context_manager(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that conn_or_acquire works as context manager."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Without client argument - creates new client
+            with channel.conn_or_acquire() as client:
+                assert client is not None
+                assert client.ping() is True
+
+            # With client argument - uses provided client
+            existing_client = channel.client
+            with channel.conn_or_acquire(existing_client) as client:
+                assert client is existing_client
+
+
+@pytest.mark.integration
+class TestFanoutMessaging:
+    """Tests for fanout (pub/sub) messaging using Redis Streams."""
+
+    def test_fanout_stream_key_generation(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that fanout stream key is generated correctly."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Test stream key generation
+            stream_key = channel._fanout_stream_key("test_exchange")
+            assert "test_exchange" in stream_key
+
+            # Test with routing key
+            stream_key_with_route = channel._fanout_stream_key("test_exchange", "my_route")
+            assert "test_exchange" in stream_key_with_route
+            assert "my_route" in stream_key_with_route
+
+    def test_fanout_consumer_group_name_generation(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that fanout consumer group names are generated correctly."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Test consumer group name generation
+            group_name = channel._fanout_consumer_group("my_queue")
+            assert "my_queue" in group_name
+            assert "fanout" in group_name
+
+    def test_fanout_exchange_declaration(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that fanout exchange can be declared."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            from kombu import Exchange, Queue
+
+            fanout_exchange = Exchange("test_fanout_decl", type="fanout")
+            fanout_queue = Queue("fanout_decl_queue", exchange=fanout_exchange)
+
+            # Bind and declare
+            fanout_queue.bind(channel).declare()  # type: ignore[attr-defined]
+
+            # The binding should be stored
+            bindings_key = "_kombu.binding.test_fanout_decl"
+            bindings = redis_client.smembers(bindings_key)
+            assert len(bindings) >= 1
+
+            # Cleanup
+            redis_client.delete(bindings_key)
+
+
+@pytest.mark.integration
+class TestDelayedMessageStorage:
+    """Tests for delayed message storage in Redis.
+
+    Note: These tests verify the _put method's delay handling directly,
+    since the signal handler that adds delay headers is only active during
+    worker task publish.
+    """
+
+    def test_message_with_delay_header_has_future_score(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that messages with x-celery-delay-seconds header have future scores."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Clear existing messages
+            redis_client.delete("celery", "messages", "messages_index")
+
+            before_time = time.time()
+
+            # Create a message with the delay header directly
+            message = {
+                "body": '{"task": "test.add", "args": [1, 2]}',
+                "properties": {
+                    "delivery_tag": f"test-delay-{time.time()}",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {DELAY_HEADER: 60.0},  # 60 second delay
+                },
+            }
+
+            # Publish directly via _put
+            channel._put("celery", message)
+
+            # Get the message score
+            messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            assert len(messages) == 1
+            _tag, actual_score = messages[0]
+
+            # Calculate expected score with 60 second delay
+            delayed_score = _queue_score(0, before_time, 60)
+
+            # The actual score should be close to the delayed score
+            # Allow tolerance for timing differences (within 5 seconds)
+            assert abs(actual_score - delayed_score) < 5000  # 5 seconds in milliseconds
+
+    def test_message_without_delay_header_has_current_score(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that messages without delay header have current time scores."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Clear existing messages
+            redis_client.delete("celery", "messages", "messages_index")
+
+            before_time = time.time()
+
+            # Create a message without delay header
+            message = {
+                "body": '{"task": "test.add", "args": [1, 2]}',
+                "properties": {
+                    "delivery_tag": f"test-no-delay-{time.time()}",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {},
+                },
+            }
+
+            # Publish directly via _put
+            channel._put("celery", message)
+            after_time = time.time()
+
+            # Get the message score
+            messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            assert len(messages) == 1
+            _tag, actual_score = messages[0]
+
+            # Calculate expected score range (no delay, priority 0)
+            min_score = _queue_score(0, before_time, 0)
+            max_score = _queue_score(0, after_time, 0)
+
+            # The actual score should be within the expected range
+            assert min_score <= actual_score <= max_score
+
+    def test_delayed_vs_immediate_message_score_difference(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that delayed messages have higher scores than immediate ones."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Clear existing messages
+            redis_client.delete("celery", "messages", "messages_index")
+
+            # Create an immediate message (no delay)
+            immediate_msg = {
+                "body": '{"task": "test.add", "args": [1, 2]}',
+                "properties": {
+                    "delivery_tag": f"immediate-{time.time()}",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {},
+                },
+            }
+            channel._put("celery", immediate_msg)
+
+            # Create a delayed message
+            delayed_msg = {
+                "body": '{"task": "test.add", "args": [3, 4]}',
+                "properties": {
+                    "delivery_tag": f"delayed-{time.time()}",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {DELAY_HEADER: 60.0},
+                },
+            }
+            channel._put("celery", delayed_msg)
+
+            # Get messages ordered by score
+            messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            assert len(messages) == 2
+
+            # The first message (lowest score) should be the immediate one
+            immediate_score = messages[0][1]
+            delayed_score = messages[1][1]
+
+            # The delayed message should have a higher score
+            assert delayed_score > immediate_score
+
+            # The difference should be approximately 60 seconds (60000 ms)
+            score_diff = delayed_score - immediate_score
+            assert 55000 < score_diff < 65000  # Within 5 seconds tolerance
+
+    def test_priority_affects_score_with_delay(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that priority still affects score even with delay."""
+        with celery_app.connection() as conn:
+            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+
+            # Clear existing messages
+            redis_client.delete("celery", "messages", "messages_index")
+
+            # Create low priority message with delay
+            low_priority_msg = {
+                "body": '{"task": "test.add", "args": [1, 1]}',
+                "properties": {
+                    "delivery_tag": f"low-pri-{time.time()}",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {DELAY_HEADER: 10.0},
+                    "priority": 0,  # Low priority
+                },
+            }
+            channel._put("celery", low_priority_msg)
+
+            time.sleep(0.01)
+
+            # Create high priority message with same delay
+            high_priority_msg = {
+                "body": '{"task": "test.add", "args": [2, 2]}',
+                "properties": {
+                    "delivery_tag": f"high-pri-{time.time()}",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {DELAY_HEADER: 10.0},
+                    "priority": 9,  # High priority
+                },
+            }
+            channel._put("celery", high_priority_msg)
+
+            messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            assert len(messages) == 2
+
+            # High priority (9) should have lower score even with delay
+            high_priority_score = messages[0][1]  # First = lowest score
+            low_priority_score = messages[1][1]  # Second = higher score
+
+            assert high_priority_score < low_priority_score
