@@ -22,11 +22,11 @@ def add_delay_header(
     retry_policy: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> None:
-    """Add x-celery-delay-seconds header based on eta in headers.
+    """Add x-delay header based on eta in headers.
 
     This signal handler intercepts task publishing and calculates the delay
     in seconds from the 'eta' header (if present). The delay is added as
-    x-celery-delay-seconds header for the transport to use.
+    x-delay header for the transport to use.
 
     Args:
         sender: The task name.

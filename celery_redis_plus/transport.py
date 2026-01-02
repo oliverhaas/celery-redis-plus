@@ -1262,6 +1262,9 @@ class Transport(virtual.Transport):
             raise ImportError("Missing redis library (pip install redis)")
         super().__init__(*args, **kwargs)
 
+        # Register signal handlers on first transport init
+        from . import signals as _signals  # noqa: F401
+
         self.cycle = MultiChannelPoller()
 
     def driver_version(self) -> str:

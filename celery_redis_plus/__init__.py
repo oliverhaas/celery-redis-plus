@@ -11,7 +11,6 @@ Requirements:
 
 Usage:
     from celery import Celery
-    import celery_redis_plus  # Auto-registers signal handler for eta/countdown
 
     app = Celery('myapp')
     app.config_from_object({
@@ -66,8 +65,3 @@ def configure_app(app: Any) -> None:
         >>> celery_redis_plus.configure_app(app)
     """
     app.steps["consumer"].add(DelayedDeliveryBootstep)
-
-
-# Auto-register signal handler on import
-# This ensures the delay header is added to all tasks with eta/countdown
-from . import signals as _signals  # noqa: F401, E402
