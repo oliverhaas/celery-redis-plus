@@ -262,30 +262,30 @@ class TestGlobalKeyPrefixMixin:
             "prefix_fake_key3",
         ]
 
-    def test_prefix_xreadgroup(self) -> None:
-        """Test XREADGROUP key prefixing."""
+    def test_prefix_xread(self) -> None:
+        """Test XREAD key prefixing."""
         mixin = GlobalKeyPrefixMixin()
         mixin.global_keyprefix = "test:"
 
-        # XREADGROUP GROUP group consumer STREAMS stream1 stream2 id1 id2
+        # XREAD STREAMS stream1 stream2 id1 id2
         args = mixin._prefix_args(
-            ["XREADGROUP", "GROUP", "mygroup", "consumer1", "STREAMS", "stream1", "stream2", ">", ">"],
+            ["XREAD", "COUNT", "1", "BLOCK", "1000", "STREAMS", "stream1", "stream2", "$", "$"],
         )
-        assert args[0] == "XREADGROUP"
+        assert args[0] == "XREAD"
         assert "test:stream1" in args
         assert "test:stream2" in args
 
-    def test_prefix_xreadgroup_single_stream(self) -> None:
-        """Test XREADGROUP with single stream."""
+    def test_prefix_xread_single_stream(self) -> None:
+        """Test XREAD with single stream."""
         mixin = GlobalKeyPrefixMixin()
         mixin.global_keyprefix = "prefix_"
 
         args = mixin._prefix_args(
-            ["XREADGROUP", "GROUP", "mygroup", "consumer1", "COUNT", "1", "STREAMS", "stream1", ">"],
+            ["XREAD", "COUNT", "1", "STREAMS", "stream1", "$"],
         )
         assert "prefix_stream1" in args
         # The ID should not be prefixed
-        assert "prefix_>" not in args
+        assert "prefix_$" not in args
 
     def test_no_prefix_when_empty(self) -> None:
         """Test that empty prefix doesn't change keys."""
@@ -295,15 +295,15 @@ class TestGlobalKeyPrefixMixin:
         args = mixin._prefix_args(["ZADD", "myqueue", {"tag1": 100}])
         assert args[1] == "myqueue"
 
-    def test_prefix_xreadgroup_without_streams_keyword(self) -> None:
-        """Test XREADGROUP when STREAMS keyword is not found (returns args unchanged)."""
+    def test_prefix_xread_without_streams_keyword(self) -> None:
+        """Test XREAD when STREAMS keyword is not found (returns args unchanged)."""
         mixin = GlobalKeyPrefixMixin()
         mixin.global_keyprefix = "test:"
 
-        # Malformed XREADGROUP without STREAMS keyword
-        args = mixin._prefix_args(["XREADGROUP", "GROUP", "mygroup", "consumer1", "stream1", ">"])
+        # Malformed XREAD without STREAMS keyword
+        args = mixin._prefix_args(["XREAD", "COUNT", "1", "stream1", "$"])
         # Should return args unchanged since STREAMS keyword is missing
-        assert args == ["XREADGROUP", "GROUP", "mygroup", "consumer1", "stream1", ">"]
+        assert args == ["XREAD", "COUNT", "1", "stream1", "$"]
 
     def test_parse_response_bzmpop_strips_prefix(self) -> None:
         """Test that parse_response strips global prefix from BZMPOP result."""
@@ -622,13 +622,6 @@ class TestChannel:
         key = channel._fanout_stream_key("myexchange", "myroute")
         assert key == "/0.myexchange/myroute"
 
-    def test_fanout_consumer_group(self) -> None:
-        """Test fanout consumer group name generation."""
-        channel = object.__new__(Channel)
-
-        group = channel._fanout_consumer_group("myqueue")
-        assert group == "myqueue"
-
     def test_prepare_virtual_host_with_slash(self) -> None:
         """Test _prepare_virtual_host with '/' returns default db."""
         from celery_redis_plus.transport import DEFAULT_DB
@@ -840,19 +833,15 @@ class TestChannel:
 class TestQoS:
     """Tests for the QoS class."""
 
-    def test_stream_metadata_tracked_for_fanout(self) -> None:
-        """Test that stream metadata is tracked for fanout messages."""
+    def test_fanout_tags_tracked(self) -> None:
+        """Test that fanout tags are tracked."""
         qos = object.__new__(QoS)
-        qos._stream_metadata = {}
+        qos._fanout_tags = set()
 
-        # Simulate adding stream metadata
-        qos._stream_metadata["tag1"] = ("stream1", "msg-id-1", "group1")
+        # Simulate adding fanout tag
+        qos._fanout_tags.add("tag1")
 
-        assert "tag1" in qos._stream_metadata
-        stream, msg_id, group = qos._stream_metadata["tag1"]
-        assert stream == "stream1"
-        assert msg_id == "msg-id-1"
-        assert group == "group1"
+        assert "tag1" in qos._fanout_tags
 
     def test_can_consume_with_no_prefetch(self) -> None:
         """Test can_consume when prefetch_count is 0 (unlimited)."""
@@ -885,7 +874,7 @@ class TestQoS:
         """Test that delivered messages are tracked."""
         qos = object.__new__(QoS)
         qos._delivered = {}
-        qos._stream_metadata = {}
+        qos._fanout_tags = set()
 
         # Simulate append (like in real QoS)
         qos._delivered["tag1"] = True
@@ -895,48 +884,23 @@ class TestQoS:
         assert "tag1" in qos._delivered
         assert "tag2" in qos._delivered
 
-    def test_ack_stream_message(self) -> None:
-        """Test ack with stream metadata (fanout message)."""
+    def test_ack_fanout_message(self) -> None:
+        """Test ack for fanout message (no Redis cleanup needed)."""
         qos = object.__new__(QoS)
-        qos._stream_metadata = {"tag1": ("prefix:stream1", "1234-0", "group1")}
-        qos._delivered = {"tag1": MagicMock()}
-        qos._dirty = set()
-        qos._quick_ack = MagicMock()  # Mock parent class method
-
-        # Setup mock channel
-        mock_channel = MagicMock()
-        mock_channel.global_keyprefix = "prefix:"
-        mock_channel.client = MagicMock()
-        qos.channel = mock_channel
-
-        qos.ack("tag1")
-
-        # Verify xack was called with prefix stripped from stream name
-        mock_channel.client.xack.assert_called_once_with("stream1", "group1", "1234-0")
-        # Verify stream metadata was removed
-        assert "tag1" not in qos._stream_metadata
-
-    def test_ack_stream_message_no_prefix(self) -> None:
-        """Test ack with stream metadata when no global prefix is set."""
-        qos = object.__new__(QoS)
-        qos._stream_metadata = {"tag1": ("stream1", "1234-0", "group1")}
+        qos._fanout_tags = {"tag1"}
         qos._delivered = {"tag1": MagicMock()}
         qos._dirty = set()
         qos._quick_ack = MagicMock()
 
-        mock_channel = MagicMock()
-        mock_channel.global_keyprefix = ""
-        mock_channel.client = MagicMock()
-        qos.channel = mock_channel
-
         qos.ack("tag1")
 
-        mock_channel.client.xack.assert_called_once_with("stream1", "group1", "1234-0")
+        # Fanout tag should be removed
+        assert "tag1" not in qos._fanout_tags
 
     def test_ack_regular_message(self) -> None:
-        """Test ack for regular (non-stream) message."""
+        """Test ack for regular (non-fanout) message."""
         qos = object.__new__(QoS)
-        qos._stream_metadata = {}
+        qos._fanout_tags = set()
         qos._delivered = {"tag1": MagicMock()}
         qos._dirty = set()
         qos._quick_ack = MagicMock()
@@ -951,73 +915,24 @@ class TestQoS:
         qos._remove_from_indices.assert_called_once_with("tag1")
         mock_pipe.execute.assert_called_once()
 
-    def test_reject_stream_message_with_requeue(self) -> None:
-        """Test reject with requeue for stream message."""
+    def test_reject_fanout_message(self) -> None:
+        """Test reject for fanout message (requeue not supported)."""
         qos = object.__new__(QoS)
-        qos._stream_metadata = {"tag1": ("prefix:stream1", "1234-0", "group1")}
+        qos._fanout_tags = {"tag1"}
         qos._delivered = {"tag1": MagicMock()}
         qos._dirty = set()
         qos._quick_ack = MagicMock()
 
-        mock_channel = MagicMock()
-        mock_channel.global_keyprefix = "prefix:"
-        mock_channel.client = MagicMock()
-        mock_channel.stream_maxlen = 10000
-        # Simulate xrange returning the original message
-        mock_channel.client.xrange.return_value = [("1234-0", {"payload": b"test"})]
-        qos.channel = mock_channel
-
+        # Requeue is ignored for fanout messages
         qos.reject("tag1", requeue=True)
 
-        # Verify message was re-added to stream
-        mock_channel.client.xadd.assert_called_once()
-        call_kwargs = mock_channel.client.xadd.call_args
-        assert call_kwargs.kwargs["name"] == "stream1"
-        assert call_kwargs.kwargs["fields"] == {"payload": b"test"}
-        # Verify original message was acknowledged
-        mock_channel.client.xack.assert_called_once_with("stream1", "group1", "1234-0")
-
-    def test_reject_stream_message_without_requeue(self) -> None:
-        """Test reject without requeue for stream message."""
-        qos = object.__new__(QoS)
-        qos._stream_metadata = {"tag1": ("stream1", "1234-0", "group1")}
-        qos._delivered = {"tag1": MagicMock()}
-        qos._dirty = set()
-        qos._quick_ack = MagicMock()
-
-        mock_channel = MagicMock()
-        mock_channel.global_keyprefix = ""
-        mock_channel.client = MagicMock()
-        qos.channel = mock_channel
-
-        qos.reject("tag1", requeue=False)
-
-        # Should just acknowledge and discard
-        mock_channel.client.xack.assert_called_once_with("stream1", "group1", "1234-0")
-        # xadd should not be called
-        mock_channel.client.xadd.assert_not_called()
-
-    def test_reject_stream_message_requeue_handles_exception(self) -> None:
-        """Test reject with requeue handles exceptions gracefully."""
-        qos = object.__new__(QoS)
-        qos._stream_metadata = {"tag1": ("stream1", "1234-0", "group1")}
-        qos._delivered = {"tag1": MagicMock()}
-        qos._dirty = set()
-        qos._quick_ack = MagicMock()
-
-        mock_channel = MagicMock()
-        mock_channel.global_keyprefix = ""
-        mock_channel.client = MagicMock()
-        mock_channel.client.xrange.side_effect = Exception("Redis error")
-        qos.channel = mock_channel
-
-        # Should not raise, just log the error
-        qos.reject("tag1", requeue=True)
+        # Fanout tag should be removed
+        assert "tag1" not in qos._fanout_tags
 
     def test_reject_regular_message_with_requeue(self) -> None:
         """Test reject with requeue for regular message."""
         qos = object.__new__(QoS)
-        qos._stream_metadata = {}
+        qos._fanout_tags = set()
         qos._delivered = {"tag1": MagicMock()}
         qos._dirty = set()
         qos._quick_ack = MagicMock()
@@ -1031,7 +946,7 @@ class TestQoS:
     def test_reject_regular_message_without_requeue(self) -> None:
         """Test reject without requeue for regular message."""
         qos = object.__new__(QoS)
-        qos._stream_metadata = {}
+        qos._fanout_tags = set()
         qos._delivered = {"tag1": MagicMock()}
         qos._dirty = set()
         qos._quick_ack = MagicMock()
@@ -1050,17 +965,17 @@ class TestQoS:
         """Test maybe_update_messages_index returns early when no delivered messages."""
         qos = object.__new__(QoS)
         qos._delivered = {}
-        qos._stream_metadata = {}
+        qos._fanout_tags = set()
 
         # Should return early without calling any Redis commands
         qos.maybe_update_messages_index()
         # No assertions needed - just verify it doesn't raise
 
     def test_maybe_update_messages_index_updates_scores(self) -> None:
-        """Test maybe_update_messages_index updates scores for non-stream messages."""
+        """Test maybe_update_messages_index updates scores for non-fanout messages."""
         qos = object.__new__(QoS)
-        qos._delivered = {"tag1": MagicMock(), "tag2": MagicMock(), "stream_tag": MagicMock()}
-        qos._stream_metadata = {"stream_tag": ("stream1", "1234-0", "group1")}
+        qos._delivered = {"tag1": MagicMock(), "tag2": MagicMock(), "fanout_tag": MagicMock()}
+        qos._fanout_tags = {"fanout_tag"}
 
         mock_pipe = MagicMock()
         mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
@@ -1253,7 +1168,7 @@ class TestMultiChannelPoller:
         """Test on_poll_start with active queues."""
         poller = MultiChannelPoller()
         poller._register_BZMPOP = MagicMock()  # type: ignore[method-assign]
-        poller._register_XREADGROUP = MagicMock()  # type: ignore[method-assign]
+        poller._register_XREAD = MagicMock()  # type: ignore[method-assign]
 
         channel = MagicMock()
         channel.active_queues = ["queue1"]
@@ -1264,13 +1179,13 @@ class TestMultiChannelPoller:
         poller.on_poll_start()
 
         poller._register_BZMPOP.assert_called_once_with(channel)  # type: ignore[attr-defined]
-        poller._register_XREADGROUP.assert_not_called()  # type: ignore[attr-defined]
+        poller._register_XREAD.assert_not_called()  # type: ignore[attr-defined]
 
     def test_on_poll_start_with_fanout_queues(self) -> None:
         """Test on_poll_start with fanout queues."""
         poller = MultiChannelPoller()
         poller._register_BZMPOP = MagicMock()  # type: ignore[method-assign]
-        poller._register_XREADGROUP = MagicMock()  # type: ignore[method-assign]
+        poller._register_XREAD = MagicMock()  # type: ignore[method-assign]
 
         channel = MagicMock()
         channel.active_queues = []
@@ -1281,13 +1196,13 @@ class TestMultiChannelPoller:
         poller.on_poll_start()
 
         poller._register_BZMPOP.assert_not_called()  # type: ignore[attr-defined]
-        poller._register_XREADGROUP.assert_called_once_with(channel)  # type: ignore[attr-defined]
+        poller._register_XREAD.assert_called_once_with(channel)  # type: ignore[attr-defined]
 
     def test_on_poll_start_qos_cannot_consume(self) -> None:
         """Test on_poll_start when QoS cannot consume."""
         poller = MultiChannelPoller()
         poller._register_BZMPOP = MagicMock()  # type: ignore[method-assign]
-        poller._register_XREADGROUP = MagicMock()  # type: ignore[method-assign]
+        poller._register_XREAD = MagicMock()  # type: ignore[method-assign]
 
         channel = MagicMock()
         channel.active_queues = ["queue1"]
@@ -1299,7 +1214,7 @@ class TestMultiChannelPoller:
 
         # Neither should be registered when can_consume is False
         poller._register_BZMPOP.assert_not_called()  # type: ignore[attr-defined]
-        poller._register_XREADGROUP.assert_not_called()  # type: ignore[attr-defined]
+        poller._register_XREAD.assert_not_called()  # type: ignore[attr-defined]
 
     def test_close_handles_unregister_errors(self) -> None:
         """Test that close handles KeyError and ValueError when unregistering."""
@@ -1512,42 +1427,6 @@ class TestTransportIntegration:
         assert len(members) == 1
         assert members[0][0] == b"message1"
 
-    def test_stream_consumer_group(self, redis_client: Any) -> None:
-        """Test Redis Streams with consumer groups."""
-        stream_name = "test_stream"
-        group_name = "test_group"
-        consumer_name = "test_consumer"
-
-        # Create consumer group (mkstream=True creates stream if not exists)
-        try:
-            redis_client.xgroup_create(stream_name, group_name, id="0", mkstream=True)
-        except Exception as e:
-            if "BUSYGROUP" not in str(e):
-                raise
-
-        # Add message to stream
-        msg_id = redis_client.xadd(stream_name, {"payload": "test_message"})
-        assert msg_id is not None
-
-        # Read with consumer group
-        messages = redis_client.xreadgroup(
-            groupname=group_name,
-            consumername=consumer_name,
-            streams={stream_name: ">"},
-            count=1,
-            block=100,
-        )
-
-        assert messages is not None
-        assert len(messages) == 1
-        stream, message_list = messages[0]
-        assert len(message_list) == 1
-
-        # Acknowledge message
-        message_id = message_list[0][0]
-        ack_count = redis_client.xack(stream_name, group_name, message_id)
-        assert ack_count == 1
-
     def test_message_hash_storage(self, redis_client: Any) -> None:
         """Test that messages can be stored and retrieved from hash."""
         messages_key = "test_messages"
@@ -1582,47 +1461,6 @@ class TestTransportIntegration:
         assert len(messages) == 1
         stream, message_list = messages[0]
         assert len(message_list) == 2
-
-    def test_stream_consumer_group_redelivery(self, redis_client: Any) -> None:
-        """Test that unacked messages can be reclaimed from PEL."""
-        stream_name = "test_stream_pel"
-        group_name = "test_group_pel"
-        consumer1 = "consumer1"
-        consumer2 = "consumer2"
-
-        # Create consumer group
-        try:
-            redis_client.xgroup_create(stream_name, group_name, id="0", mkstream=True)
-        except Exception as e:
-            if "BUSYGROUP" not in str(e):
-                raise
-
-        # Add message
-        redis_client.xadd(stream_name, {"payload": "test"})
-
-        # Read with consumer1 (but don't ack)
-        messages = redis_client.xreadgroup(
-            groupname=group_name,
-            consumername=consumer1,
-            streams={stream_name: ">"},
-            count=1,
-        )
-        assert len(messages) == 1
-
-        # Check pending
-        pending = redis_client.xpending(stream_name, group_name)
-        assert pending["pending"] == 1
-
-        # Try to claim with consumer2 (min_idle_time=0 for test)
-        msg_id = messages[0][1][0][0]
-        claimed = redis_client.xclaim(
-            stream_name,
-            group_name,
-            consumer2,
-            min_idle_time=0,
-            message_ids=[msg_id],
-        )
-        assert len(claimed) == 1
 
     def test_stream_maxlen_trimming(self, redis_client: Any) -> None:
         """Test that stream respects maxlen for trimming."""
@@ -2326,18 +2164,6 @@ class TestFanoutMessaging:
             stream_key_with_route = channel._fanout_stream_key("test_exchange", "my_route")
             assert "test_exchange" in stream_key_with_route
             assert "my_route" in stream_key_with_route
-
-    def test_fanout_consumer_group_name_generation(
-        self,
-        celery_app: Celery,
-    ) -> None:
-        """Test that fanout consumer group names are generated correctly."""
-        with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
-
-            # Test consumer group name generation - uses queue name directly
-            group_name = channel._fanout_consumer_group("my_queue")
-            assert group_name == "my_queue"
 
     def test_fanout_exchange_declaration(
         self,
