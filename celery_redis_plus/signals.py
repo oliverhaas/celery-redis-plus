@@ -1,4 +1,10 @@
-"""Signal handlers to add delay header for tasks with eta/countdown."""
+"""Signal handlers for celery-redis-plus.
+
+This module provides signal handlers that integrate Celery with the
+celery-redis-plus transport. The main responsibility is converting
+Celery's eta (ISO datetime string in headers) to properties.eta
+(Unix timestamp float) for the transport layer.
+"""
 
 from __future__ import annotations
 
@@ -7,65 +13,52 @@ from typing import Any
 
 from celery.signals import before_task_publish
 
-from .constants import DELAY_HEADER
-
 
 @before_task_publish.connect
-def add_delay_header(
-    sender: str | None = None,
-    body: dict[str, Any] | None = None,
-    exchange: str | None = None,
-    routing_key: str | None = None,
-    headers: dict[str, Any] | None = None,
-    properties: dict[str, Any] | None = None,
-    declare: list[Any] | None = None,
-    retry_policy: dict[str, Any] | None = None,
+def _convert_eta_to_properties(
+    body: dict[str, Any],
+    properties: dict[str, Any],
     **kwargs: Any,
 ) -> None:
-    """Add x-celery-delay-seconds header based on eta in headers.
+    """Convert Celery's headers.eta to properties.eta for the transport.
 
-    This signal handler intercepts task publishing and calculates the delay
-    in seconds from the 'eta' header (if present). The delay is added as
-    x-celery-delay-seconds header for the transport to use.
+    Celery stores eta as an ISO datetime string in headers. Our transport
+    expects properties.eta as a Unix timestamp float (similar to priority).
+    This signal handler bridges the two.
 
     Args:
-        sender: The task name.
-        body: The task message body.
-        exchange: The exchange to publish to.
-        routing_key: The routing key.
-        headers: Message headers (modified in place to add delay header).
-        properties: Message properties.
-        declare: Entities to declare.
-        retry_policy: Retry policy for publishing.
-        **kwargs: Additional keyword arguments.
+        body: The message body (unused).
+        properties: Message properties dict - we add 'eta' here.
+        **kwargs: Additional signal arguments (headers, exchange, etc.).
     """
-    if headers is None:
+    headers = kwargs.get("headers", {})
+    if not headers:
         return
 
-    eta = headers.get("eta")
-    if eta is None:
+    eta_value = headers.get("eta")
+    if eta_value is None:
         return
 
-    # Parse eta - it can be an ISO format string or datetime
-    if isinstance(eta, str):
-        # Parse ISO format datetime string
-        # Celery uses ISO format with timezone: 2024-01-15T10:30:00+00:00
+    # Parse ISO datetime string to Unix timestamp
+    if isinstance(eta_value, str):
+        # Celery sends ISO format datetime strings
         try:
-            eta_dt = datetime.fromisoformat(eta)
-        except ValueError:
-            return
-    elif isinstance(eta, datetime):
-        eta_dt = eta
-    else:
-        return
-
-    # Ensure eta is timezone-aware
-    if eta_dt.tzinfo is None:
-        eta_dt = eta_dt.replace(tzinfo=UTC)
-
-    now = datetime.now(UTC)
-    delay_seconds = (eta_dt - now).total_seconds()
-
-    # Only add delay header if eta is in the future
-    if delay_seconds > 0:
-        headers[DELAY_HEADER] = delay_seconds
+            # Try parsing with timezone info
+            if eta_value.endswith("Z"):
+                eta_value = eta_value[:-1] + "+00:00"
+            eta_dt = datetime.fromisoformat(eta_value)
+            # Ensure UTC timezone
+            if eta_dt.tzinfo is None:
+                eta_dt = eta_dt.replace(tzinfo=UTC)
+            properties["eta"] = eta_dt.timestamp()
+        except (ValueError, TypeError):
+            # If parsing fails, skip - transport will handle as immediate
+            pass
+    elif isinstance(eta_value, datetime):
+        # Already a datetime object
+        if eta_value.tzinfo is None:
+            eta_value = eta_value.replace(tzinfo=UTC)
+        properties["eta"] = eta_value.timestamp()
+    elif isinstance(eta_value, (int, float)):
+        # Already a Unix timestamp
+        properties["eta"] = float(eta_value)

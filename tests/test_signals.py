@@ -1,128 +1,136 @@
-"""Tests for the signal handler that adds delay headers."""
+"""Tests for signal handlers."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
-from celery_redis_plus.constants import DELAY_HEADER
-from celery_redis_plus.signals import add_delay_header
-
 
 @pytest.mark.unit
-class TestAddDelayHeader:
-    """Tests for add_delay_header signal handler."""
+class TestConvertEtaToProperties:
+    """Tests for the _convert_eta_to_properties signal handler."""
 
     def test_no_headers(self) -> None:
-        """Test that handler handles None headers gracefully."""
-        # Should not raise
-        add_delay_header(sender="task", headers=None)
+        """Test with no headers - should not modify properties."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
 
-    def test_no_eta(self) -> None:
-        """Test that handler does nothing when no eta is present."""
-        headers: dict[str, object] = {}
-        add_delay_header(sender="task", headers=headers)
-        assert DELAY_HEADER not in headers
+        properties: dict[str, Any] = {}
+        _convert_eta_to_properties(body={}, properties=properties)
+        assert "eta" not in properties
 
-    def test_eta_in_future_iso_string(self) -> None:
-        """Test that delay header is added for future eta as ISO string."""
-        future_eta = datetime.now(UTC) + timedelta(seconds=60)
-        headers: dict[str, object] = {"eta": future_eta.isoformat()}
+    def test_no_eta_in_headers(self) -> None:
+        """Test with headers but no eta - should not modify properties."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
 
-        add_delay_header(sender="task", headers=headers)
+        properties: dict[str, Any] = {}
+        _convert_eta_to_properties(body={}, properties=properties, headers={"foo": "bar"})
+        assert "eta" not in properties
 
-        assert DELAY_HEADER in headers
-        delay = headers[DELAY_HEADER]
-        assert isinstance(delay, float)
-        # Should be approximately 60 seconds (allow some tolerance for test execution time)
-        assert 55 < delay < 65
+    def test_eta_iso_string_with_z(self) -> None:
+        """Test eta as ISO string with Z suffix."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
 
-    def test_eta_in_future_datetime(self) -> None:
-        """Test that delay header is added for future eta as datetime."""
-        future_eta = datetime.now(UTC) + timedelta(seconds=120)
-        headers: dict[str, object] = {"eta": future_eta}
+        properties: dict[str, Any] = {}
+        eta_dt = datetime(2025, 1, 15, 10, 30, 0, tzinfo=UTC)
+        eta_str = eta_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        add_delay_header(sender="task", headers=headers)
+        _convert_eta_to_properties(body={}, properties=properties, headers={"eta": eta_str})
 
-        assert DELAY_HEADER in headers
-        delay = headers[DELAY_HEADER]
-        assert isinstance(delay, float)
-        assert 115 < delay < 125
+        assert "eta" in properties
+        assert abs(properties["eta"] - eta_dt.timestamp()) < 0.001
 
-    def test_eta_in_past(self) -> None:
-        """Test that delay header is not added for past eta."""
-        past_eta = datetime.now(UTC) - timedelta(seconds=60)
-        headers: dict[str, object] = {"eta": past_eta.isoformat()}
+    def test_eta_iso_string_with_offset(self) -> None:
+        """Test eta as ISO string with timezone offset."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
 
-        add_delay_header(sender="task", headers=headers)
+        properties: dict[str, Any] = {}
+        eta_dt = datetime(2025, 1, 15, 10, 30, 0, tzinfo=UTC)
+        eta_str = eta_dt.isoformat()
 
-        # Should not add delay header for past eta
-        assert DELAY_HEADER not in headers
+        _convert_eta_to_properties(body={}, properties=properties, headers={"eta": eta_str})
 
-    def test_eta_naive_datetime(self) -> None:
-        """Test that naive datetime is treated as UTC."""
-        future_eta = datetime.now(UTC) + timedelta(seconds=60)
-        # Create naive datetime (no timezone)
-        naive_eta = future_eta.replace(tzinfo=None)
-        headers: dict[str, object] = {"eta": naive_eta}
+        assert "eta" in properties
+        assert abs(properties["eta"] - eta_dt.timestamp()) < 0.001
 
-        add_delay_header(sender="task", headers=headers)
+    def test_eta_iso_string_naive(self) -> None:
+        """Test eta as naive ISO string (treated as UTC)."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
 
-        assert DELAY_HEADER in headers
+        properties: dict[str, Any] = {}
+        eta_str = "2025-01-15T10:30:00"
 
-    def test_invalid_eta_string(self) -> None:
-        """Test that invalid eta string is handled gracefully."""
-        headers: dict[str, object] = {"eta": "not-a-date"}
+        _convert_eta_to_properties(body={}, properties=properties, headers={"eta": eta_str})
 
-        # Should not raise
-        add_delay_header(sender="task", headers=headers)
+        assert "eta" in properties
+        # Should be treated as UTC
+        expected_dt = datetime(2025, 1, 15, 10, 30, 0, tzinfo=UTC)
+        assert abs(properties["eta"] - expected_dt.timestamp()) < 0.001
 
-        assert DELAY_HEADER not in headers
+    def test_eta_datetime_object(self) -> None:
+        """Test eta as datetime object."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
 
-    def test_invalid_eta_type(self) -> None:
-        """Test that invalid eta type is handled gracefully."""
-        headers: dict[str, object] = {"eta": 12345}  # Invalid type
+        properties: dict[str, Any] = {}
+        eta_dt = datetime(2025, 1, 15, 10, 30, 0, tzinfo=UTC)
 
-        # Should not raise
-        add_delay_header(sender="task", headers=headers)
+        _convert_eta_to_properties(body={}, properties=properties, headers={"eta": eta_dt})
 
-        assert DELAY_HEADER not in headers
+        assert "eta" in properties
+        assert abs(properties["eta"] - eta_dt.timestamp()) < 0.001
 
-    def test_eta_with_timezone_offset(self) -> None:
-        """Test eta with non-UTC timezone."""
-        # Create a datetime with +05:00 offset, 60 seconds in the future
-        now_utc = datetime.now(UTC)
-        future_utc = now_utc + timedelta(seconds=60)
-        # Convert to +05:00 timezone
-        tz_offset = timezone(timedelta(hours=5))
-        future_with_offset = future_utc.astimezone(tz_offset)
+    def test_eta_datetime_naive(self) -> None:
+        """Test eta as naive datetime (treated as UTC)."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
 
-        headers: dict[str, object] = {"eta": future_with_offset.isoformat()}
+        properties: dict[str, Any] = {}
+        # Create a naive datetime by removing tzinfo from a tz-aware datetime
+        eta_dt_aware = datetime(2025, 1, 15, 10, 30, 0, tzinfo=UTC)
+        eta_dt = eta_dt_aware.replace(tzinfo=None)  # naive
 
-        add_delay_header(sender="task", headers=headers)
+        _convert_eta_to_properties(body={}, properties=properties, headers={"eta": eta_dt})
 
-        assert DELAY_HEADER in headers
-        delay = headers[DELAY_HEADER]
-        assert isinstance(delay, float)
-        assert 55 < delay < 65
+        assert "eta" in properties
+        expected_dt = datetime(2025, 1, 15, 10, 30, 0, tzinfo=UTC)
+        assert abs(properties["eta"] - expected_dt.timestamp()) < 0.001
 
-    def test_all_other_kwargs_ignored(self) -> None:
-        """Test that other kwargs are properly ignored."""
-        future_eta = datetime.now(UTC) + timedelta(seconds=30)
-        headers: dict[str, object] = {"eta": future_eta.isoformat()}
+    def test_eta_unix_timestamp_float(self) -> None:
+        """Test eta as Unix timestamp float."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
 
-        # Call with various other kwargs that should be ignored
-        add_delay_header(
-            sender="my_task",
-            body={"args": [], "kwargs": {}},
-            exchange="celery",
-            routing_key="celery",
-            headers=headers,
-            properties={"delivery_mode": 2},
-            declare=[],
-            retry_policy={"max_retries": 3},
-            extra_kwarg="should be ignored",
-        )
+        properties: dict[str, Any] = {}
+        eta_timestamp = 1736938200.0  # Some timestamp
 
-        assert DELAY_HEADER in headers
+        _convert_eta_to_properties(body={}, properties=properties, headers={"eta": eta_timestamp})
+
+        assert "eta" in properties
+        assert properties["eta"] == eta_timestamp
+
+    def test_eta_unix_timestamp_int(self) -> None:
+        """Test eta as Unix timestamp int."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
+
+        properties: dict[str, Any] = {}
+        eta_timestamp = 1736938200
+
+        _convert_eta_to_properties(body={}, properties=properties, headers={"eta": eta_timestamp})
+
+        assert "eta" in properties
+        assert properties["eta"] == float(eta_timestamp)
+
+    def test_invalid_eta_string_ignored(self) -> None:
+        """Test invalid eta string is ignored."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
+
+        properties: dict[str, Any] = {}
+        _convert_eta_to_properties(body={}, properties=properties, headers={"eta": "not-a-date"})
+        assert "eta" not in properties
+
+    def test_none_eta_ignored(self) -> None:
+        """Test None eta is ignored."""
+        from celery_redis_plus.signals import _convert_eta_to_properties
+
+        properties: dict[str, Any] = {}
+        _convert_eta_to_properties(body={}, properties=properties, headers={"eta": None})
+        assert "eta" not in properties

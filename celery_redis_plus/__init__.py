@@ -2,7 +2,7 @@
 
 This package provides an enhanced Redis transport for Celery that uses:
 - BZMPOP + sorted sets for regular queues (priority support + reliability)
-- Redis Streams for fanout exchanges (reliable consumer groups)
+- Redis Streams for fanout exchanges (true broadcast with XREAD)
 - Native delayed delivery integrated into sorted set scoring
 
 Requirements:
@@ -11,7 +11,6 @@ Requirements:
 
 Usage:
     from celery import Celery
-    import celery_redis_plus  # Auto-registers signal handler for eta/countdown
 
     app = Celery('myapp')
     app.config_from_object({
@@ -37,13 +36,15 @@ Usage:
 
 from __future__ import annotations
 
+from importlib.metadata import version
 from typing import Any
 
 from .bootstep import DelayedDeliveryBootstep
-from .constants import DELAY_HEADER
 from .transport import Transport
 
-__all__ = ["DELAY_HEADER", "DelayedDeliveryBootstep", "Transport", "configure_app"]
+__all__ = ["DelayedDeliveryBootstep", "Transport", "__version__", "configure_app"]
+
+__version__ = version("celery-redis-plus")
 
 
 def configure_app(app: Any) -> None:
@@ -63,11 +64,3 @@ def configure_app(app: Any) -> None:
         >>> celery_redis_plus.configure_app(app)
     """
     app.steps["consumer"].add(DelayedDeliveryBootstep)
-
-
-__version__ = "0.1.0a2"
-
-
-# Auto-register signal handler on import
-# This ensures the delay header is added to all tasks with eta/countdown
-from . import signals as _signals  # noqa: F401, E402

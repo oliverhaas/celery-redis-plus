@@ -17,9 +17,8 @@ Connection string has the following format:
 
 Transport Options
 =================
-* ``visibility_timeout``: Time in seconds before unacked messages are restored (default: 3600)
+* ``visibility_timeout``: Time in seconds before unacked messages are restored (default: 300)
 * ``stream_maxlen``: Maximum stream length for fanout streams (default: 10000)
-* ``consumer_group_prefix``: Prefix for consumer groups (default: 'celery-redis-plus')
 * ``global_keyprefix``: Global prefix for all Redis keys
 * ``socket_timeout``: Socket timeout in seconds
 * ``socket_connect_timeout``: Socket connection timeout in seconds
@@ -49,16 +48,15 @@ from kombu.utils.eventio import ERR, READ, poll
 from kombu.utils.functional import accepts_argument
 from kombu.utils.json import dumps, loads
 from kombu.utils.objects import cached_property
-from kombu.utils.scheduling import cycle_by_name
 from kombu.utils.url import _parse_url
 from vine import promise
 
 from .constants import (
-    DEFAULT_CONSUMER_GROUP_PREFIX,
+    DEFAULT_DELAYED_CHECK_INTERVAL,
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
-    DELAY_HEADER,
+    DELAYED_QUEUE_SUFFIX,
     PRIORITY_SCORE_MULTIPLIER,
 )
 
@@ -80,18 +78,16 @@ DEFAULT_DB = 0
 error_classes_t = namedtuple("error_classes_t", ("connection_errors", "channel_errors"))
 
 
-def _queue_score(priority: int, timestamp: float | None = None, delay_seconds: float = 0.0) -> float:
+def _queue_score(priority: int, timestamp: float | None = None) -> float:
     """Compute sorted set score for queue ordering.
 
     Higher priority number = higher priority = lower score = popped first.
     This matches RabbitMQ semantics where priority 255 is highest, 0 is lowest.
     Within same priority, earlier timestamp = lower score = popped first (FIFO).
-    Delayed messages have future timestamps in their score.
 
     Args:
         priority: Message priority (0-255, higher is higher priority, matching RabbitMQ)
         timestamp: Unix timestamp in seconds (defaults to current time)
-        delay_seconds: Additional delay in seconds for delayed delivery
 
     Returns:
         Float score for ZADD
@@ -100,7 +96,7 @@ def _queue_score(priority: int, timestamp: float | None = None, delay_seconds: f
         timestamp = time()
     # Invert priority so higher priority number = lower score = popped first
     # Multiply by large factor to leave room for millisecond timestamps
-    return (255 - priority) * PRIORITY_SCORE_MULTIPLIER + int((timestamp + delay_seconds) * 1000)
+    return (255 - priority) * PRIORITY_SCORE_MULTIPLIER + int(timestamp * 1000)
 
 
 def get_redis_error_classes() -> error_classes_t:
@@ -185,13 +181,11 @@ class GlobalKeyPrefixMixin:
         "ZADD",
         "ZCARD",
         "ZPOPMIN",
+        "ZRANGEBYSCORE",
         "ZREM",
         "ZREVRANGEBYSCORE",
         "ZSCORE",
         "XADD",
-        "XACK",
-        "XGROUP CREATE",
-        "XRANGE",
     ]
 
     @staticmethod
@@ -209,10 +203,10 @@ class GlobalKeyPrefixMixin:
         return pre_args + keys + post_args
 
     @staticmethod
-    def _prefix_xreadgroup_args(args: list[Any], prefix: str) -> list[Any]:
-        """Prefix keys in XREADGROUP command.
+    def _prefix_xread_args(args: list[Any], prefix: str) -> list[Any]:
+        """Prefix keys in XREAD command.
 
-        XREADGROUP GROUP <group> <consumer> [COUNT n] [BLOCK ms] STREAMS <key1> ... <id1> ...
+        XREAD [COUNT n] [BLOCK ms] STREAMS <key1> ... <id1> ...
         """
         streams_idx = None
         for i, arg in enumerate(args):
@@ -231,7 +225,7 @@ class GlobalKeyPrefixMixin:
         "DEL": {"args_start": 0, "args_end": None},
         "WATCH": {"args_start": 0, "args_end": None},
         "BZMPOP": _prefix_bzmpop_args,
-        "XREADGROUP": _prefix_xreadgroup_args,
+        "XREAD": _prefix_xread_args,
     }
 
     def _prefix_args(self, args: list[Any]) -> list[Any]:
@@ -310,8 +304,8 @@ class QoS(virtual.QoS):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._vrestore_count = 0
-        # For streams fanout: track stream/message_id/group for ack
-        self._stream_metadata: dict[str, tuple[str, str, str]] = {}
+        # For streams fanout: track delivery tags that came from fanout (no ack needed)
+        self._fanout_tags: set[str] = set()
 
     def append(self, message: Any, delivery_tag: str) -> None:
         # Message is already stored in messages hash at publish time.
@@ -319,45 +313,18 @@ class QoS(virtual.QoS):
         super().append(message, delivery_tag)
 
     def ack(self, delivery_tag: str) -> None:
-        # Check if this is a stream message (fanout)
-        if delivery_tag in self._stream_metadata:
-            stream, message_id, group_name = self._stream_metadata.pop(delivery_tag)
-            # Strip global prefix since client will add it
-            prefix = self.channel.global_keyprefix
-            if prefix and stream.startswith(prefix):
-                stream = stream[len(prefix) :]
-            self.channel.client.xack(stream, group_name, message_id)
+        # Fanout messages don't need Redis cleanup (no consumer groups)
+        if delivery_tag in self._fanout_tags:
+            self._fanout_tags.discard(delivery_tag)
         else:
             # Regular sorted set message
             self._remove_from_indices(delivery_tag).execute()
         super().ack(delivery_tag)
 
     def reject(self, delivery_tag: str, requeue: bool = False) -> None:
-        # Check if this is a stream message (fanout)
-        if delivery_tag in self._stream_metadata:
-            stream, message_id, group_name = self._stream_metadata.pop(delivery_tag)
-            prefix = self.channel.global_keyprefix
-            if prefix and stream.startswith(prefix):
-                stream = stream[len(prefix) :]
-
-            if requeue:
-                # Re-add to stream
-                try:
-                    messages = self.channel.client.xrange(stream, min=message_id, max=message_id, count=1)
-                    if messages:
-                        _msg_id, fields = messages[0]
-                        self.channel.client.xadd(
-                            name=stream,
-                            fields=fields,
-                            id="*",
-                            maxlen=self.channel.stream_maxlen,
-                            approximate=True,
-                        )
-                        self.channel.client.xack(stream, group_name, message_id)
-                except Exception:
-                    crit("Failed to requeue stream message %r", delivery_tag, exc_info=True)
-            else:
-                self.channel.client.xack(stream, group_name, message_id)
+        # Fanout messages: requeue not supported (fire-and-forget broadcast)
+        if delivery_tag in self._fanout_tags:
+            self._fanout_tags.discard(delivery_tag)
             super().ack(delivery_tag)
         else:
             # Regular sorted set message
@@ -377,7 +344,12 @@ class QoS(virtual.QoS):
 
     def _remove_from_indices(self, delivery_tag: str, pipe: Any = None) -> Any:
         with self.pipe_or_acquire(pipe) as pipe:
-            return pipe.zrem(self.messages_index_key, delivery_tag).hdel(self.messages_key, delivery_tag)
+            # Also clean up delayed score hash (no-op if not a delayed message)
+            return (
+                pipe.zrem(self.messages_index_key, delivery_tag)
+                .hdel(self.messages_key, delivery_tag)
+                .hdel(self.messages_delayed_score_key, delivery_tag)
+            )
 
     def maybe_update_messages_index(self) -> None:
         """Update scores of delivered messages to current time.
@@ -390,8 +362,8 @@ class QoS(virtual.QoS):
         now = time()
         with self.channel.conn_or_acquire() as client, client.pipeline() as pipe:
             for tag in self._delivered:
-                # Skip stream messages
-                if tag not in self._stream_metadata:
+                # Skip fanout messages (they don't use the index)
+                if tag not in self._fanout_tags:
                     pipe.zadd(self.messages_index_key, {tag: now})
             pipe.execute()
 
@@ -420,9 +392,9 @@ class QoS(virtual.QoS):
                             # Message already acked, remove from index
                             client.zrem(self.messages_index_key, tag_str)
                             continue
-                        M, EX, RK = loads(bytes_to_str(payload))  # type: ignore[call-arg]
+                        _message, exchange, routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
                         # Check if delivery_tag is still in any target queue
-                        queues = self.channel._lookup(EX, RK)
+                        queues = self.channel._lookup(exchange, routing_key)
                         in_queue = False
                         for queue in queues:
                             if client.zscore(queue, tag_str) is not None:
@@ -441,8 +413,8 @@ class QoS(virtual.QoS):
             p = pipe.hget(self.messages_key, tag)
             pipe.multi()
             if p:
-                M, EX, RK = loads(bytes_to_str(p))  # type: ignore[call-arg]
-                self.channel._do_restore_message(M, EX, RK, pipe, leftmost, tag)
+                message, exchange, routing_key, _priority = loads(bytes_to_str(p))  # type: ignore[call-arg]
+                self.channel._do_restore_message(message, exchange, routing_key, pipe, leftmost, tag)
 
         with self.channel.conn_or_acquire(client) as client:
             client.transaction(restore_transaction, self.messages_key)
@@ -462,6 +434,10 @@ class QoS(virtual.QoS):
     @cached_property
     def messages_mutex_expire(self) -> int:
         return self.channel.messages_mutex_expire
+
+    @cached_property
+    def messages_delayed_score_key(self) -> str:
+        return self.channel.messages_delayed_score_key
 
     @cached_property
     def visibility_timeout(self) -> float:
@@ -532,14 +508,14 @@ class MultiChannelPoller:
         if not channel._in_poll:
             channel._bzmpop_start()
 
-    def _register_XREADGROUP(self, channel: Channel) -> None:
-        """Enable XREADGROUP mode for channel (fanout streams)."""
-        ident = channel, channel.client, "XREADGROUP"
-        if not self._client_registered(channel, channel.client, "XREADGROUP"):
+    def _register_XREAD(self, channel: Channel) -> None:
+        """Enable XREAD mode for channel (fanout streams)."""
+        ident = channel, channel.client, "XREAD"
+        if not self._client_registered(channel, channel.client, "XREAD"):
             channel._in_fanout_poll = False
             self._register(*ident)
         if not channel._in_fanout_poll:
-            channel._xreadgroup_start()
+            channel._xread_start()
 
     def on_poll_start(self) -> None:
         for channel in self._channels:
@@ -548,7 +524,7 @@ class MultiChannelPoller:
                     self._register_BZMPOP(channel)
             if channel.active_fanout_queues:
                 if channel.qos.can_consume():
-                    self._register_XREADGROUP(channel)
+                    self._register_XREAD(channel)
 
     def on_poll_init(self, poller: Any) -> None:
         self.poller = poller
@@ -567,6 +543,18 @@ class MultiChannelPoller:
         for channel in self._channels:
             if channel.active_queues:
                 channel.qos.maybe_update_messages_index()
+
+    def maybe_move_ready_delayed_messages(self) -> int:
+        """Move delayed messages that are ready to their destination queues.
+
+        Returns:
+            Total number of messages moved across all channels.
+        """
+        total_moved = 0
+        for channel in self._channels:
+            if channel.active_queues:
+                total_moved += channel.move_ready_delayed_messages()
+        return total_moved
 
     def on_readable(self, fileno: int) -> bool | None:
         chan, cmd_type = self._fd_to_chan[fileno]
@@ -591,7 +579,7 @@ class MultiChannelPoller:
                         self._register_BZMPOP(channel)
                 if channel.active_fanout_queues:
                     if channel.qos.can_consume():
-                        self._register_XREADGROUP(channel)
+                        self._register_XREAD(channel)
 
             events = self.poller.poll(timeout)
             if events:
@@ -642,6 +630,7 @@ class Channel(virtual.Channel):
     messages_index_key = "messages_index"
     messages_mutex_key = "messages_mutex"
     messages_mutex_expire = 300  # 5 minutes
+    messages_delayed_score_key = "messages_delayed_score"  # Precomputed scores for delayed msgs
 
     # Visibility and timeout settings
     visibility_timeout: float = DEFAULT_VISIBILITY_TIMEOUT
@@ -656,7 +645,6 @@ class Channel(virtual.Channel):
 
     # Streams configuration
     stream_maxlen = DEFAULT_STREAM_MAXLEN
-    consumer_group_prefix = DEFAULT_CONSUMER_GROUP_PREFIX
 
     # Global key prefix
     global_keyprefix = ""
@@ -664,9 +652,6 @@ class Channel(virtual.Channel):
     # Fanout settings
     fanout_prefix: bool | str = True
     fanout_patterns = True
-
-    # Queue ordering
-    queue_order_strategy = "round_robin"
 
     _async_pool: Any = None
     _pool: Any = None
@@ -685,13 +670,11 @@ class Channel(virtual.Channel):
         "socket_connect_timeout",
         "socket_keepalive",
         "socket_keepalive_options",
-        "queue_order_strategy",
         "max_connections",
         "health_check_interval",
         "retry_on_timeout",
         "client_name",
         "stream_maxlen",
-        "consumer_group_prefix",
     )
 
     connection_class = redis.Connection if redis else None
@@ -701,14 +684,15 @@ class Channel(virtual.Channel):
         super().__init__(*args, **kwargs)
 
         self._registered = False
-        self._queue_cycle = cycle_by_name(self.queue_order_strategy)()
+        self._queue_cycle: list[str] = []
         self.Client = self._get_client()
         self.ResponseError = self._get_response_error()
         self.active_fanout_queues: set[str] = set()
         self.auto_delete_queues: set[str] = set()
         self._fanout_to_queue: dict[str, str] = {}
-        self.handlers = {"BZMPOP": self._bzmpop_read, "XREADGROUP": self._xreadgroup_read}
-        self.brpop_timeout = self.connection.brpop_timeout
+        self.handlers = {"BZMPOP": self._bzmpop_read, "XREAD": self._xread_read}
+        # Track last-read stream ID per stream for fanout (start with $ = only new messages)
+        self._stream_offsets: dict[str, str] = {}
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -772,8 +756,8 @@ class Channel(virtual.Channel):
             if delivery_tag is None:
                 delivery_tag = payload["properties"]["delivery_tag"]
             for queue in self._lookup(exchange, routing_key):
-                pri = self._get_message_priority(payload, reverse=False)
-                score = 0 if leftmost else _queue_score(pri)
+                priority = self._get_message_priority(payload, reverse=False)
+                score = 0 if leftmost else _queue_score(priority)
                 pipe.zadd(queue, {delivery_tag: score})
                 pipe.hset(self.messages_key, delivery_tag, dumps([payload, exchange, routing_key]))  # type: ignore[call-arg]
         except Exception:
@@ -783,11 +767,11 @@ class Channel(virtual.Channel):
         tag = message.delivery_tag
 
         def restore_transaction(pipe: Any) -> None:
-            P = pipe.hget(self.messages_key, tag)
+            payload = pipe.hget(self.messages_key, tag)
             pipe.multi()
-            if P:
-                M, EX, RK = loads(bytes_to_str(P))  # type: ignore[call-arg]
-                self._do_restore_message(M, EX, RK, pipe, leftmost, tag)
+            if payload:
+                message, exchange, routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
+                self._do_restore_message(message, exchange, routing_key, pipe, leftmost, tag)
 
         with self.conn_or_acquire() as client:
             client.transaction(restore_transaction, self.messages_key)
@@ -834,11 +818,10 @@ class Channel(virtual.Channel):
 
     def _bzmpop_start(self, timeout: float | None = None) -> None:
         if timeout is None:
-            timeout = self.brpop_timeout
-        queues = self._queue_cycle.consume(len(self.active_queues))
-        if not queues:
+            timeout = self.connection.polling_interval or 1
+        if not self._queue_cycle:
             return
-        keys = list(queues)
+        keys = list(self._queue_cycle)
         self._in_poll = self.client.connection
 
         command_args: list[Any] = ["BZMPOP", timeout or 0, len(keys), *keys, "MIN"]
@@ -859,10 +842,9 @@ class Channel(virtual.Channel):
                 dest = bytes_to_str(dest)
                 delivery_tag, _score = members[0]
                 delivery_tag = bytes_to_str(delivery_tag)
-                self._queue_cycle.rotate(dest)
                 payload = self.client.hget(self.messages_key, delivery_tag)
                 if payload:
-                    message, _, _ = loads(bytes_to_str(payload))  # type: ignore[call-arg]
+                    message, _exchange, _routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
                     self.connection._deliver(message, dest)
                     return True
                 raise Empty()
@@ -878,70 +860,39 @@ class Channel(virtual.Channel):
             return f"{self.keyprefix_fanout}{exchange}/{routing_key}"
         return f"{self.keyprefix_fanout}{exchange}"
 
-    def _fanout_consumer_group(self, queue: str) -> str:
-        """Get consumer group name for fanout queue."""
-        return f"{self.consumer_group_prefix}-fanout-{queue}"
-
-    @cached_property
-    def consumer_id(self) -> str:
-        """Unique consumer identifier."""
-        import os
-        import threading
-
-        hostname = socket_module.gethostname()
-        pid = os.getpid()
-        thread_id = threading.get_ident()
-        return f"{hostname}-{pid}-{thread_id}"
-
-    def _ensure_consumer_group(self, stream: str, group: str | None = None) -> None:
-        """Ensure consumer group exists for stream."""
-        if group is None:
-            group = f"{self.consumer_group_prefix}-default"
-        try:
-            self.client.xgroup_create(name=stream, groupname=group, id="0", mkstream=True)
-        except self.ResponseError as e:
-            if "BUSYGROUP" not in str(e):
-                raise
-
-    def _xreadgroup_start(self, timeout: float | None = None) -> None:
-        """Start XREADGROUP for fanout streams."""
+    def _xread_start(self, timeout: float | None = None) -> None:
+        """Start XREAD for fanout streams (true broadcast - every consumer gets every message)."""
         if timeout is None:
-            timeout = self.brpop_timeout
+            timeout = self.connection.polling_interval or 1
 
         streams: dict[str, str] = {}
-        self._pending_fanout_groups: dict[str, str] = {}
 
         for queue in self.active_fanout_queues:
             if queue in self._fanout_queues:
                 exchange, routing_key = self._fanout_queues[queue]
                 stream_key = self._fanout_stream_key(exchange, routing_key)
-                group_name = self._fanout_consumer_group(queue)
-                self._ensure_consumer_group(stream_key, group_name)
-                streams[stream_key] = ">"
-                self._pending_fanout_groups[stream_key] = group_name
+                # Use stored offset or "$" for only new messages
+                offset = self._stream_offsets.get(stream_key, "$")
+                streams[stream_key] = offset
 
         if not streams:
             return
 
         self._in_fanout_poll = self.client.connection
 
-        # Build and send command - we can only use one group per XREADGROUP call
-        # so we just use the first one
-        first_stream = next(iter(streams.keys()))
-        first_group = self._pending_fanout_groups[first_stream]
+        # Build XREAD command
+        stream_keys = list(streams.keys())
+        stream_ids = [streams[k] for k in stream_keys]
 
         command_args: list[Any] = [
-            "XREADGROUP",
-            "GROUP",
-            first_group,
-            self.consumer_id,
+            "XREAD",
             "COUNT",
             "1",
             "BLOCK",
             str(int((timeout or 0) * 1000)),
             "STREAMS",
-            first_stream,
-            ">",
+            *stream_keys,
+            *stream_ids,
         ]
 
         if self.global_keyprefix:
@@ -949,11 +900,11 @@ class Channel(virtual.Channel):
 
         self.client.connection.send_command(*command_args)
 
-    def _xreadgroup_read(self, **options: Any) -> bool:
-        """Read messages from XREADGROUP."""
+    def _xread_read(self, **options: Any) -> bool:
+        """Read messages from XREAD (fanout broadcast)."""
         try:
             try:
-                messages = self.client.parse_response(self.client.connection, "XREADGROUP", **options)
+                messages = self.client.parse_response(self.client.connection, "XREAD", **options)
             except self.connection_errors:
                 self.client.connection.disconnect()
                 raise
@@ -966,14 +917,20 @@ class Channel(virtual.Channel):
                 for message_id, fields in message_list:
                     message_id_str = bytes_to_str(message_id) if isinstance(message_id, bytes) else message_id
 
+                    # Update offset for this stream
+                    # Strip prefix if present for storing offset
+                    offset_key = stream_str
+                    prefix = self.global_keyprefix
+                    if prefix and stream_str.startswith(prefix):
+                        offset_key = stream_str[len(prefix) :]
+                    self._stream_offsets[offset_key] = message_id_str
+
                     # Find which queue this stream belongs to
                     queue_name = None
-                    group_name = None
                     for queue, (exchange, routing_key) in self._fanout_queues.items():
                         fanout_stream = self._fanout_stream_key(exchange, routing_key)
                         if stream_str.endswith(fanout_stream) or stream_str == fanout_stream:
                             queue_name = queue
-                            group_name = self._fanout_consumer_group(queue)
                             break
 
                     if not queue_name:
@@ -989,8 +946,8 @@ class Channel(virtual.Channel):
                     delivery_tag = self._next_delivery_tag()
                     payload["properties"]["delivery_tag"] = delivery_tag
 
-                    # Store metadata for ack
-                    self.qos._stream_metadata[delivery_tag] = (stream_str, message_id_str, group_name)
+                    # Mark as fanout message (no ack needed)
+                    self.qos._fanout_tags.add(delivery_tag)
 
                     # Deliver message
                     self.connection._deliver(payload, queue_name)
@@ -999,7 +956,6 @@ class Channel(virtual.Channel):
             raise Empty()
         finally:
             self._in_fanout_poll = None  # type: ignore[assignment]
-            self._pending_fanout_groups = {}
 
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
         return self.client.parse_response(self.client.connection, cmd_type)
@@ -1013,7 +969,7 @@ class Channel(virtual.Channel):
                 delivery_tag = bytes_to_str(delivery_tag)
                 payload = client.hget(self.messages_key, delivery_tag)
                 if payload:
-                    message, _, _ = loads(bytes_to_str(payload))  # type: ignore[call-arg]
+                    message, _exchange, _routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
                     return message
             raise Empty()
 
@@ -1021,28 +977,143 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             return client.zcard(queue)
 
+    # Lua script for atomically moving ready delayed messages to main queue
+    # KEYS: [1] = delayed_score_hash, [2..n] = queue names (main queues)
+    # ARGV: [1] = threshold_time, [2] = delayed_queue_suffix, [3] = batch_limit
+    # Returns: array of [total_moved, queue1_moved, queue2_moved, ...]
+    _move_ready_delayed_lua = """
+    local score_hash = KEYS[1]
+    local threshold = tonumber(ARGV[1])
+    local delayed_suffix = ARGV[2]
+    local batch_limit = tonumber(ARGV[3])
+    local results = {0}  -- results[1] = total moved
+
+    -- Process each queue (KEYS[2] onwards are main queue names)
+    for i = 2, #KEYS do
+        local main_queue = KEYS[i]
+        local delayed_queue = main_queue .. delayed_suffix
+        local queue_moved = 0
+
+        -- Get ready messages with limit (score <= threshold)
+        local ready = redis.call('ZRANGEBYSCORE', delayed_queue, '-inf', threshold, 'LIMIT', 0, batch_limit)
+
+        for _, tag in ipairs(ready) do
+            -- Get precomputed score
+            local score = redis.call('HGET', score_hash, tag)
+            if score then
+                -- Move to main queue with precomputed score
+                redis.call('ZREM', delayed_queue, tag)
+                redis.call('ZADD', main_queue, score, tag)
+                redis.call('HDEL', score_hash, tag)
+                queue_moved = queue_moved + 1
+            else
+                -- No score found, message was deleted - just clean up
+                redis.call('ZREM', delayed_queue, tag)
+            end
+        end
+
+        results[1] = results[1] + queue_moved
+        results[i] = queue_moved
+    end
+
+    return results
+    """
+
+    # Maximum messages to move per queue per check cycle
+    _move_ready_delayed_batch_limit = 1000
+
+    def move_ready_delayed_messages(self) -> int:
+        """Move messages from delayed queues to ready queues when their eta has passed.
+
+        Uses a Lua script for atomic, efficient batch moves without round-trips.
+        For each active queue, checks the corresponding {queue}:delayed sorted set
+        for messages with score <= threshold. The threshold is current time plus
+        the check interval, so we move messages that will be ready by the next check.
+
+        Returns:
+            Number of messages moved.
+        """
+        if not self.active_queues:
+            return 0
+
+        # Move messages that will be ready by the next check interval
+        threshold = time() + DEFAULT_DELAYED_CHECK_INTERVAL
+        queues = list(self.active_queues)
+
+        with self.conn_or_acquire() as client:
+            # Register the Lua script (cached after first call)
+            move_script = client.register_script(self._move_ready_delayed_lua)
+
+            # Pass all queue names to Lua: KEYS[1] = score_hash, KEYS[2..n] = queues
+            keys = [self.messages_delayed_score_key, *queues]
+            results = move_script(
+                keys=keys,
+                args=[threshold, DELAYED_QUEUE_SUFFIX, self._move_ready_delayed_batch_limit],
+            )
+
+        if not results:
+            return 0
+
+        total_moved = results[0]
+
+        # Check if any queue hit the batch limit and log a warning
+        for i, queue in enumerate(queues):
+            queue_moved = results[i + 1] if i + 1 < len(results) else 0
+            if queue_moved >= self._move_ready_delayed_batch_limit:
+                warning(
+                    "Delayed message queue %r hit batch limit of %d. There may be more messages waiting to be moved.",
+                    queue,
+                    self._move_ready_delayed_batch_limit,
+                )
+
+        return total_moved
+
     def _put(self, queue: str, message: dict[str, Any], **kwargs: Any) -> None:
-        """Deliver message to queue using sorted set."""
-        pri = self._get_message_priority(message, reverse=False)
+        """Deliver message to queue using sorted set.
+
+        Messages with short delay (≤ DEFAULT_DELAYED_CHECK_INTERVAL) go to {queue}
+        with a future timestamp in the score.
+        Messages with longer delay go to {queue}:delayed with eta as score,
+        and are moved to {queue} by a background process when ready.
+
+        Args:
+            queue: Target queue name.
+            message: Message dict with 'properties' containing optional 'eta'
+                     (Unix timestamp float) for delayed delivery.
+        """
+        priority = self._get_message_priority(message, reverse=False)
         props = message["properties"]
         delivery_tag = props["delivery_tag"]
         delivery_info = props["delivery_info"]
         exchange = delivery_info["exchange"]
         routing_key = delivery_info["routing_key"]
 
-        # Check for delay header
-        headers = props.get("headers", {})
-        delay_seconds = headers.get(DELAY_HEADER, 0.0)
-        if delay_seconds is None or delay_seconds < 0:
-            delay_seconds = 0.0
-
         now = time()
-        queue_score = _queue_score(pri, now, delay_seconds)
+
+        # eta is a Unix timestamp (float) in properties, similar to priority
+        eta_timestamp: float | None = props.get("eta")
+        delay_seconds = max(0.0, eta_timestamp - now) if eta_timestamp else 0.0
 
         with self.conn_or_acquire() as client, client.pipeline() as pipe:
-            pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key]))  # type: ignore[call-arg]
-            pipe.zadd(self.messages_index_key, {delivery_tag: now})
-            pipe.zadd(queue, {delivery_tag: queue_score})
+            if delay_seconds > DEFAULT_DELAYED_CHECK_INTERVAL:
+                # Long delay: store in {queue}:delayed with eta timestamp as score
+                # Background process will move it to main queue when ready
+                delayed_queue = queue + DELAYED_QUEUE_SUFFIX
+                # Precompute the final queue score for when message becomes ready
+                # This enables efficient Lua-based move without JSON parsing
+                ready_score = _queue_score(priority, eta_timestamp)
+                # Use eta_timestamp for index so restore_visible won't restore before eta
+                pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key, priority]))  # type: ignore[call-arg]
+                pipe.zadd(self.messages_index_key, {delivery_tag: eta_timestamp})
+                pipe.zadd(delayed_queue, {delivery_tag: eta_timestamp})
+                pipe.hset(self.messages_delayed_score_key, delivery_tag, ready_score)
+            else:
+                # Immediate or short delay: store in queue with priority+timestamp score
+                visible_at = now + delay_seconds
+                queue_score = _queue_score(priority, visible_at)
+                pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key, priority]))  # type: ignore[call-arg]
+                pipe.zadd(self.messages_index_key, {delivery_tag: visible_at})
+                pipe.zadd(queue, {delivery_tag: queue_score})
             pipe.execute()
 
     def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
@@ -1068,10 +1139,6 @@ class Channel(virtual.Channel):
     def _queue_bind(self, exchange: str, routing_key: str, pattern: str, queue: str) -> None:
         if self.typeof(exchange).type == "fanout":
             self._fanout_queues[queue] = (exchange, routing_key.replace("#", "*"))
-            # Ensure consumer group for fanout
-            stream_key = self._fanout_stream_key(exchange, routing_key)
-            group_name = self._fanout_consumer_group(queue)
-            self._ensure_consumer_group(stream_key, group_name)
         with self.conn_or_acquire() as client:
             client.sadd(
                 self.keyprefix_queue % (exchange,),
@@ -1122,7 +1189,7 @@ class Channel(virtual.Channel):
                 pass
         if self._in_fanout_poll:
             try:
-                self._xreadgroup_read()
+                self._xread_read()
             except Empty:
                 pass
         if not self.closed:
@@ -1284,7 +1351,7 @@ class Channel(virtual.Channel):
         return self._create_client(asynchronous=True)
 
     def _update_queue_cycle(self) -> None:
-        self._queue_cycle.update(self.active_queues)
+        self._queue_cycle = list(self.active_queues)
 
     def _get_response_error(self) -> type[Exception]:
         from redis import exceptions
@@ -1310,8 +1377,7 @@ class Transport(virtual.Transport):
 
     Channel = Channel
 
-    polling_interval = None  # Disable sleep between unsuccessful polls
-    brpop_timeout = 1
+    polling_interval = 1  # Timeout for blocking BZMPOP/XREADGROUP calls in seconds
     default_port = DEFAULT_PORT
     driver_type = "redis"
     driver_name = "redis"
@@ -1333,9 +1399,10 @@ class Transport(virtual.Transport):
             raise ImportError("Missing redis library (pip install redis)")
         super().__init__(*args, **kwargs)
 
+        # Import signals module to register signal handlers when transport is used
+        from . import signals as _signals  # noqa: F401
+
         self.cycle = MultiChannelPoller()
-        if self.polling_interval is not None:
-            self.brpop_timeout = self.polling_interval
 
     def driver_version(self) -> str:
         return redis.__version__
@@ -1368,12 +1435,17 @@ class Transport(virtual.Transport):
         visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]
         loop.call_repeatedly(visibility_timeout / 3, cycle.maybe_update_messages_index)
 
+        # Check for ready delayed messages every DEFAULT_DELAYED_CHECK_INTERVAL seconds
+        loop.call_repeatedly(DEFAULT_DELAYED_CHECK_INTERVAL, cycle.maybe_move_ready_delayed_messages)
+
     def on_readable(self, fileno: int) -> Any:
         """Handle AIO event for one of our file descriptors."""
         return self.cycle.on_readable(fileno)
 
     def setup_native_delayed_delivery(self, connection: Connection, queues: list[str]) -> None:
-        """No-op: delayed delivery is handled inline via score-based retrieval."""
+        """Set up native delayed delivery (background processing via event loop callback)."""
+        # Delayed delivery is now handled by cycle.maybe_move_ready_delayed_messages
+        # which is registered in register_with_event_loop
 
     def teardown_native_delayed_delivery(self) -> None:
-        """No-op: no background processing to tear down."""
+        """Tear down native delayed delivery (no-op, event loop handles cleanup)."""

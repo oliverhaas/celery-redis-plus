@@ -32,16 +32,15 @@ Unlike the standard Redis transport which uses separate queues per priority leve
 - **Atomic consumption**: BZMPOP ensures exactly-once delivery
 - **FIFO within priority**: Messages with the same priority are delivered in order
 
-Score formula: `(255 - priority) × 10¹² + timestamp_ms + delay_ms`
+Score formula: `(255 - priority) × 10¹⁰ + timestamp_ms + delay_ms`
 
 ### Reliable Fanout with Redis Streams
 
-The standard Redis transport uses PUB/SUB for fanout exchanges, which means messages are lost if no subscribers are listening. `celery-redis-plus` uses Redis Streams with consumer groups instead:
+The standard Redis transport uses PUB/SUB for fanout exchanges, which means messages are lost if no subscribers are listening. `celery-redis-plus` uses Redis Streams with XREAD instead:
 
-- **Durable messages**: Messages persist until acknowledged
-- **Consumer groups**: Multiple workers can share the load
-- **Message recovery**: Unacknowledged messages can be reclaimed after timeout
-- **Automatic cleanup**: Processed messages are trimmed from streams
+- **Durable messages**: Messages persist in the stream
+- **True broadcast**: Every consumer receives every message (each tracks their own position)
+- **Automatic cleanup**: Old messages are trimmed from streams based on `stream_maxlen`
 
 ## Installation
 
@@ -104,10 +103,9 @@ Regular queues use Redis sorted sets (ZSETs) instead of lists:
 For fanout exchanges (broadcast patterns):
 
 1. **Publishing**: Messages are added to Redis Streams with `XADD`
-2. **Consumer Groups**: Each worker joins a consumer group with `XREADGROUP`
-3. **Acknowledgment**: Processed messages are acknowledged with `XACK`
-4. **Recovery**: Pending messages are reclaimed after visibility timeout using `XCLAIM`
-5. **Cleanup**: Acknowledged messages are periodically trimmed from streams
+2. **Reading**: Each consumer uses `XREAD` to read messages, tracking their own position
+3. **True broadcast**: Every consumer gets every message (no consumer groups)
+4. **Cleanup**: Old messages are trimmed based on `stream_maxlen`
 
 ## Configuration
 
@@ -174,10 +172,6 @@ Celery bootstep that starts background threads for:
 
 Helper function to register the bootstep with a Celery application.
 
-### `celery_redis_plus.DELAY_HEADER`
-
-The header name used for delay information (`x-celery-delay-seconds`).
-
 ## Requirements
 
 - Python >= 3.13
@@ -194,23 +188,21 @@ Tested with:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/celery-redis-plus.git
+git clone https://github.com/oliverhaas/celery-redis-plus.git
 cd celery-redis-plus
 
 # Create virtual environment and install with development dependencies
 uv venv
-uv sync --extra dev
-
-# Or with pip
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+uv sync --group dev
 
 # Run tests (requires Docker for integration tests)
-pytest
+uv run pytest
 
 # Run linter
-ruff check .
+uv run ruff check
+
+# Run type checker
+uv run ty check
 ```
 
 ## License

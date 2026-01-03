@@ -7,42 +7,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 # Create virtual environment and install with development dependencies (using uv)
 uv venv
-uv sync
+uv sync --group dev
 
 # Run all tests
-pytest
+uv run pytest
 
 # Run a single test file
-pytest tests/test_signals.py
+uv run pytest tests/test_transport.py
 
 # Run a specific test
-pytest tests/test_signals.py::TestAddDelayHeader::test_eta_in_future_iso_string
+uv run pytest tests/test_transport.py::TestDelayedDeliveryQueues::test_message_with_long_delay_goes_to_delayed_queue
 
 # Run linter
-ruff check .
+uv run ruff check
 
 # Run linter with auto-fix
-ruff check . --fix
+uv run ruff check --fix
 
 # Run type checker
-ty check celery_redis_plus/ tests/
+uv run ty check
 ```
 
 ## Architecture
 
-celery-redis-plus is a drop-in replacement Redis transport for Celery that implements native delayed message delivery using Redis ZSETs. Instead of workers polling for delayed tasks, messages are stored in a sorted set and moved to queues exactly when due.
+celery-redis-plus is a drop-in replacement Redis transport for Celery that uses:
+- BZMPOP + sorted sets for regular queues (priority support + reliability)
+- Redis Streams with XREAD for fanout exchanges (true broadcast)
+- Native delayed delivery integrated into sorted set scoring
 
 ### Message Flow
 
-1. **Signal Handler** (`signals.py`): The `before_task_publish` signal intercepts tasks with `eta` or `countdown` and adds an `x-celery-delay-seconds` header with the computed delay
-2. **Custom Transport** (`transport.py`): The `Channel._put` method checks for the delay header. If present, the message goes to a Redis ZSET (`{queue_name}:delayed`) with the delivery timestamp as score; otherwise, it publishes normally
-3. **Background Thread**: The `Transport._delayed_delivery_loop` runs in a daemon thread, polling the ZSET every second and atomically moving ready messages to the queue using a Lua script
+1. **Custom Transport** (`transport.py`): The `Channel._put` method parses the `eta` header (ISO datetime) to compute delay. Messages with long delays (> 60s) go to a separate delayed queue; short delays use timing in the sorted set score
+2. **Two-Queue System**: `{queue}` for immediate/short delays, `{queue}:delayed` for long delays. A background thread moves ready messages from delayed to main queue
+3. **Sorted Set Scoring**: Messages are stored in sorted sets with score = `(255 - priority) × 10¹⁰ + timestamp_ms`. Lower score = higher priority = delivered first
 
 ### Key Components
 
-- **`Transport`** (extends `kombu.transport.redis.Transport`): Custom transport with `supports_native_delayed_delivery` flag. Creates background thread for delayed message processing
-- **`Channel`** (extends `kombu.transport.redis.Channel`): Overrides `_put` to route delayed messages to ZSETs
-- **`DelayedDeliveryBootstep`**: Celery consumer bootstep that calls `transport.setup_native_delayed_delivery()` on worker start and `teardown_native_delayed_delivery()` on stop
+- **`Transport`** (extends `kombu.transport.virtual.Transport`): Custom transport with `supports_native_delayed_delivery` flag
+- **`Channel`** (extends `kombu.transport.virtual.Channel`): Uses BZMPOP for consuming from sorted sets, XREAD for fanout streams
+- **`DelayedDeliveryBootstep`**: Celery consumer bootstep (currently no-op since delay is handled inline via scoring)
 - **`configure_app(app)`**: Registers the bootstep with a Celery app via `app.steps["consumer"].add()`
 
 ### Configuration
@@ -54,9 +57,11 @@ celery_redis_plus.transport:Transport://localhost:6379/0
 
 ### Constants
 
-- `DELAY_HEADER`: `"x-celery-delay-seconds"` - header name for delay value
-- `DELAYED_QUEUE_SUFFIX`: `":delayed"` - suffix for ZSET keys
+- `PRIORITY_SCORE_MULTIPLIER`: `10¹⁰` - multiplier for priority in score calculation
+- `DEFAULT_VISIBILITY_TIMEOUT`: `300` - seconds before unacked messages are restored
+- `DEFAULT_DELAYED_CHECK_INTERVAL`: `60` - threshold in seconds for routing to delayed queue
+- `DELAYED_QUEUE_SUFFIX`: `":delayed"` - suffix for delayed message queues
 
 ## Testing
 
-Tests use pytest with fixtures in `conftest.py`. Integration tests use testcontainers for Redis (marked with `@pytest.mark.integration`). Unit tests mock the Redis client. The `celery_app` fixture uses an in-memory broker with `task_always_eager=True`.
+Tests use pytest with fixtures in `conftest.py`. Integration tests use testcontainers for Redis and Valkey (marked with `@pytest.mark.integration`). Unit tests mock the Redis client.
