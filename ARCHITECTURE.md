@@ -36,7 +36,7 @@ When a worker starts:
 3. **Event loop registration** (`transport.py:1401-1430`):
    - `on_poll_init()`: Initial message recovery
    - `on_poll_start()`: Called every tick, registers BZMPOP/XREAD commands
-   - `maybe_requeue_messages()`: Called every **60 seconds** (DEFAULT_REQUEUE_CHECK_INTERVAL)
+   - `maybe_enqueue_due_messages()`: Called every **60 seconds** (DEFAULT_REQUEUE_CHECK_INTERVAL)
    - `maybe_update_messages_index()`: Called every **visibility_timeout/3 seconds** (~100s default)
 
 4. **Bootstep** (`bootstep.py:35-71`):
@@ -280,8 +280,8 @@ Messages have a "visibility timeout" - if not acked within this time, they're co
   ```
 - Keeps messages "alive" while being processed
 
-**Unified Requeue** (`transport.py:1013-1057`):
-- Every 60 seconds (DEFAULT_REQUEUE_CHECK_INTERVAL), `requeue_messages()` runs
+**Enqueue Due Messages** (`transport.py:1013-1057`):
+- Every 60 seconds (DEFAULT_REQUEUE_CHECK_INTERVAL), `enqueue_due_messages()` runs
 - Uses Lua script for atomic batch processing
 - Processes messages with `queue_at <= now + requeue_check_interval`
 
@@ -364,16 +364,16 @@ This ensures:
 - Reads `routing_key` from hash to add message to the correct queue
 - Batch limit of 1000 messages per cycle (DEFAULT_REQUEUE_BATCH_LIMIT)
 
-### 5.3 Restore by Tag (Lua Script)
+### 5.3 Requeue by Tag (Lua Script)
 
-When a specific message needs restoration (e.g., on reject with requeue), a Lua script atomically:
+When a specific message needs to be requeued (e.g., on reject with requeue), a Lua script atomically:
 1. Reads `priority` and `routing_key` (queue) from the per-message hash
 2. Sets `redelivered=1` in the hash
 3. Refreshes the TTL
 4. Adds the message back to the queue with appropriate score (using global key prefix)
 
 ```lua
--- _restore_message_lua
+-- _requeue_message_lua
 local message_key = KEYS[1]
 local leftmost = tonumber(ARGV[1]) == 1
 local priority_multiplier = tonumber(ARGV[2])

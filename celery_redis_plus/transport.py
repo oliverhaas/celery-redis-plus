@@ -36,6 +36,7 @@ import socket as socket_module
 import uuid
 from collections import namedtuple
 from contextlib import contextmanager
+from pathlib import Path
 from queue import Empty
 from time import time
 from typing import TYPE_CHECKING, Any
@@ -77,6 +78,11 @@ crit, warning = logger.critical, logger.warning
 
 DEFAULT_PORT = 6379
 DEFAULT_DB = 0
+
+# Load Lua scripts at module init
+_PACKAGE_DIR = Path(__file__).parent
+_ENQUEUE_DUE_MESSAGES_LUA = (_PACKAGE_DIR / "transport_enqueue_due_messages.lua").read_text()
+_REQUEUE_MESSAGE_LUA = (_PACKAGE_DIR / "transport_requeue_message.lua").read_text()
 
 error_classes_t = namedtuple("error_classes_t", ("connection_errors", "channel_errors"))
 
@@ -304,7 +310,7 @@ class QoS(virtual.QoS):
         else:
             # Regular sorted set message
             if requeue:
-                self.restore_by_tag(delivery_tag, leftmost=True)
+                self.requeue_by_tag(delivery_tag, leftmost=True)
             else:
                 self._remove_from_indices(delivery_tag).execute()
             super().ack(delivery_tag)
@@ -325,8 +331,8 @@ class QoS(virtual.QoS):
     def maybe_update_messages_index(self) -> None:
         """Update scores of delivered messages to now + visibility_timeout.
 
-        Acts as a heartbeat to keep messages from being requeued by
-        requeue_messages() while they are still being processed.
+        Acts as a heartbeat to keep messages from being enqueued by
+        enqueue_due_messages() while they are still being processed.
 
         Uses ZADD XX to only update existing entries, avoiding race conditions
         where a message is acked (removed from index) between checking
@@ -343,22 +349,22 @@ class QoS(virtual.QoS):
                     pipe.zadd(self.messages_index_key, {tag: queue_at}, xx=True)
             pipe.execute()
 
-    def requeue_messages(self) -> int:
-        """Requeue messages whose queue_at time has passed.
+    def enqueue_due_messages(self) -> int:
+        """Enqueue messages whose queue_at time has passed.
 
         This unified method handles both:
-        - Delayed messages that are now ready to be processed
-        - Messages that were consumed but not acked (lost/timed out)
+        - Delayed messages that are now ready to be processed (first delivery)
+        - Messages that were consumed but not acked (redelivery)
 
         Uses a Lua script for atomic, efficient batch processing.
 
         Returns:
-            Number of messages requeued.
+            Number of messages enqueued.
         """
-        return self.channel.requeue_messages()
+        return self.channel.enqueue_due_messages()
 
-    def restore_by_tag(self, tag: str, client: Any = None, leftmost: bool = False) -> None:
-        """Restore a message by its delivery tag using Lua script.
+    def requeue_by_tag(self, tag: str, client: Any = None, leftmost: bool = False) -> None:
+        """Requeue a rejected message by its delivery tag using Lua script.
 
         The Lua script atomically reads the routing_key (queue) from the message
         hash and adds the message back to that queue.
@@ -366,9 +372,9 @@ class QoS(virtual.QoS):
         Args:
             tag: The message's delivery tag.
             client: Optional Redis client (unused, kept for API compatibility).
-            leftmost: If True, restore to front of queue (score=0).
+            leftmost: If True, requeue to front of queue (score=0).
         """
-        self.channel._restore_by_tag(tag, leftmost)
+        self.channel._requeue_by_tag(tag, leftmost)
 
     @cached_property
     def messages_index_key(self) -> str:
@@ -463,22 +469,24 @@ class MultiChannelPoller:
 
     def on_poll_init(self, poller: Any) -> None:
         self.poller = poller
-        # Initial requeue check on startup
-        self.maybe_requeue_messages()
+        # Initial enqueue check on startup
+        self.maybe_enqueue_due_messages()
 
-    def maybe_requeue_messages(self) -> int:
-        """Requeue messages whose queue_at time has passed.
+    def maybe_enqueue_due_messages(self) -> int:
+        """Enqueue messages whose queue_at time has passed.
 
-        This unified method handles both delayed messages and timed-out messages.
+        This unified method handles both:
+        - Delayed messages ready for first delivery
+        - Timed-out messages that need redelivery
 
         Returns:
-            Total number of messages requeued across all channels.
+            Total number of messages enqueued across all channels.
         """
-        total_requeued = 0
+        total_enqueued = 0
         for channel in self._channels:
             if channel.active_queues:
-                total_requeued += channel.qos.requeue_messages()
-        return total_requeued
+                total_enqueued += channel.qos.enqueue_due_messages()
+        return total_enqueued
 
     def maybe_update_messages_index(self) -> None:
         """Update message index scores to keep delivered messages alive."""
@@ -689,7 +697,7 @@ class Channel(virtual.Channel):
 
         This method is called by Kombu's virtual.Channel for message recovery.
         """
-        self._restore_by_tag(message.delivery_tag, leftmost)
+        self._requeue_by_tag(message.delivery_tag, leftmost)
 
     def _restore_at_beginning(self, message: Any) -> None:
         return self._restore(message, leftmost=True)
@@ -892,149 +900,30 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             return client.zcard(queue)
 
-    # Lua script for requeuing messages whose queue_at time has passed.
-    # This handles both delayed messages and messages that timed out (not acked).
-    # Uses per-message hashes: message:{tag} with fields: payload, routing_key, priority, native_delayed, eta
-    # For native_delayed messages: set native_delayed=0 (first delivery, not a redelivery)
-    # For timed-out messages: set redelivered=1 (message was consumed but not acked)
-    # Reads routing_key from hash to add message to the correct queue.
-    # KEYS: [1] = messages_index
-    # ARGV: [1] = threshold, [2] = batch_limit, [3] = visibility_timeout,
-    #       [4] = priority_multiplier, [5] = message_key_prefix, [6] = global_keyprefix
-    # Returns: total number of messages requeued
-    _requeue_messages_lua = """
-    local messages_index = KEYS[1]
-    local threshold = tonumber(ARGV[1])
-    local batch_limit = tonumber(ARGV[2])
-    local visibility_timeout = tonumber(ARGV[3])
-    local priority_multiplier = tonumber(ARGV[4])
-    local message_key_prefix = ARGV[5]
-    local global_keyprefix = ARGV[6]
-    local total_requeued = 0
-
-    -- Get current time in seconds and milliseconds
-    local time_result = redis.call('TIME')
-    local now_sec = tonumber(time_result[1])
-    local now_ms = now_sec * 1000 + math.floor(tonumber(time_result[2]) / 1000)
-
-    -- Get messages ready for requeue (score <= threshold)
-    local ready = redis.call('ZRANGEBYSCORE', messages_index, '-inf', threshold, 'LIMIT', 0, batch_limit)
-
-    for _, tag in ipairs(ready) do
-        -- Build prefixed message key
-        local message_key = global_keyprefix .. message_key_prefix .. tag
-
-        -- Get fields from per-message hash
-        local priority = redis.call('HGET', message_key, 'priority')
-        if priority then
-            priority = tonumber(priority)
-            local routing_key = redis.call('HGET', message_key, 'routing_key')
-            local eta = redis.call('HGET', message_key, 'eta')
-            eta = eta and tonumber(eta) or 0
-
-            -- Calculate queue score using eta if it's in the future, else use now
-            local score_time_ms
-            if eta > 0 and eta * 1000 > now_ms then
-                score_time_ms = eta * 1000
-            else
-                score_time_ms = now_ms
-            end
-            local queue_score = (255 - priority) * priority_multiplier + score_time_ms
-
-            -- Check if this is a native delayed message (first delivery) or a timed-out message (redelivery)
-            local native_delayed = redis.call('HGET', message_key, 'native_delayed')
-            if native_delayed and tonumber(native_delayed) == 1 then
-                -- Native delayed message: clear the flag (this is the first delivery)
-                redis.call('HSET', message_key, 'native_delayed', '0')
-            else
-                -- Timed-out message: mark as redelivered
-                redis.call('HSET', message_key, 'redelivered', '1')
-            end
-
-            -- Add to the message's queue (with global prefix)
-            local queue_key = global_keyprefix .. routing_key
-            redis.call('ZADD', queue_key, 'NX', queue_score, tag)
-
-            -- Update queue_at for next cycle (now + visibility_timeout)
-            local new_queue_at = now_sec + visibility_timeout
-            redis.call('ZADD', messages_index, new_queue_at, tag)
-            total_requeued = total_requeued + 1
-        else
-            -- No message hash = message was already acked/deleted, clean up index
-            redis.call('ZREM', messages_index, tag)
-        end
-    end
-
-    return total_requeued
-    """
-
-    # Lua script for restoring a single message to its queue.
-    # Sets redelivered=1 and adds to queue with appropriate score.
-    # Uses routing_key from the hash as the queue name.
-    # KEYS: [1] = message_key
-    # ARGV: [1] = leftmost (1 or 0), [2] = priority_multiplier, [3] = message_ttl, [4] = global_keyprefix
-    # Returns: 1 if restored, 0 if message not found
-    _restore_message_lua = """
-    local message_key = KEYS[1]
-    local leftmost = tonumber(ARGV[1]) == 1
-    local priority_multiplier = tonumber(ARGV[2])
-    local message_ttl = tonumber(ARGV[3])
-    local global_keyprefix = ARGV[4]
-
-    -- Get priority and routing_key (queue) from hash
-    local priority = redis.call('HGET', message_key, 'priority')
-    local routing_key = redis.call('HGET', message_key, 'routing_key')
-    if not priority or not routing_key then
-        return 0
-    end
-
-    -- Mark as redelivered
-    redis.call('HSET', message_key, 'redelivered', '1')
-    redis.call('EXPIRE', message_key, message_ttl)
-
-    -- Calculate score
-    local score
-    if leftmost then
-        score = 0
-    else
-        priority = tonumber(priority)
-        local now_ms = redis.call('TIME')
-        now_ms = tonumber(now_ms[1]) * 1000 + math.floor(tonumber(now_ms[2]) / 1000)
-        score = (255 - priority) * priority_multiplier + now_ms
-    end
-
-    -- Add to queue (routing_key with global prefix)
-    local queue_key = global_keyprefix .. routing_key
-    local tag = string.match(message_key, ':(.+)$')
-    redis.call('ZADD', queue_key, score, tag)
-
-    return 1
-    """
-
-    def requeue_messages(self) -> int:
-        """Requeue messages whose queue_at time has passed.
+    def enqueue_due_messages(self) -> int:
+        """Enqueue messages whose queue_at time has passed.
 
         This unified method handles both:
-        - Delayed messages that are now ready to be processed
-        - Messages that were consumed but not acked (lost/timed out)
+        - Delayed messages that are now ready to be processed (first delivery)
+        - Messages that were consumed but not acked (redelivery)
 
         Uses ZADD NX to avoid re-adding messages that are already in the queue.
         The Lua script reads routing_key from each message's hash to add it to the
         correct queue, and calculates new_queue_at = now + visibility_timeout.
 
         Returns:
-            Number of messages requeued.
+            Number of messages enqueued.
         """
         now = time()
-        # Check messages that will need requeuing by next interval
+        # Check messages that will need enqueuing by next interval
         threshold = now + DEFAULT_REQUEUE_CHECK_INTERVAL
 
         with self.conn_or_acquire() as client:
-            requeue_script = client.register_script(self._requeue_messages_lua)
+            enqueue_script = client.register_script(_ENQUEUE_DUE_MESSAGES_LUA)
 
             # Only pass messages_index as a key; routing_key is read from each message's hash
             keys = [self.messages_index_key]
-            total_requeued = requeue_script(
+            total_enqueued = enqueue_script(
                 keys=keys,
                 args=[
                     threshold,
@@ -1046,32 +935,32 @@ class Channel(virtual.Channel):
                 ],
             )
 
-        if total_requeued >= DEFAULT_REQUEUE_BATCH_LIMIT:
+        if total_enqueued >= DEFAULT_REQUEUE_BATCH_LIMIT:
             warning(
-                "Requeue hit batch limit of %d. There may be more messages waiting.",
+                "Enqueue hit batch limit of %d. There may be more messages waiting.",
                 DEFAULT_REQUEUE_BATCH_LIMIT,
             )
 
-        return total_requeued or 0
+        return total_enqueued or 0
 
-    def _restore_by_tag(self, delivery_tag: str, leftmost: bool = False) -> bool:
-        """Restore a message to its queue using Lua script.
+    def _requeue_by_tag(self, delivery_tag: str, leftmost: bool = False) -> bool:
+        """Requeue a rejected message to its queue using Lua script.
 
         The Lua script atomically reads the routing_key (queue) from the message
         hash and adds the message back to that queue. Sets the redelivered flag.
 
         Args:
             delivery_tag: The message's delivery tag.
-            leftmost: If True, restore to front of queue (score=0).
+            leftmost: If True, requeue to front of queue (score=0).
 
         Returns:
-            True if message was restored, False if not found.
+            True if message was requeued, False if not found.
         """
         message_key = self._message_key(delivery_tag)
 
         with self.conn_or_acquire() as client:
-            restore_script = client.register_script(self._restore_message_lua)
-            result = restore_script(
+            requeue_script = client.register_script(_REQUEUE_MESSAGE_LUA)
+            result = requeue_script(
                 keys=[message_key],
                 args=[1 if leftmost else 0, PRIORITY_SCORE_MULTIPLIER, self.message_ttl, self.global_keyprefix],
             )
@@ -1446,7 +1335,7 @@ class Transport(virtual.Transport):
         loop.on_tick.add(on_poll_start)
 
         # Unified requeue check handles both delayed messages and timed-out messages
-        loop.call_repeatedly(DEFAULT_REQUEUE_CHECK_INTERVAL, cycle.maybe_requeue_messages)
+        loop.call_repeatedly(DEFAULT_REQUEUE_CHECK_INTERVAL, cycle.maybe_enqueue_due_messages)
 
         # Heartbeat to keep in-flight messages alive
         visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]

@@ -993,11 +993,11 @@ class TestQoS:
         qos._dirty = set()
         qos._quick_ack = MagicMock()
 
-        qos.restore_by_tag = MagicMock()
+        qos.requeue_by_tag = MagicMock()
 
         qos.reject("tag1", requeue=True)
 
-        qos.restore_by_tag.assert_called_once_with("tag1", leftmost=True)
+        qos.requeue_by_tag.assert_called_once_with("tag1", leftmost=True)
 
     def test_reject_regular_message_without_requeue(self) -> None:
         """Test reject without requeue for regular message."""
@@ -1324,14 +1324,14 @@ class TestMultiChannelPoller:
 
         assert result is None
 
-    def test_maybe_requeue_messages_returns_zero_when_no_active_queues(self) -> None:
-        """Test maybe_requeue_messages returns 0 when channels have no active queues."""
+    def test_maybe_enqueue_due_messages_returns_zero_when_no_active_queues(self) -> None:
+        """Test maybe_enqueue_due_messages returns 0 when channels have no active queues."""
         poller = MultiChannelPoller()
         channel = MagicMock()
         channel.active_queues = []
         poller._channels = {channel}  # type: ignore[assignment]
 
-        result = poller.maybe_requeue_messages()
+        result = poller.maybe_enqueue_due_messages()
 
         assert result == 0
 
@@ -2433,8 +2433,8 @@ class TestMessageRequeue:
             if "celery" not in channel._active_queues:
                 channel._active_queues.append("celery")
 
-            # Call requeue_messages - should restore the message
-            requeued = channel.requeue_messages()
+            # Call enqueue_due_messages - should restore the message
+            requeued = channel.enqueue_due_messages()
 
             assert requeued >= 1
 
@@ -2482,8 +2482,8 @@ class TestMessageRequeue:
             if "celery" not in channel._active_queues:
                 channel._active_queues.append("celery")
 
-            # Call requeue_messages - should skip (message still in queue via ZADD NX)
-            channel.requeue_messages()
+            # Call enqueue_due_messages - should skip (message still in queue via ZADD NX)
+            channel.enqueue_due_messages()
 
             # Score should be unchanged (ZADD NX doesn't update existing entries)
             assert client.zscore("celery", delivery_tag) == original_score
@@ -2514,17 +2514,17 @@ class TestMessageRequeue:
             if "celery" not in channel._active_queues:
                 channel._active_queues.append("celery")
 
-            # Call requeue_messages - should remove from index
-            channel.requeue_messages()
+            # Call enqueue_due_messages - should remove from index
+            channel.enqueue_due_messages()
 
             # Should be removed from index (cleaned up by Lua script)
             assert client.zscore("messages_index", delivery_tag) is None
 
-    def test_restore_by_tag(
+    def test_requeue_by_tag(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test restore_by_tag restores a specific message."""
+        """Test requeue_by_tag restores a specific message."""
 
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
@@ -2534,7 +2534,7 @@ class TestMessageRequeue:
             client.delete("celery", "messages_index")
 
             # Set up a message in the per-message hash
-            delivery_tag = "restore-tag-test"
+            delivery_tag = "requeue-tag-test"
             payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
             message_key = f"message:{delivery_tag}"
 
@@ -2550,17 +2550,17 @@ class TestMessageRequeue:
             # Message is not in queue
             assert client.zscore("celery", delivery_tag) is None
 
-            # Restore the message
-            channel.qos.restore_by_tag(delivery_tag)
+            # Requeue the message
+            channel.qos.requeue_by_tag(delivery_tag)
 
             # Message should now be in the queue
             assert client.zscore("celery", delivery_tag) is not None
 
-    def test_restore_by_tag_sets_redelivered_flag(
+    def test_requeue_by_tag_sets_redelivered_flag(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that _restore_by_tag sets the redelivered flag in hash."""
+        """Test that _requeue_by_tag sets the redelivered flag in hash."""
 
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
@@ -2591,8 +2591,8 @@ class TestMessageRequeue:
                 },
             )
 
-            # Restore the message using the Lua script
-            result = channel._restore_by_tag(delivery_tag, leftmost=False)
+            # Requeue the message using the Lua script
+            result = channel._requeue_by_tag(delivery_tag, leftmost=False)
             assert result is True
 
             # Check the redelivered flag was set in the hash
@@ -2602,11 +2602,11 @@ class TestMessageRequeue:
             # Message should be in queue
             assert client.zscore("celery", delivery_tag) is not None
 
-    def test_restore_by_tag_leftmost_uses_zero_score(
+    def test_requeue_by_tag_leftmost_uses_zero_score(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that _restore_by_tag with leftmost=True uses score 0."""
+        """Test that _requeue_by_tag with leftmost=True uses score 0."""
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
             client = channel.client
@@ -2636,8 +2636,8 @@ class TestMessageRequeue:
                 },
             )
 
-            # Restore with leftmost=True
-            result = channel._restore_by_tag(delivery_tag, leftmost=True)
+            # Requeue with leftmost=True
+            result = channel._requeue_by_tag(delivery_tag, leftmost=True)
             assert result is True
 
             # Score should be 0 (highest priority, processed first)
