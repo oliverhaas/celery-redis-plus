@@ -14,7 +14,6 @@ from kombu import Exchange, Queue
 from kombu.exceptions import OperationalError
 from kombu.utils.eventio import ERR
 from kombu.utils.json import dumps as json_dumps
-from kombu.utils.json import loads as json_loads
 
 from celery_redis_plus.constants import (
     DEFAULT_MESSAGE_TTL,
@@ -27,8 +26,6 @@ from celery_redis_plus.transport import (
     Channel,
     GlobalKeyPrefixMixin,
     MultiChannelPoller,
-    Mutex,
-    MutexHeld,
     PrefixedRedisPipeline,
     PrefixedStrictRedis,
     QoS,
@@ -115,51 +112,6 @@ class TestRedisHelpers:
 
         error_class = get_redis_ConnectionError()
         assert error_class is exceptions.ConnectionError
-
-
-@pytest.mark.unit
-class TestMutex:
-    """Tests for the Mutex context manager."""
-
-    def test_mutex_acquired_successfully(self) -> None:
-        """Test mutex acquisition when lock is available."""
-        mock_client = MagicMock()
-        mock_lock = MagicMock()
-        mock_lock.acquire.return_value = True
-        mock_client.lock.return_value = mock_lock
-
-        with Mutex(mock_client, "test_lock", expire=60):
-            pass
-
-        mock_client.lock.assert_called_once_with("test_lock", timeout=60)
-        mock_lock.acquire.assert_called_once_with(blocking=False)
-        mock_lock.release.assert_called_once()
-
-    def test_mutex_raises_when_held(self) -> None:
-        """Test mutex raises MutexHeld when lock is not available."""
-        mock_client = MagicMock()
-        mock_lock = MagicMock()
-        mock_lock.acquire.return_value = False
-        mock_client.lock.return_value = mock_lock
-
-        with pytest.raises(MutexHeld), Mutex(mock_client, "test_lock", expire=60):
-            pass
-
-        mock_lock.release.assert_not_called()
-
-    def test_mutex_handles_lock_expired(self) -> None:
-        """Test mutex handles LockNotOwnedError on release."""
-        import redis.exceptions
-
-        mock_client = MagicMock()
-        mock_lock = MagicMock()
-        mock_lock.acquire.return_value = True
-        mock_lock.release.side_effect = redis.exceptions.LockNotOwnedError("Lock expired")
-        mock_client.lock.return_value = mock_lock
-
-        # Should not raise
-        with Mutex(mock_client, "test_lock", expire=60):
-            pass
 
 
 @pytest.mark.unit
@@ -494,8 +446,12 @@ class TestChannel:
         assert mock_pipe.zadd.call_count == 2
         mock_pipe.execute.assert_called_once()
 
-    def test_put_with_long_delay_goes_to_main_queue(self) -> None:
-        """Test that messages with long delay go to main queue with future timestamp score."""
+    def test_put_with_long_delay_goes_to_messages_index(self) -> None:
+        """Test that native delayed messages (delay > 60s) go to messages_index, not queue.
+
+        Native delayed delivery stores the message only in messages_index with
+        queue_at = eta. The requeue mechanism will add it to the queue when eta arrives.
+        """
 
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
@@ -516,7 +472,7 @@ class TestChannel:
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
         channel._get_message_priority = MagicMock(return_value=0)
 
-        # Use a long delay (e.g., 1 hour)
+        # Use a long delay (e.g., 1 hour) - triggers native delayed delivery
         delay_seconds = 3600.0
         before = time.time()
         eta_timestamp = before + delay_seconds
@@ -532,24 +488,22 @@ class TestChannel:
         channel._put("my_queue", message)
         after = time.time()
 
-        # Get the score that was passed to zadd for the queue
+        # Native delayed messages only get ONE zadd call (to messages_index, not queue)
         zadd_calls = mock_pipe.zadd.call_args_list
-        # Second zadd call is for the queue
-        queue_zadd_call = zadd_calls[1]
-        queue_name, score_dict = queue_zadd_call[0]
-        score = list(score_dict.values())[0]
+        assert len(zadd_calls) == 1
 
-        # Queue name should be the main queue (no separate delayed queue)
-        assert queue_name == "my_queue"
+        # The single zadd should be for messages_index with queue_at = eta
+        index_zadd_call = zadd_calls[0]
+        index_name, score_dict = index_zadd_call[0]
+        assert index_name == "messages_index"
+        queue_at = list(score_dict.values())[0]
+        assert before + delay_seconds <= queue_at <= after + delay_seconds
 
-        # Score should be in priority+timestamp format with eta as timestamp
-        expected_min = _queue_score(0, before + delay_seconds)
-        expected_max = _queue_score(0, after + delay_seconds)
-        assert expected_min <= score <= expected_max
-
-        # Verify priority is stored in per-message hash
+        # Verify per-message hash is stored with native_delayed=1
         hset_call = mock_pipe.hset.call_args
-        assert "priority" in hset_call.kwargs.get("mapping", {})
+        mapping = hset_call.kwargs.get("mapping", {})
+        assert "priority" in mapping
+        assert mapping.get("native_delayed") == 1
 
     def test_put_with_short_delay_goes_to_main_queue(self) -> None:
         """Test that messages with short delay go to main queue with future timestamp score."""
@@ -573,7 +527,8 @@ class TestChannel:
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
         channel._get_message_priority = MagicMock(return_value=0)
 
-        # Use short delay (30 seconds)
+        # Use short delay (30 seconds) - less than DEFAULT_REQUEUE_CHECK_INTERVAL (60s)
+        # Short delays are treated as immediate, Celery's built-in eta logic handles them
         delay_seconds = 30.0
         before = time.time()
         eta_timestamp = before + delay_seconds
@@ -599,9 +554,10 @@ class TestChannel:
         # Queue name should be the main queue
         assert queue_name == "my_queue"
 
-        # Score should be in priority+timestamp format with delay added to timestamp
-        expected_min = _queue_score(0, before + delay_seconds)
-        expected_max = _queue_score(0, after + delay_seconds)
+        # Short delays are treated as immediate (score based on now, not eta)
+        # Celery's built-in eta logic will handle the actual delay
+        expected_min = _queue_score(0, before)
+        expected_max = _queue_score(0, after)
         assert expected_min <= score <= expected_max
 
     def test_put_with_no_eta(self) -> None:
@@ -789,7 +745,7 @@ class TestChannel:
         mock_client = MagicMock()
         # zpopmin returns [(delivery_tag, score)]
         mock_client.zpopmin.return_value = [(b"tag123", 100.0)]
-        # Per-message hash: hget(message_key, "payload") returns just the payload JSON
+        # Per-message hash: hget returns just the payload
         mock_client.hget.return_value = b'{"body": "test"}'
 
         mock_context = MagicMock()
@@ -799,7 +755,7 @@ class TestChannel:
 
         result = channel._get("myqueue")
         assert result == {"body": "test"}
-        # Verify hget was called with the message key and "payload" field
+        # Verify hget was called with the message key and payload field
         mock_client.hget.assert_called_once_with("message:tag123", "payload")
 
     def test_get_synchronous_empty(self) -> None:
@@ -1971,11 +1927,10 @@ class TestMessagePublishing:
         assert "body" in message or "args" in str(message)
 
         # Check other fields in the per-message hash
-        exchange = redis_client.hget(message_key, "exchange")
         routing_key = redis_client.hget(message_key, "routing_key")
         priority = redis_client.hget(message_key, "priority")
-        assert exchange is not None
         assert routing_key is not None
+        assert routing_key.decode() == "celery"  # routing_key stores the queue name
         assert priority is not None
         assert int(priority) >= 0
 
@@ -2223,19 +2178,24 @@ class TestDelayedMessageStorage:
     worker task publish. All messages (with or without eta) go to the main queue.
     """
 
-    def test_message_with_eta_goes_to_main_queue(
+    def test_message_with_eta_goes_to_messages_index(
         self,
         celery_app: Celery,
         redis_client: Any,
     ) -> None:
-        """Test that messages with eta go to main queue with eta-based score."""
+        """Test that native delayed messages go to messages_index, not queue immediately.
+
+        Native delayed messages (delay > 60s) are stored in messages_index with
+        queue_at = eta. The requeue mechanism will add them to the queue when
+        the eta time arrives. This prevents them from being consumed early.
+        """
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
             # Clear existing messages
             redis_client.delete("celery", "messages_index")
 
-            delay_seconds = 120  # 2 minutes in the future
+            delay_seconds = 120  # 2 minutes in the future (> 60s threshold)
             before_time = time.time()
             eta_timestamp = before_time + delay_seconds
             delivery_tag = f"test-delay-{time.time()}"
@@ -2253,20 +2213,27 @@ class TestDelayedMessageStorage:
             # Publish directly via _put
             channel._put("celery", message)
 
-            # Message SHOULD be in the main queue
+            # Message should NOT be in the main queue yet (native delayed delivery)
             main_messages = redis_client.zrange("celery", 0, -1, withscores=True)
-            assert len(main_messages) == 1
-            _tag, actual_score = main_messages[0]
+            assert len(main_messages) == 0
 
-            # Score should be based on eta timestamp (priority 0 + eta)
-            expected_score = _queue_score(0, eta_timestamp)
-            assert actual_score == pytest.approx(expected_score, rel=1e-6)
+            # Message should be in messages_index with queue_at = eta
+            index_entries = redis_client.zrange("messages_index", 0, -1, withscores=True)
+            assert len(index_entries) == 1
+            tag, queue_at = index_entries[0]
+            assert tag.decode() if isinstance(tag, bytes) else tag == delivery_tag
+            assert queue_at == pytest.approx(eta_timestamp, rel=1e-6)
 
-            # Priority should be stored in per-message hash
+            # Message data should be stored in per-message hash
             message_key = f"message:{delivery_tag}"
             priority = redis_client.hget(message_key, "priority")
             assert priority is not None
             assert int(priority) == 0  # Default priority
+
+            # native_delayed field should be set to 1
+            native_delayed = redis_client.hget(message_key, "native_delayed")
+            assert native_delayed is not None
+            assert int(native_delayed) == 1
 
     def test_message_without_eta_has_current_score(
         self,
@@ -2308,12 +2275,16 @@ class TestDelayedMessageStorage:
             # The actual score should be within the expected range
             assert min_score <= actual_score <= max_score
 
-    def test_delayed_and_immediate_messages_ordered_by_score(
+    def test_short_delayed_and_immediate_messages_ordered_by_score(
         self,
         celery_app: Celery,
         redis_client: Any,
     ) -> None:
-        """Test that delayed and immediate messages are ordered correctly in queue."""
+        """Test that short-delayed and immediate messages are ordered correctly in queue.
+
+        Short delays (<= 60s) are treated as immediate delivery, so both messages
+        should be in the queue immediately.
+        """
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
@@ -2321,7 +2292,8 @@ class TestDelayedMessageStorage:
             redis_client.delete("celery", "messages_index")
 
             now = time.time()
-            eta_timestamp = now + 60  # 60 seconds in future
+            # Use delay <= 60s so it's treated as immediate (Celery handles the delay)
+            eta_timestamp = now + 30  # 30 seconds in future (<= DEFAULT_REQUEUE_CHECK_INTERVAL)
 
             # Create an immediate message (no eta)
             immediate_msg = {
@@ -2333,24 +2305,29 @@ class TestDelayedMessageStorage:
             }
             channel._put("celery", immediate_msg)
 
-            # Create a delayed message with eta
-            delayed_msg = {
+            # Create a short-delayed message (delay <= 60s, treated as immediate)
+            short_delayed_msg = {
                 "body": '{"task": "test.add", "args": [3, 4]}',
                 "properties": {
-                    "delivery_tag": f"delayed-{time.time()}",
+                    "delivery_tag": f"short-delayed-{time.time()}",
                     "delivery_info": {"exchange": "celery", "routing_key": "celery"},
                     "eta": eta_timestamp,
                 },
             }
-            channel._put("celery", delayed_msg)
+            channel._put("celery", short_delayed_msg)
 
-            # Both messages should be in main queue
+            # Both messages should be in main queue (short delay is treated as immediate)
             main_messages = redis_client.zrange("celery", 0, -1, withscores=True)
             assert len(main_messages) == 2
 
-            # Immediate message should have lower score (processed first)
-            first_tag = main_messages[0][0].decode() if isinstance(main_messages[0][0], bytes) else main_messages[0][0]
-            assert "immediate" in first_tag
+            # Both messages should have scores based on "now" (not the eta)
+            # since short delays are treated as immediate delivery
+            for tag_bytes, score in main_messages:
+                tag = tag_bytes.decode() if isinstance(tag_bytes, bytes) else tag_bytes
+                # Score should be based on current time, not eta
+                expected_min = _queue_score(0, now - 1)  # Allow some slack
+                expected_max = _queue_score(0, now + 2)
+                assert expected_min <= score <= expected_max, f"Score {score} for {tag} not in expected range"
 
     def test_high_priority_message_ordered_before_low_priority(
         self,
@@ -2552,7 +2529,6 @@ class TestMessageRequeue:
                 message_key,
                 mapping={
                     "payload": json_dumps(payload),  # type: ignore[call-arg]
-                    "exchange": "",
                     "routing_key": "celery",
                     "priority": "0",
                 },
@@ -2567,11 +2543,11 @@ class TestMessageRequeue:
             # Message should now be in the queue
             assert client.zscore("celery", delivery_tag) is not None
 
-    def test_do_restore_message_sets_redelivered_flag(
+    def test_restore_by_tag_sets_redelivered_flag(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that _do_restore_message sets the redelivered flag."""
+        """Test that _restore_by_tag sets the redelivered flag in hash."""
 
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
@@ -2590,24 +2566,34 @@ class TestMessageRequeue:
                 },
             }
 
-            # Restore the message using a pipeline
-            with client.pipeline() as pipe:
-                channel._do_restore_message(payload, "", "celery", pipe, leftmost=False, delivery_tag=delivery_tag)
-                pipe.execute()
-
-            # Check the message was stored with redelivered flag
+            # Store the message in per-message hash (simulating initial publish)
             message_key = f"message:{delivery_tag}"
-            stored_payload_json = client.hget(message_key, "payload")
-            assert stored_payload_json is not None
-            stored_payload = json_loads(stored_payload_json)  # type: ignore[call-arg]
-            assert stored_payload["headers"]["redelivered"] is True
-            assert stored_payload["properties"]["delivery_info"]["redelivered"] is True
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),  # type: ignore[call-arg]
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "redelivered": "0",
+                },
+            )
 
-    def test_do_restore_message_leftmost_uses_zero_score(
+            # Restore the message using the Lua script
+            result = channel._restore_by_tag(delivery_tag, leftmost=False)
+            assert result is True
+
+            # Check the redelivered flag was set in the hash
+            redelivered = client.hget(message_key, "redelivered")
+            assert redelivered == b"1"
+
+            # Message should be in queue
+            assert client.zscore("celery", delivery_tag) is not None
+
+    def test_restore_by_tag_leftmost_uses_zero_score(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that _do_restore_message with leftmost=True uses score 0."""
+        """Test that _restore_by_tag with leftmost=True uses score 0."""
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
             client = channel.client
@@ -2625,10 +2611,21 @@ class TestMessageRequeue:
                 },
             }
 
+            # Store the message in per-message hash
+            message_key = f"message:{delivery_tag}"
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),  # type: ignore[call-arg]
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "redelivered": "0",
+                },
+            )
+
             # Restore with leftmost=True
-            with client.pipeline() as pipe:
-                channel._do_restore_message(payload, "", "celery", pipe, leftmost=True, delivery_tag=delivery_tag)
-                pipe.execute()
+            result = channel._restore_by_tag(delivery_tag, leftmost=True)
+            assert result is True
 
             # Score should be 0 (highest priority, processed first)
             score = client.zscore("celery", delivery_tag)
@@ -2663,7 +2660,6 @@ class TestMessageRequeue:
                 message_key,
                 mapping={
                     "payload": json_dumps(payload),  # type: ignore[call-arg]
-                    "exchange": "",
                     "routing_key": "celery",
                     "priority": "0",
                 },
@@ -2708,7 +2704,6 @@ class TestMessageRequeue:
                 message_key,
                 mapping={
                     "payload": json_dumps(payload),  # type: ignore[call-arg]
-                    "exchange": "",
                     "routing_key": "celery",
                     "priority": "0",
                 },

@@ -15,7 +15,7 @@ app.config_from_object({
 celery_redis_plus.configure_app(app)  # Registers DelayedDeliveryBootstep
 ```
 
-When the transport module is imported (`transport.py:1397-1403`):
+When the transport module is imported (`transport.py:1388-1396`):
 - The `Transport.__init__` imports the `signals` module
 - This triggers `@before_task_publish.connect` decorator in `signals.py:17`, registering `_convert_eta_to_properties`
 
@@ -23,17 +23,17 @@ When the transport module is imported (`transport.py:1397-1403`):
 
 When a worker starts:
 
-1. **Transport initialization** (`transport.py:1397-1405`):
+1. **Transport initialization** (`transport.py:1388-1396`):
    - Creates `MultiChannelPoller` to manage async I/O
    - Imports signals module (registers eta conversion handler)
 
-2. **Channel creation** (`transport.py:683-716`):
+2. **Channel creation** (`transport.py:647-681`):
    - Creates Redis connection pools (sync and async)
    - Initializes message handlers: `{"BZMPOP": _bzmpop_read, "XREAD": _xread_read}`
    - Pings Redis to verify connection
    - Registers channel with `MultiChannelPoller`
 
-3. **Event loop registration** (`transport.py:1410-1439`):
+3. **Event loop registration** (`transport.py:1401-1430`):
    - `on_poll_init()`: Initial message recovery
    - `on_poll_start()`: Called every tick, registers BZMPOP/XREAD commands
    - `maybe_requeue_messages()`: Called every **60 seconds** (DEFAULT_REQUEUE_CHECK_INTERVAL)
@@ -58,15 +58,15 @@ my_task.apply_async()  # or my_task.delay()
 1. **Signal handler** (`signals.py:17-64`):
    - No eta in headers → does nothing
 
-2. **Channel._put()** (`transport.py:1071-1117`):
+2. **Channel._put()** (`transport.py:1059-1108`):
    - `eta_timestamp = None` → uses `visible_at = now`
    - All messages go directly to the main queue:
      ```python
      queue_score = _queue_score(priority, visible_at)
-     try_requeue_at = now + visibility_timeout  # When to requeue if not acked
+     queue_at = now + visibility_timeout  # When to (re)queue if not acked
      ```
 
-3. **Score calculation** (`transport.py:81-99`):
+3. **Score calculation** (`transport.py:83-101`):
    ```python
    score = (255 - priority) * 10^10 + timestamp_ms
    ```
@@ -75,15 +75,19 @@ my_task.apply_async()  # or my_task.delay()
 
 4. **Redis operations** (pipeline, atomic):
    ```
-   HSET message:{delivery_tag} payload {json} exchange {exchange} routing_key {routing_key} priority {priority}
+   HSET message:{delivery_tag} payload {json} routing_key {queue} priority {priority} redelivered 0 delayed 0
    EXPIRE message:{delivery_tag} {message_ttl}  # Default 3 days
-   ZADD messages_index {delivery_tag: try_requeue_at}
+   ZADD messages_index {delivery_tag: queue_at}
    ZADD {queue} {delivery_tag: queue_score}
    ```
 
 ---
 
 ### 2.2 Message WITH eta (Delayed Delivery)
+
+**Native vs Celery-handled delays:**
+- If `delay > DEFAULT_REQUEUE_CHECK_INTERVAL` (60s): Native delayed delivery via score
+- If `delay <= 60s`: Treated as immediate, Celery's built-in eta logic handles the short delay
 
 ```python
 my_task.apply_async(countdown=30)   # 30 second delay
@@ -97,20 +101,20 @@ my_task.apply_async(countdown=3600) # 1 hour delay
    - Converts to Unix timestamp
    - Sets `properties["eta"] = timestamp`
 
-2. **Channel._put()** (`transport.py:1071-1117`):
+2. **Channel._put()** (`transport.py:1059-1108`):
    - All messages (regardless of delay length) go to the main queue
    - Uses eta timestamp in the score:
      ```python
-     visible_at = max(eta_timestamp, now)  # Use eta for queue score
+     visible_at = eta_timestamp if eta_timestamp > now else now
      queue_score = _queue_score(priority, visible_at)
      ```
-   - Sets try_requeue_at to the max of eta and now+visibility_timeout
+   - Sets `queue_at = eta` (requeue mechanism delivers at eta time)
 
 3. **Redis operations** (same structure as immediate):
    ```
-   HSET message:{delivery_tag} payload {json} exchange {exchange} routing_key {routing_key} priority {priority}
+   HSET message:{delivery_tag} payload {json} routing_key {queue} priority {priority} redelivered 0 delayed 1
    EXPIRE message:{delivery_tag} {message_ttl}  # Default 3 days
-   ZADD messages_index {delivery_tag: try_requeue_at}
+   ZADD messages_index {delivery_tag: queue_at}  # queue_at = eta
    ZADD {queue} {delivery_tag: queue_score}  # Score includes future timestamp
    ```
 
@@ -125,7 +129,7 @@ The message is in the queue but won't be popped until its score is the lowest (i
 app.send_task('broadcast_task', routing_key='', exchange='broadcast')
 ```
 
-**Flow** (`transport.py:1119-1133`):
+**Flow** (`transport.py:1110-1124`):
 
 1. `_put_fanout()` called instead of `_put()`
 2. Uses Redis Streams instead of sorted sets:
@@ -141,16 +145,16 @@ app.send_task('broadcast_task', routing_key='', exchange='broadcast')
 
 ### 3.1 Worker Polling
 
-The `MultiChannelPoller.get()` method (`transport.py:573-600`) is the main loop:
+The `MultiChannelPoller.get()` method (`transport.py:536-563`) is the main loop:
 
-1. **Register BZMPOP** for active queues (`transport.py:502-509`):
+1. **Register BZMPOP** for active queues (`transport.py:803-815`):
    ```
    BZMPOP {timeout} {numkeys} queue1 queue2 ... MIN
    ```
    - Blocks until message available or timeout
    - `MIN` pops lowest score (highest priority)
 
-2. **Register XREAD** for fanout queues (`transport.py:863-901`):
+2. **Register XREAD** for fanout queues (`transport.py:845-886`):
    ```
    XREAD COUNT 1 BLOCK {timeout_ms} STREAMS stream1 stream2 ... id1 id2 ...
    ```
@@ -159,7 +163,7 @@ The `MultiChannelPoller.get()` method (`transport.py:573-600`) is the main loop:
 
 ### 3.2 Message Delivery (BZMPOP)
 
-When BZMPOP returns (`transport.py:833-853`):
+When BZMPOP returns (`transport.py:817-852`):
 
 ```python
 result = client.parse_response(connection, "BZMPOP")
@@ -181,7 +185,7 @@ The message is:
 
 ### 3.3 Message Delivery (XREAD - Fanout)
 
-When XREAD returns (`transport.py:903-958`):
+When XREAD returns (`transport.py:888-943`):
 
 ```python
 for stream, message_list in messages:
@@ -207,7 +211,7 @@ for stream, message_list in messages:
 
 ### 4.1 Successful Processing (ack)
 
-When task completes successfully (`transport.py:315-322`):
+When task completes successfully (`transport.py:316-323`):
 
 ```python
 def ack(self, delivery_tag):
@@ -220,7 +224,7 @@ def ack(self, delivery_tag):
     super().ack(delivery_tag)
 ```
 
-**Redis cleanup** (`transport.py:345-352`):
+**Redis cleanup** (`transport.py:346-349`):
 ```
 ZREM messages_index {delivery_tag}
 DEL message:{delivery_tag}
@@ -228,7 +232,7 @@ DEL message:{delivery_tag}
 
 ### 4.2 Failed Processing (reject with requeue)
 
-When task fails and should be retried (`transport.py:324-335`):
+When task fails and should be retried (`transport.py:325-336`):
 
 ```python
 def reject(self, delivery_tag, requeue=True):
@@ -243,7 +247,7 @@ def reject(self, delivery_tag, requeue=True):
             self._remove_from_indices(delivery_tag).execute()
 ```
 
-**Restore transaction** (`transport.py:411-420`):
+**Restore transaction** (`transport.py:381-409`):
 ```python
 # In a WATCH/MULTI transaction:
 message_key = f"message:{tag}"
@@ -264,11 +268,11 @@ HSET message_key "payload" {payload_with_redelivered=True}
 
 Messages have a "visibility timeout" - if not acked within this time, they're considered lost. The same mechanism handles both unacked messages AND delayed messages.
 
-**Key insight**: `messages_index` stores `try_requeue_at` timestamps:
-- For immediate messages: `try_requeue_at = now + visibility_timeout`
-- For delayed messages: `try_requeue_at = max(eta, now + visibility_timeout)`
+**Key insight**: `messages_index` stores `queue_at` timestamps:
+- For immediate messages: `queue_at = now + visibility_timeout`
+- For delayed messages: `queue_at = eta` (requeue mechanism delivers at eta time)
 
-**Heartbeat** (`transport.py:354-368`):
+**Heartbeat** (`transport.py:351-365`):
 - Every `visibility_timeout/3` seconds (~100s)
 - Updates `messages_index` score to extend the visibility window:
   ```
@@ -276,51 +280,54 @@ Messages have a "visibility timeout" - if not acked within this time, they're co
   ```
 - Keeps messages "alive" while being processed
 
-**Unified Requeue** (`transport.py:984-1020`):
+**Unified Requeue** (`transport.py:1013-1057`):
 - Every 60 seconds (DEFAULT_REQUEUE_CHECK_INTERVAL), `requeue_messages()` runs
 - Uses Lua script for atomic batch processing
-- Processes messages with `try_requeue_at <= now + requeue_check_interval`
+- Processes messages with `queue_at <= now + requeue_check_interval`
 
 ### 5.2 Lua Script for Atomic Requeue
 
-The Lua script (`transport.py:984-1020`) handles both delayed messages and visibility timeout restoration:
+The Lua script (`transport.py:972-1011`) handles both delayed messages and visibility timeout restoration:
 
 ```lua
-local now = tonumber(ARGV[1])
-local requeue_interval = tonumber(ARGV[2])
-local batch_limit = tonumber(ARGV[3])
-local message_key_prefix = ARGV[4]  -- "message:"
+local messages_index = KEYS[1]
+local threshold = tonumber(ARGV[1])
+local batch_limit = tonumber(ARGV[2])
+local new_queue_at = tonumber(ARGV[3])
+local priority_multiplier = tonumber(ARGV[4])
+local message_key_prefix = ARGV[5]
+local total_requeued = 0
 
-local threshold = now + requeue_interval
-local requeued = 0
-local per_queue_counts = {}
-
--- Get messages ready for requeue
+-- Get messages ready for requeue (score <= threshold)
 local ready = redis.call('ZRANGEBYSCORE', messages_index, '-inf', threshold, 'LIMIT', 0, batch_limit)
 
 for _, tag in ipairs(ready) do
+    -- Get priority from per-message hash
     local message_key = message_key_prefix .. tag
-    local routing_key = redis.call('HGET', message_key, 'routing_key')
+    local priority = redis.call('HGET', message_key, 'priority')
+    if priority then
+        priority = tonumber(priority)
+        -- Calculate queue score: (255 - priority) * multiplier + current_time_ms
+        local now_ms = redis.call('TIME')
+        now_ms = tonumber(now_ms[1]) * 1000 + math.floor(tonumber(now_ms[2]) / 1000)
+        local queue_score = (255 - priority) * priority_multiplier + now_ms
 
-    if not routing_key then
-        -- Message already acked (per-message hash deleted), clean up index
-        redis.call('ZREM', messages_index, tag)
-    else
-        -- Get priority directly from per-message hash
-        local priority = tonumber(redis.call('HGET', message_key, 'priority')) or 0
-        local score = (255 - priority) * 1e10 + now * 1000
-
-        -- Use ZADD NX to only add if not already in queue
-        local added = redis.call('ZADD', routing_key, 'NX', score, tag)
-        if added == 1 then
-            requeued = requeued + 1
-            -- Update try_requeue_at for next cycle
-            redis.call('ZADD', messages_index, now + visibility_timeout, tag)
+        -- Try to add to each queue (NX = only if not exists)
+        for i = 2, #KEYS do
+            local queue = KEYS[i]
+            redis.call('ZADD', queue, 'NX', queue_score, tag)
         end
+
+        -- Update queue_at for next cycle
+        redis.call('ZADD', messages_index, new_queue_at, tag)
+        total_requeued = total_requeued + 1
+    else
+        -- No message hash = message was already acked/deleted, clean up index
+        redis.call('ZREM', messages_index, tag)
     end
 end
 
-return {requeued, cjson.encode(per_queue_counts)}
+return total_requeued
 ```
 
 This ensures:
@@ -329,26 +336,51 @@ This ensures:
 - Both delayed messages and timed-out messages are handled uniformly
 - Batch limit of 1000 messages per cycle (DEFAULT_REQUEUE_BATCH_LIMIT)
 
-### 5.3 Restore by Tag
+### 5.3 Restore by Tag (Lua Script)
 
-When a specific message needs restoration (`transport.py:741-764`):
+When a specific message needs restoration, a Lua script atomically:
+1. Reads `priority` and `routing_key` (queue) from the per-message hash
+2. Sets `redelivered=1` in the hash
+3. Refreshes the TTL
+4. Adds the message back to the queue with appropriate score
 
-```python
-def _do_restore_message(self, payload, exchange, routing_key, pipe, leftmost=False, delivery_tag=None):
-    # Mark as redelivered
-    payload["headers"]["redelivered"] = True
-    payload["properties"]["delivery_info"]["redelivered"] = True
+```lua
+-- _restore_message_lua
+local message_key = KEYS[1]
+local leftmost = tonumber(ARGV[1]) == 1
+local priority_multiplier = tonumber(ARGV[2])
+local message_ttl = tonumber(ARGV[3])
 
-    # Calculate score (0 for front, normal for back)
-    priority = payload.get("properties", {}).get("priority", 0)
-    score = 0 if leftmost else _queue_score(priority)
+-- Get priority and routing_key (queue) from hash
+local priority = redis.call('HGET', message_key, 'priority')
+local queue = redis.call('HGET', message_key, 'routing_key')
+if not priority or not queue then
+    return 0
+end
 
-    # Add back to queue and update per-message hash
-    message_key = f"message:{delivery_tag}"
-    for queue in lookup_queues(exchange, routing_key):
-        pipe.zadd(queue, {delivery_tag: score})
-        pipe.hset(message_key, "payload", dumps(payload))
+-- Mark as redelivered
+redis.call('HSET', message_key, 'redelivered', '1')
+redis.call('EXPIRE', message_key, message_ttl)
+
+-- Calculate score (0 for front, normal for back)
+local score
+if leftmost then
+    score = 0
+else
+    priority = tonumber(priority)
+    local now_ms = redis.call('TIME')
+    now_ms = tonumber(now_ms[1]) * 1000 + math.floor(tonumber(now_ms[2]) / 1000)
+    score = (255 - priority) * priority_multiplier + now_ms
+end
+
+-- Add to queue (routing_key is the queue name)
+local tag = string.match(message_key, ':(.+)$')
+redis.call('ZADD', queue, score, tag)
+
+return 1
 ```
+
+The `redelivered` field in the hash is stored for debugging purposes only.
 
 ---
 
@@ -385,8 +417,8 @@ def _do_restore_message(self, payload, exchange, routing_key, pipe, leftmost=Fal
 
 | Key | Purpose |
 |-----|---------|
-| `{prefix}message:{delivery_tag}` | Hash: `{payload, exchange, routing_key, priority}` with TTL |
-| `{prefix}messages_index` | Sorted set: `{delivery_tag: try_requeue_at}` |
+| `{prefix}message:{delivery_tag}` | Hash: `{payload, routing_key, priority, redelivered, delayed}` with TTL |
+| `{prefix}messages_index` | Sorted set: `{delivery_tag: queue_at}` |
 | `{prefix}{queue}` | Sorted set: main queue with priority+timestamp scores |
 | `{prefix}_kombu.binding.{exchange}` | Set: exchange bindings |
 | `{prefix}/{db}.{exchange}/{routing_key}` | Stream: fanout messages |

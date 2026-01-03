@@ -73,12 +73,6 @@ except Exception:
 
 ---
 
-### Lines 773, 779-780, 788: `_do_restore_message` edge cases
-**Why uncovered**: Some edge cases in message restoration not hit (e.g., specific error paths).
-**Difficulty**: Medium
-
----
-
 ### Lines 811, 813, 818-819: `basic_cancel` protected read path
 **Why uncovered**: Protected read state only active during async polling.
 **Difficulty**: Hard - async testing
