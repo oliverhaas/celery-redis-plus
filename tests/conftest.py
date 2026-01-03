@@ -2,23 +2,30 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 
 # Re-export fixtures from fixtures.py
 from tests.fixtures import redis_client, redis_container
 
-if TYPE_CHECKING:
-    pass
-
 __all__ = [
+    "clear_redis",
     "redis_client",
     "redis_container",
 ]
 
 # Enable celery.contrib.pytest plugin for celery_app and celery_worker fixtures
 pytest_plugins = ("celery.contrib.pytest",)
+
+
+@pytest.fixture
+def clear_redis(redis_client: Any) -> None:
+    """Clear Redis database before each test.
+
+    This fixture ensures tests start with a clean state.
+    """
+    redis_client.flushdb()
 
 
 @pytest.fixture
@@ -82,11 +89,13 @@ def clear_kombu_global_event_loop() -> Any:
 def celery_app(
     celery_app: Any,
     redis_container: tuple[str, int, str],
+    clear_redis: None,
     cleanup_async_results: Any,
     clear_kombu_global_event_loop: Any,
 ) -> Any:
     """Override celery_app to ensure proper cleanup.
 
+    The clear_redis fixture ensures each test starts with a clean Redis state.
     The extra fixture dependencies ensure proper teardown order.
     """
     return celery_app

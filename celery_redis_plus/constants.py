@@ -22,8 +22,15 @@ DEFAULT_HEALTH_CHECK_INTERVAL = 25
 # Default stream maximum length for fanout streams
 DEFAULT_STREAM_MAXLEN = 10000
 
-# Suffix for delayed message queues (stores messages until their eta)
-DELAYED_QUEUE_SUFFIX = ":delayed"
+# Interval in seconds for requeue check (restores unacked messages and moves delayed messages)
+DEFAULT_REQUEUE_CHECK_INTERVAL = 60
 
-# Interval in seconds for checking delayed messages (move ready ones to queue)
-DEFAULT_DELAYED_CHECK_INTERVAL = 60
+# Batch limit for requeue operations (max messages processed per queue per cycle)
+DEFAULT_REQUEUE_BATCH_LIMIT = 1000
+
+# Default TTL for per-message hashes in seconds (3 days)
+# Messages are cleaned up on ack, but this TTL ensures orphaned messages are eventually removed
+DEFAULT_MESSAGE_TTL = 3 * 24 * 60 * 60  # 259200 seconds
+
+# Prefix for per-message hash keys
+MESSAGE_KEY_PREFIX = "message:"

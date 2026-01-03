@@ -52,11 +52,13 @@ from kombu.utils.url import _parse_url
 from vine import promise
 
 from .constants import (
-    DEFAULT_DELAYED_CHECK_INTERVAL,
     DEFAULT_HEALTH_CHECK_INTERVAL,
+    DEFAULT_MESSAGE_TTL,
+    DEFAULT_REQUEUE_BATCH_LIMIT,
+    DEFAULT_REQUEUE_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
-    DELAYED_QUEUE_SUFFIX,
+    MESSAGE_KEY_PREFIX,
     PRIORITY_SCORE_MULTIPLIER,
 )
 
@@ -303,7 +305,6 @@ class QoS(virtual.QoS):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._vrestore_count = 0
         # For streams fanout: track delivery tags that came from fanout (no ack needed)
         self._fanout_tags: set[str] = set()
 
@@ -343,85 +344,56 @@ class QoS(virtual.QoS):
                 yield client.pipeline()
 
     def _remove_from_indices(self, delivery_tag: str, pipe: Any = None) -> Any:
+        message_key = self.channel._message_key(delivery_tag)
         with self.pipe_or_acquire(pipe) as pipe:
-            # Also clean up delayed score hash (no-op if not a delayed message)
-            return (
-                pipe.zrem(self.messages_index_key, delivery_tag)
-                .hdel(self.messages_key, delivery_tag)
-                .hdel(self.messages_delayed_score_key, delivery_tag)
-            )
+            return pipe.zrem(self.messages_index_key, delivery_tag).delete(message_key)
 
     def maybe_update_messages_index(self) -> None:
-        """Update scores of delivered messages to current time.
+        """Update scores of delivered messages to now + visibility_timeout.
 
-        Acts as a heartbeat to keep messages from being restored by
-        restore_visible() while they are still being processed.
+        Acts as a heartbeat to keep messages from being requeued by
+        requeue_messages() while they are still being processed.
         """
         if not self._delivered:
             return
-        now = time()
+        try_requeue_at = time() + self.visibility_timeout
         with self.channel.conn_or_acquire() as client, client.pipeline() as pipe:
             for tag in self._delivered:
                 # Skip fanout messages (they don't use the index)
                 if tag not in self._fanout_tags:
-                    pipe.zadd(self.messages_index_key, {tag: now})
+                    pipe.zadd(self.messages_index_key, {tag: try_requeue_at})
             pipe.execute()
 
-    def restore_visible(self, start: int = 0, num: int = 10, interval: int = 10) -> None:
-        """Restore messages that have exceeded visibility timeout."""
-        self._vrestore_count += 1
-        if (self._vrestore_count - 1) % interval:
-            return
-        with self.channel.conn_or_acquire() as client:
-            ceil = time() - self.visibility_timeout
-            try:
-                with Mutex(client, self.messages_mutex_key, self.messages_mutex_expire):
-                    visible = client.zrevrangebyscore(
-                        self.messages_index_key,
-                        ceil,
-                        0,
-                        start=num and start,
-                        num=num,
-                        withscores=True,
-                    )
-                    for tag, _score in visible or []:
-                        tag_str = bytes_to_str(tag)
-                        # Check if message is still in a queue before restoring
-                        payload = client.hget(self.messages_key, tag_str)
-                        if not payload:
-                            # Message already acked, remove from index
-                            client.zrem(self.messages_index_key, tag_str)
-                            continue
-                        _message, exchange, routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
-                        # Check if delivery_tag is still in any target queue
-                        queues = self.channel._lookup(exchange, routing_key)
-                        in_queue = False
-                        for queue in queues:
-                            if client.zscore(queue, tag_str) is not None:
-                                in_queue = True
-                                break
-                        if in_queue:
-                            # Message still in queue, not yet consumed - skip
-                            continue
-                        # Message was consumed but not acked, restore it
-                        self.restore_by_tag(tag_str, client)
-            except MutexHeld:
-                pass
+    def requeue_messages(self) -> int:
+        """Requeue messages whose try_requeue_at time has passed.
+
+        This unified method handles both:
+        - Delayed messages that are now ready to be processed
+        - Messages that were consumed but not acked (lost/timed out)
+
+        Uses a Lua script for atomic, efficient batch processing.
+
+        Returns:
+            Number of messages requeued.
+        """
+        return self.channel.requeue_messages()
 
     def restore_by_tag(self, tag: str, client: Any = None, leftmost: bool = False) -> None:
+        message_key = self.channel._message_key(tag)
+
         def restore_transaction(pipe: Any) -> None:
-            p = pipe.hget(self.messages_key, tag)
+            payload_json = pipe.hget(message_key, "payload")
+            exchange = pipe.hget(message_key, "exchange")
+            routing_key = pipe.hget(message_key, "routing_key")
             pipe.multi()
-            if p:
-                message, exchange, routing_key, _priority = loads(bytes_to_str(p))  # type: ignore[call-arg]
-                self.channel._do_restore_message(message, exchange, routing_key, pipe, leftmost, tag)
+            if payload_json:
+                message = loads(bytes_to_str(payload_json))  # type: ignore[call-arg]
+                ex = bytes_to_str(exchange) if exchange else ""
+                rk = bytes_to_str(routing_key) if routing_key else ""
+                self.channel._do_restore_message(message, ex, rk, pipe, leftmost, tag)
 
         with self.channel.conn_or_acquire(client) as client:
-            client.transaction(restore_transaction, self.messages_key)
-
-    @cached_property
-    def messages_key(self) -> str:
-        return self.channel.messages_key
+            client.transaction(restore_transaction, message_key)
 
     @cached_property
     def messages_index_key(self) -> str:
@@ -434,10 +406,6 @@ class QoS(virtual.QoS):
     @cached_property
     def messages_mutex_expire(self) -> int:
         return self.channel.messages_mutex_expire
-
-    @cached_property
-    def messages_delayed_score_key(self) -> str:
-        return self.channel.messages_delayed_score_key
 
     @cached_property
     def visibility_timeout(self) -> float:
@@ -528,33 +496,28 @@ class MultiChannelPoller:
 
     def on_poll_init(self, poller: Any) -> None:
         self.poller = poller
-        for channel in self._channels:
-            return channel.qos.restore_visible(num=10)
-        return None
+        # Initial requeue check on startup
+        self.maybe_requeue_messages()
 
-    def maybe_restore_messages(self) -> None:
+    def maybe_requeue_messages(self) -> int:
+        """Requeue messages whose try_requeue_at time has passed.
+
+        This unified method handles both delayed messages and timed-out messages.
+
+        Returns:
+            Total number of messages requeued across all channels.
+        """
+        total_requeued = 0
         for channel in self._channels:
             if channel.active_queues:
-                return channel.qos.restore_visible(num=10)
-        return None
+                total_requeued += channel.qos.requeue_messages()
+        return total_requeued
 
     def maybe_update_messages_index(self) -> None:
         """Update message index scores to keep delivered messages alive."""
         for channel in self._channels:
             if channel.active_queues:
                 channel.qos.maybe_update_messages_index()
-
-    def maybe_move_ready_delayed_messages(self) -> int:
-        """Move delayed messages that are ready to their destination queues.
-
-        Returns:
-            Total number of messages moved across all channels.
-        """
-        total_moved = 0
-        for channel in self._channels:
-            if channel.active_queues:
-                total_moved += channel.move_ready_delayed_messages()
-        return total_moved
 
     def on_readable(self, fileno: int) -> bool | None:
         chan, cmd_type = self._fd_to_chan[fileno]
@@ -587,7 +550,6 @@ class MultiChannelPoller:
                     ret = self.handle_event(fileno, event)
                     if ret:
                         return
-            self.maybe_restore_messages()
             raise Empty()
         finally:
             self._in_protected_read = False
@@ -626,11 +588,12 @@ class Channel(virtual.Channel):
     _fanout_queues: dict[str, tuple[str, str]] = {}
 
     # Message storage keys
-    messages_key = "messages"
+    # Per-message hash keys use format: {message_key_prefix}{delivery_tag}
+    message_key_prefix = MESSAGE_KEY_PREFIX
+    message_ttl = DEFAULT_MESSAGE_TTL  # TTL for per-message hashes (3 days default)
     messages_index_key = "messages_index"
     messages_mutex_key = "messages_mutex"
     messages_mutex_expire = 300  # 5 minutes
-    messages_delayed_score_key = "messages_delayed_score"  # Precomputed scores for delayed msgs
 
     # Visibility and timeout settings
     visibility_timeout: float = DEFAULT_VISIBILITY_TIMEOUT
@@ -658,7 +621,8 @@ class Channel(virtual.Channel):
 
     from_transport_options = virtual.Channel.from_transport_options + (
         "sep",
-        "messages_key",
+        "message_key_prefix",
+        "message_ttl",
         "messages_index_key",
         "messages_mutex_key",
         "messages_mutex_expire",
@@ -738,6 +702,10 @@ class Channel(virtual.Channel):
         if self.connection and self.connection.cycle:
             self.connection.cycle._on_connection_disconnect(connection)
 
+    def _message_key(self, delivery_tag: str) -> str:
+        """Get the Redis key for a message's per-message hash."""
+        return f"{self.message_key_prefix}{delivery_tag}"
+
     def _do_restore_message(
         self,
         payload: dict[str, Any],
@@ -755,26 +723,42 @@ class Channel(virtual.Channel):
                 pass
             if delivery_tag is None:
                 delivery_tag = payload["properties"]["delivery_tag"]
+            priority = self._get_message_priority(payload, reverse=False)
+            message_key = self._message_key(delivery_tag)
             for queue in self._lookup(exchange, routing_key):
-                priority = self._get_message_priority(payload, reverse=False)
                 score = 0 if leftmost else _queue_score(priority)
                 pipe.zadd(queue, {delivery_tag: score})
-                pipe.hset(self.messages_key, delivery_tag, dumps([payload, exchange, routing_key]))  # type: ignore[call-arg]
+            # Update the per-message hash with redelivered payload
+            pipe.hset(
+                message_key,
+                mapping={
+                    "payload": dumps(payload),  # type: ignore[call-arg]
+                    "exchange": exchange,
+                    "routing_key": routing_key,
+                    "priority": priority,
+                },
+            )
+            pipe.expire(message_key, self.message_ttl)
         except Exception:
             crit("Could not restore message: %r", payload, exc_info=True)
 
     def _restore(self, message: Any, leftmost: bool = False) -> None:
         tag = message.delivery_tag
+        message_key = self._message_key(tag)
 
         def restore_transaction(pipe: Any) -> None:
-            payload = pipe.hget(self.messages_key, tag)
+            payload_json = pipe.hget(message_key, "payload")
+            exchange = pipe.hget(message_key, "exchange")
+            routing_key = pipe.hget(message_key, "routing_key")
             pipe.multi()
-            if payload:
-                message, exchange, routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
-                self._do_restore_message(message, exchange, routing_key, pipe, leftmost, tag)
+            if payload_json:
+                msg = loads(bytes_to_str(payload_json))  # type: ignore[call-arg]
+                ex = bytes_to_str(exchange) if exchange else ""
+                rk = bytes_to_str(routing_key) if routing_key else ""
+                self._do_restore_message(msg, ex, rk, pipe, leftmost, tag)
 
         with self.conn_or_acquire() as client:
-            client.transaction(restore_transaction, self.messages_key)
+            client.transaction(restore_transaction, message_key)
 
     def _restore_at_beginning(self, message: Any) -> None:
         return self._restore(message, leftmost=True)
@@ -842,9 +826,10 @@ class Channel(virtual.Channel):
                 dest = bytes_to_str(dest)
                 delivery_tag, _score = members[0]
                 delivery_tag = bytes_to_str(delivery_tag)
-                payload = self.client.hget(self.messages_key, delivery_tag)
-                if payload:
-                    message, _exchange, _routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
+                message_key = self._message_key(delivery_tag)
+                payload_json = self.client.hget(message_key, "payload")
+                if payload_json:
+                    message = loads(bytes_to_str(payload_json))  # type: ignore[call-arg]
                     self.connection._deliver(message, dest)
                     return True
                 raise Empty()
@@ -967,114 +952,116 @@ class Channel(virtual.Channel):
             if result:
                 delivery_tag, _score = result[0]
                 delivery_tag = bytes_to_str(delivery_tag)
-                payload = client.hget(self.messages_key, delivery_tag)
-                if payload:
-                    message, _exchange, _routing_key, _priority = loads(bytes_to_str(payload))  # type: ignore[call-arg]
-                    return message
+                message_key = self._message_key(delivery_tag)
+                payload_json = client.hget(message_key, "payload")
+                if payload_json:
+                    return loads(bytes_to_str(payload_json))  # type: ignore[call-arg]
             raise Empty()
 
     def _size(self, queue: str) -> int:
         with self.conn_or_acquire() as client:
             return client.zcard(queue)
 
-    # Lua script for atomically moving ready delayed messages to main queue
-    # KEYS: [1] = delayed_score_hash, [2..n] = queue names (main queues)
-    # ARGV: [1] = threshold_time, [2] = delayed_queue_suffix, [3] = batch_limit
-    # Returns: array of [total_moved, queue1_moved, queue2_moved, ...]
-    _move_ready_delayed_lua = """
-    local score_hash = KEYS[1]
+    # Lua script for requeuing messages whose try_requeue_at time has passed.
+    # This handles both delayed messages and messages that timed out (not acked).
+    # Uses per-message hashes: message:{tag} with fields: payload, exchange, routing_key, priority
+    # KEYS: [1] = messages_index, [2..n] = queue names
+    # ARGV: [1] = threshold, [2] = batch_limit, [3] = new_try_requeue_at,
+    #       [4] = priority_multiplier, [5] = message_key_prefix
+    # Returns: total number of messages requeued
+    _requeue_messages_lua = """
+    local messages_index = KEYS[1]
     local threshold = tonumber(ARGV[1])
-    local delayed_suffix = ARGV[2]
-    local batch_limit = tonumber(ARGV[3])
-    local results = {0}  -- results[1] = total moved
+    local batch_limit = tonumber(ARGV[2])
+    local new_try_requeue_at = tonumber(ARGV[3])
+    local priority_multiplier = tonumber(ARGV[4])
+    local message_key_prefix = ARGV[5]
+    local total_requeued = 0
 
-    -- Process each queue (KEYS[2] onwards are main queue names)
-    for i = 2, #KEYS do
-        local main_queue = KEYS[i]
-        local delayed_queue = main_queue .. delayed_suffix
-        local queue_moved = 0
+    -- Get messages ready for requeue (score <= threshold)
+    local ready = redis.call('ZRANGEBYSCORE', messages_index, '-inf', threshold, 'LIMIT', 0, batch_limit)
 
-        -- Get ready messages with limit (score <= threshold)
-        local ready = redis.call('ZRANGEBYSCORE', delayed_queue, '-inf', threshold, 'LIMIT', 0, batch_limit)
+    for _, tag in ipairs(ready) do
+        -- Get priority from per-message hash
+        local message_key = message_key_prefix .. tag
+        local priority = redis.call('HGET', message_key, 'priority')
+        if priority then
+            priority = tonumber(priority)
+            -- Calculate queue score: (255 - priority) * multiplier + current_time_ms
+            local now_ms = redis.call('TIME')
+            now_ms = tonumber(now_ms[1]) * 1000 + math.floor(tonumber(now_ms[2]) / 1000)
+            local queue_score = (255 - priority) * priority_multiplier + now_ms
 
-        for _, tag in ipairs(ready) do
-            -- Get precomputed score
-            local score = redis.call('HGET', score_hash, tag)
-            if score then
-                -- Move to main queue with precomputed score
-                redis.call('ZREM', delayed_queue, tag)
-                redis.call('ZADD', main_queue, score, tag)
-                redis.call('HDEL', score_hash, tag)
-                queue_moved = queue_moved + 1
-            else
-                -- No score found, message was deleted - just clean up
-                redis.call('ZREM', delayed_queue, tag)
+            -- Try to add to each queue (NX = only if not exists)
+            for i = 2, #KEYS do
+                local queue = KEYS[i]
+                redis.call('ZADD', queue, 'NX', queue_score, tag)
             end
-        end
 
-        results[1] = results[1] + queue_moved
-        results[i] = queue_moved
+            -- Update try_requeue_at for next cycle
+            redis.call('ZADD', messages_index, new_try_requeue_at, tag)
+            total_requeued = total_requeued + 1
+        else
+            -- No message hash = message was already acked/deleted, clean up index
+            redis.call('ZREM', messages_index, tag)
+        end
     end
 
-    return results
+    return total_requeued
     """
 
-    # Maximum messages to move per queue per check cycle
-    _move_ready_delayed_batch_limit = 1000
+    def requeue_messages(self) -> int:
+        """Requeue messages whose try_requeue_at time has passed.
 
-    def move_ready_delayed_messages(self) -> int:
-        """Move messages from delayed queues to ready queues when their eta has passed.
+        This unified method handles both:
+        - Delayed messages that are now ready to be processed
+        - Messages that were consumed but not acked (lost/timed out)
 
-        Uses a Lua script for atomic, efficient batch moves without round-trips.
-        For each active queue, checks the corresponding {queue}:delayed sorted set
-        for messages with score <= threshold. The threshold is current time plus
-        the check interval, so we move messages that will be ready by the next check.
+        Uses ZADD NX to avoid re-adding messages that are already in the queue.
+        Updates messages_index to schedule the next requeue attempt.
 
         Returns:
-            Number of messages moved.
+            Number of messages requeued.
         """
         if not self.active_queues:
             return 0
 
-        # Move messages that will be ready by the next check interval
-        threshold = time() + DEFAULT_DELAYED_CHECK_INTERVAL
+        now = time()
+        # Check messages that will need requeuing by next interval
+        threshold = now + DEFAULT_REQUEUE_CHECK_INTERVAL
+        # Next requeue attempt if message still not acked
+        new_try_requeue_at = now + self.visibility_timeout
         queues = list(self.active_queues)
 
         with self.conn_or_acquire() as client:
-            # Register the Lua script (cached after first call)
-            move_script = client.register_script(self._move_ready_delayed_lua)
+            requeue_script = client.register_script(self._requeue_messages_lua)
 
-            # Pass all queue names to Lua: KEYS[1] = score_hash, KEYS[2..n] = queues
-            keys = [self.messages_delayed_score_key, *queues]
-            results = move_script(
+            keys = [self.messages_index_key, *queues]
+            total_requeued = requeue_script(
                 keys=keys,
-                args=[threshold, DELAYED_QUEUE_SUFFIX, self._move_ready_delayed_batch_limit],
+                args=[
+                    threshold,
+                    DEFAULT_REQUEUE_BATCH_LIMIT,
+                    new_try_requeue_at,
+                    PRIORITY_SCORE_MULTIPLIER,
+                    self.message_key_prefix,
+                ],
             )
 
-        if not results:
-            return 0
+        if total_requeued >= DEFAULT_REQUEUE_BATCH_LIMIT:
+            warning(
+                "Requeue hit batch limit of %d. There may be more messages waiting.",
+                DEFAULT_REQUEUE_BATCH_LIMIT,
+            )
 
-        total_moved = results[0]
-
-        # Check if any queue hit the batch limit and log a warning
-        for i, queue in enumerate(queues):
-            queue_moved = results[i + 1] if i + 1 < len(results) else 0
-            if queue_moved >= self._move_ready_delayed_batch_limit:
-                warning(
-                    "Delayed message queue %r hit batch limit of %d. There may be more messages waiting to be moved.",
-                    queue,
-                    self._move_ready_delayed_batch_limit,
-                )
-
-        return total_moved
+        return total_requeued or 0
 
     def _put(self, queue: str, message: dict[str, Any], **kwargs: Any) -> None:
         """Deliver message to queue using sorted set.
 
-        Messages with short delay (≤ DEFAULT_DELAYED_CHECK_INTERVAL) go to {queue}
-        with a future timestamp in the score.
-        Messages with longer delay go to {queue}:delayed with eta as score,
-        and are moved to {queue} by a background process when ready.
+        All messages go directly to the queue with a score encoding priority and
+        scheduled time. The messages_index tracks when to attempt requeue if the
+        message is not acknowledged (try_requeue_at = visible_at + visibility_timeout).
 
         Args:
             queue: Target queue name.
@@ -1092,28 +1079,32 @@ class Channel(virtual.Channel):
 
         # eta is a Unix timestamp (float) in properties, similar to priority
         eta_timestamp: float | None = props.get("eta")
-        delay_seconds = max(0.0, eta_timestamp - now) if eta_timestamp else 0.0
+        visible_at = eta_timestamp if eta_timestamp and eta_timestamp > now else now
+
+        # Queue score encodes priority and scheduled time
+        queue_score = _queue_score(priority, visible_at)
+
+        # try_requeue_at: when to check if this message needs requeuing
+        # For delayed messages, this is eta + visibility_timeout
+        # For immediate messages, this is now + visibility_timeout
+        try_requeue_at = visible_at + self.visibility_timeout
+
+        message_key = self._message_key(delivery_tag)
 
         with self.conn_or_acquire() as client, client.pipeline() as pipe:
-            if delay_seconds > DEFAULT_DELAYED_CHECK_INTERVAL:
-                # Long delay: store in {queue}:delayed with eta timestamp as score
-                # Background process will move it to main queue when ready
-                delayed_queue = queue + DELAYED_QUEUE_SUFFIX
-                # Precompute the final queue score for when message becomes ready
-                # This enables efficient Lua-based move without JSON parsing
-                ready_score = _queue_score(priority, eta_timestamp)
-                # Use eta_timestamp for index so restore_visible won't restore before eta
-                pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key, priority]))  # type: ignore[call-arg]
-                pipe.zadd(self.messages_index_key, {delivery_tag: eta_timestamp})
-                pipe.zadd(delayed_queue, {delivery_tag: eta_timestamp})
-                pipe.hset(self.messages_delayed_score_key, delivery_tag, ready_score)
-            else:
-                # Immediate or short delay: store in queue with priority+timestamp score
-                visible_at = now + delay_seconds
-                queue_score = _queue_score(priority, visible_at)
-                pipe.hset(self.messages_key, delivery_tag, dumps([message, exchange, routing_key, priority]))  # type: ignore[call-arg]
-                pipe.zadd(self.messages_index_key, {delivery_tag: visible_at})
-                pipe.zadd(queue, {delivery_tag: queue_score})
+            # Store message in per-message hash with individual fields
+            pipe.hset(
+                message_key,
+                mapping={
+                    "payload": dumps(message),  # type: ignore[call-arg]
+                    "exchange": exchange,
+                    "routing_key": routing_key,
+                    "priority": priority,
+                },
+            )
+            pipe.expire(message_key, self.message_ttl)
+            pipe.zadd(self.messages_index_key, {delivery_tag: try_requeue_at})
+            pipe.zadd(queue, {delivery_tag: queue_score})
             pipe.execute()
 
     def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
@@ -1430,22 +1421,14 @@ class Transport(virtual.Transport):
             [add_reader(fd, on_readable, fd) for fd in cycle.fds]
 
         loop.on_tick.add(on_poll_start)
-        loop.call_repeatedly(10, cycle.maybe_restore_messages)
 
+        # Unified requeue check handles both delayed messages and timed-out messages
+        loop.call_repeatedly(DEFAULT_REQUEUE_CHECK_INTERVAL, cycle.maybe_requeue_messages)
+
+        # Heartbeat to keep in-flight messages alive
         visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]
         loop.call_repeatedly(visibility_timeout / 3, cycle.maybe_update_messages_index)
-
-        # Check for ready delayed messages every DEFAULT_DELAYED_CHECK_INTERVAL seconds
-        loop.call_repeatedly(DEFAULT_DELAYED_CHECK_INTERVAL, cycle.maybe_move_ready_delayed_messages)
 
     def on_readable(self, fileno: int) -> Any:
         """Handle AIO event for one of our file descriptors."""
         return self.cycle.on_readable(fileno)
-
-    def setup_native_delayed_delivery(self, connection: Connection, queues: list[str]) -> None:
-        """Set up native delayed delivery (background processing via event loop callback)."""
-        # Delayed delivery is now handled by cycle.maybe_move_ready_delayed_messages
-        # which is registered in register_with_event_loop
-
-    def teardown_native_delayed_delivery(self) -> None:
-        """Tear down native delayed delivery (no-op, event loop handles cleanup)."""

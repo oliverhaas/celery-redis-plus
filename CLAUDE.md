@@ -16,7 +16,7 @@ uv run pytest
 uv run pytest tests/test_transport.py
 
 # Run a specific test
-uv run pytest tests/test_transport.py::TestDelayedDeliveryQueues::test_message_with_long_delay_goes_to_delayed_queue
+uv run pytest tests/test_transport.py::TestDelayedMessageStorage::test_message_with_eta_goes_to_main_queue
 
 # Run linter
 uv run ruff check
@@ -34,12 +34,13 @@ celery-redis-plus is a drop-in replacement Redis transport for Celery that uses:
 - BZMPOP + sorted sets for regular queues (priority support + reliability)
 - Redis Streams with XREAD for fanout exchanges (true broadcast)
 - Native delayed delivery integrated into sorted set scoring
+- Unified requeue mechanism for both delayed and timed-out messages
 
 ### Message Flow
 
-1. **Custom Transport** (`transport.py`): The `Channel._put` method parses the `eta` header (ISO datetime) to compute delay. Messages with long delays (> 60s) go to a separate delayed queue; short delays use timing in the sorted set score
-2. **Two-Queue System**: `{queue}` for immediate/short delays, `{queue}:delayed` for long delays. A background thread moves ready messages from delayed to main queue
-3. **Sorted Set Scoring**: Messages are stored in sorted sets with score = `(255 - priority) × 10¹⁰ + timestamp_ms`. Lower score = higher priority = delivered first
+1. **Custom Transport** (`transport.py`): The `Channel._put` method parses the `eta` header (ISO datetime) to compute delay. All messages go to the main queue with score based on eta timestamp
+2. **Single Queue System**: All messages go to `{queue}` with score = `(255 - priority) × 10¹⁰ + timestamp_ms`. Delayed messages have future timestamps, causing them to be delivered later
+3. **Unified Requeue**: A single Lua script handles both delayed message delivery and visibility timeout restoration via the `messages_index` sorted set
 
 ### Key Components
 
@@ -58,9 +59,16 @@ celery_redis_plus.transport:Transport://localhost:6379/0
 ### Constants
 
 - `PRIORITY_SCORE_MULTIPLIER`: `10¹⁰` - multiplier for priority in score calculation
-- `DEFAULT_VISIBILITY_TIMEOUT`: `300` - seconds before unacked messages are restored
-- `DEFAULT_DELAYED_CHECK_INTERVAL`: `60` - threshold in seconds for routing to delayed queue
-- `DELAYED_QUEUE_SUFFIX`: `":delayed"` - suffix for delayed message queues
+- `DEFAULT_VISIBILITY_TIMEOUT`: `300` - seconds before unacked messages are requeued
+- `DEFAULT_REQUEUE_CHECK_INTERVAL`: `60` - interval for checking messages to requeue
+- `DEFAULT_REQUEUE_BATCH_LIMIT`: `1000` - max messages processed per requeue cycle
+
+### Redis Keys
+
+- `messages`: Hash storing `{delivery_tag: [message, exchange, routing_key]}`
+- `messages_priority`: Hash storing `{delivery_tag: priority}` for requeue scoring
+- `messages_index`: Sorted set storing `{delivery_tag: try_requeue_at}` for requeue timing
+- `{queue}`: Sorted set storing messages with priority+timestamp scores
 
 ## Testing
 
