@@ -894,41 +894,69 @@ class Channel(virtual.Channel):
 
     # Lua script for requeuing messages whose queue_at time has passed.
     # This handles both delayed messages and messages that timed out (not acked).
-    # Uses per-message hashes: message:{tag} with fields: payload, exchange, routing_key, priority
-    # KEYS: [1] = messages_index, [2..n] = queue names
-    # ARGV: [1] = threshold, [2] = batch_limit, [3] = new_queue_at,
-    #       [4] = priority_multiplier, [5] = message_key_prefix
+    # Uses per-message hashes: message:{tag} with fields: payload, routing_key, priority, native_delayed, eta
+    # For native_delayed messages: set native_delayed=0 (first delivery, not a redelivery)
+    # For timed-out messages: set redelivered=1 (message was consumed but not acked)
+    # Reads routing_key from hash to add message to the correct queue.
+    # KEYS: [1] = messages_index
+    # ARGV: [1] = threshold, [2] = batch_limit, [3] = visibility_timeout,
+    #       [4] = priority_multiplier, [5] = message_key_prefix, [6] = global_keyprefix
     # Returns: total number of messages requeued
     _requeue_messages_lua = """
     local messages_index = KEYS[1]
     local threshold = tonumber(ARGV[1])
     local batch_limit = tonumber(ARGV[2])
-    local new_queue_at = tonumber(ARGV[3])
+    local visibility_timeout = tonumber(ARGV[3])
     local priority_multiplier = tonumber(ARGV[4])
     local message_key_prefix = ARGV[5]
+    local global_keyprefix = ARGV[6]
     local total_requeued = 0
+
+    -- Get current time in seconds and milliseconds
+    local time_result = redis.call('TIME')
+    local now_sec = tonumber(time_result[1])
+    local now_ms = now_sec * 1000 + math.floor(tonumber(time_result[2]) / 1000)
 
     -- Get messages ready for requeue (score <= threshold)
     local ready = redis.call('ZRANGEBYSCORE', messages_index, '-inf', threshold, 'LIMIT', 0, batch_limit)
 
     for _, tag in ipairs(ready) do
-        -- Get priority from per-message hash
-        local message_key = message_key_prefix .. tag
+        -- Build prefixed message key
+        local message_key = global_keyprefix .. message_key_prefix .. tag
+
+        -- Get fields from per-message hash
         local priority = redis.call('HGET', message_key, 'priority')
         if priority then
             priority = tonumber(priority)
-            -- Calculate queue score: (255 - priority) * multiplier + current_time_ms
-            local now_ms = redis.call('TIME')
-            now_ms = tonumber(now_ms[1]) * 1000 + math.floor(tonumber(now_ms[2]) / 1000)
-            local queue_score = (255 - priority) * priority_multiplier + now_ms
+            local routing_key = redis.call('HGET', message_key, 'routing_key')
+            local eta = redis.call('HGET', message_key, 'eta')
+            eta = eta and tonumber(eta) or 0
 
-            -- Try to add to each queue (NX = only if not exists)
-            for i = 2, #KEYS do
-                local queue = KEYS[i]
-                redis.call('ZADD', queue, 'NX', queue_score, tag)
+            -- Calculate queue score using eta if it's in the future, else use now
+            local score_time_ms
+            if eta > 0 and eta * 1000 > now_ms then
+                score_time_ms = eta * 1000
+            else
+                score_time_ms = now_ms
+            end
+            local queue_score = (255 - priority) * priority_multiplier + score_time_ms
+
+            -- Check if this is a native delayed message (first delivery) or a timed-out message (redelivery)
+            local native_delayed = redis.call('HGET', message_key, 'native_delayed')
+            if native_delayed and tonumber(native_delayed) == 1 then
+                -- Native delayed message: clear the flag (this is the first delivery)
+                redis.call('HSET', message_key, 'native_delayed', '0')
+            else
+                -- Timed-out message: mark as redelivered
+                redis.call('HSET', message_key, 'redelivered', '1')
             end
 
-            -- Update queue_at for next cycle
+            -- Add to the message's queue (with global prefix)
+            local queue_key = global_keyprefix .. routing_key
+            redis.call('ZADD', queue_key, 'NX', queue_score, tag)
+
+            -- Update queue_at for next cycle (now + visibility_timeout)
+            local new_queue_at = now_sec + visibility_timeout
             redis.call('ZADD', messages_index, new_queue_at, tag)
             total_requeued = total_requeued + 1
         else
@@ -944,18 +972,19 @@ class Channel(virtual.Channel):
     # Sets redelivered=1 and adds to queue with appropriate score.
     # Uses routing_key from the hash as the queue name.
     # KEYS: [1] = message_key
-    # ARGV: [1] = leftmost (1 or 0), [2] = priority_multiplier, [3] = message_ttl
+    # ARGV: [1] = leftmost (1 or 0), [2] = priority_multiplier, [3] = message_ttl, [4] = global_keyprefix
     # Returns: 1 if restored, 0 if message not found
     _restore_message_lua = """
     local message_key = KEYS[1]
     local leftmost = tonumber(ARGV[1]) == 1
     local priority_multiplier = tonumber(ARGV[2])
     local message_ttl = tonumber(ARGV[3])
+    local global_keyprefix = ARGV[4]
 
     -- Get priority and routing_key (queue) from hash
     local priority = redis.call('HGET', message_key, 'priority')
-    local queue = redis.call('HGET', message_key, 'routing_key')
-    if not priority or not queue then
+    local routing_key = redis.call('HGET', message_key, 'routing_key')
+    if not priority or not routing_key then
         return 0
     end
 
@@ -974,9 +1003,10 @@ class Channel(virtual.Channel):
         score = (255 - priority) * priority_multiplier + now_ms
     end
 
-    -- Add to queue (routing_key is the queue name)
+    -- Add to queue (routing_key with global prefix)
+    local queue_key = global_keyprefix .. routing_key
     local tag = string.match(message_key, ':(.+)$')
-    redis.call('ZADD', queue, score, tag)
+    redis.call('ZADD', queue_key, score, tag)
 
     return 1
     """
@@ -989,33 +1019,30 @@ class Channel(virtual.Channel):
         - Messages that were consumed but not acked (lost/timed out)
 
         Uses ZADD NX to avoid re-adding messages that are already in the queue.
-        Updates messages_index to schedule the next queue attempt.
+        The Lua script reads routing_key from each message's hash to add it to the
+        correct queue, and calculates new_queue_at = now + visibility_timeout.
 
         Returns:
             Number of messages requeued.
         """
-        if not self.active_queues:
-            return 0
-
         now = time()
         # Check messages that will need requeuing by next interval
         threshold = now + DEFAULT_REQUEUE_CHECK_INTERVAL
-        # Next queue attempt if message still not acked
-        new_queue_at = now + self.visibility_timeout
-        queues = list(self.active_queues)
 
         with self.conn_or_acquire() as client:
             requeue_script = client.register_script(self._requeue_messages_lua)
 
-            keys = [self.messages_index_key, *queues]
+            # Only pass messages_index as a key; routing_key is read from each message's hash
+            keys = [self.messages_index_key]
             total_requeued = requeue_script(
                 keys=keys,
                 args=[
                     threshold,
                     DEFAULT_REQUEUE_BATCH_LIMIT,
-                    new_queue_at,
+                    self.visibility_timeout,
                     PRIORITY_SCORE_MULTIPLIER,
                     self.message_key_prefix,
+                    self.global_keyprefix,
                 ],
             )
 
@@ -1046,7 +1073,7 @@ class Channel(virtual.Channel):
             restore_script = client.register_script(self._restore_message_lua)
             result = restore_script(
                 keys=[message_key],
-                args=[1 if leftmost else 0, PRIORITY_SCORE_MULTIPLIER, self.message_ttl],
+                args=[1 if leftmost else 0, PRIORITY_SCORE_MULTIPLIER, self.message_ttl, self.global_keyprefix],
             )
             return bool(result)
 
@@ -1096,6 +1123,7 @@ class Channel(virtual.Channel):
                     "priority": priority,
                     "redelivered": 0,
                     "native_delayed": 1 if is_native_delayed else 0,
+                    "eta": eta_timestamp if eta_timestamp else 0,
                 },
             )
             pipe.expire(message_key, self.message_ttl)

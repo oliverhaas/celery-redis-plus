@@ -287,38 +287,63 @@ Messages have a "visibility timeout" - if not acked within this time, they're co
 
 ### 5.2 Lua Script for Atomic Requeue
 
-The Lua script (`transport.py:972-1011`) handles both delayed messages and visibility timeout restoration:
+The Lua script (`transport.py:905-968`) handles both delayed messages and visibility timeout restoration:
 
 ```lua
 local messages_index = KEYS[1]
 local threshold = tonumber(ARGV[1])
 local batch_limit = tonumber(ARGV[2])
-local new_queue_at = tonumber(ARGV[3])
+local visibility_timeout = tonumber(ARGV[3])
 local priority_multiplier = tonumber(ARGV[4])
 local message_key_prefix = ARGV[5]
+local global_keyprefix = ARGV[6]
 local total_requeued = 0
+
+-- Get current time in seconds and milliseconds
+local time_result = redis.call('TIME')
+local now_sec = tonumber(time_result[1])
+local now_ms = now_sec * 1000 + math.floor(tonumber(time_result[2]) / 1000)
 
 -- Get messages ready for requeue (score <= threshold)
 local ready = redis.call('ZRANGEBYSCORE', messages_index, '-inf', threshold, 'LIMIT', 0, batch_limit)
 
 for _, tag in ipairs(ready) do
-    -- Get priority from per-message hash
-    local message_key = message_key_prefix .. tag
+    -- Build prefixed message key
+    local message_key = global_keyprefix .. message_key_prefix .. tag
+
+    -- Get fields from per-message hash
     local priority = redis.call('HGET', message_key, 'priority')
     if priority then
         priority = tonumber(priority)
-        -- Calculate queue score: (255 - priority) * multiplier + current_time_ms
-        local now_ms = redis.call('TIME')
-        now_ms = tonumber(now_ms[1]) * 1000 + math.floor(tonumber(now_ms[2]) / 1000)
-        local queue_score = (255 - priority) * priority_multiplier + now_ms
+        local routing_key = redis.call('HGET', message_key, 'routing_key')
+        local eta = redis.call('HGET', message_key, 'eta')
+        eta = eta and tonumber(eta) or 0
 
-        -- Try to add to each queue (NX = only if not exists)
-        for i = 2, #KEYS do
-            local queue = KEYS[i]
-            redis.call('ZADD', queue, 'NX', queue_score, tag)
+        -- Calculate queue score using eta if it's in the future, else use now
+        local score_time_ms
+        if eta > 0 and eta * 1000 > now_ms then
+            score_time_ms = eta * 1000
+        else
+            score_time_ms = now_ms
+        end
+        local queue_score = (255 - priority) * priority_multiplier + score_time_ms
+
+        -- Check if this is a native delayed message (first delivery) or a timed-out message (redelivery)
+        local native_delayed = redis.call('HGET', message_key, 'native_delayed')
+        if native_delayed and tonumber(native_delayed) == 1 then
+            -- Native delayed message: clear the flag (this is the first delivery)
+            redis.call('HSET', message_key, 'native_delayed', '0')
+        else
+            -- Timed-out message: mark as redelivered
+            redis.call('HSET', message_key, 'redelivered', '1')
         end
 
-        -- Update queue_at for next cycle
+        -- Add to the message's queue (with global prefix)
+        local queue_key = global_keyprefix .. routing_key
+        redis.call('ZADD', queue_key, 'NX', queue_score, tag)
+
+        -- Update queue_at for next cycle (now + visibility_timeout)
+        local new_queue_at = now_sec + visibility_timeout
         redis.call('ZADD', messages_index, new_queue_at, tag)
         total_requeued = total_requeued + 1
     else
@@ -333,16 +358,19 @@ return total_requeued
 This ensures:
 - Atomic batch processing (no race conditions)
 - ZADD NX prevents duplicate enqueues (message already in queue stays untouched)
-- Both delayed messages and timed-out messages are handled uniformly
+- Native delayed messages have `native_delayed` flag cleared on first delivery (not marked as redelivered)
+- Timed-out messages are marked with `redelivered=1`
+- Uses stored `eta` for queue score calculation when the eta is in the future
+- Reads `routing_key` from hash to add message to the correct queue
 - Batch limit of 1000 messages per cycle (DEFAULT_REQUEUE_BATCH_LIMIT)
 
 ### 5.3 Restore by Tag (Lua Script)
 
-When a specific message needs restoration, a Lua script atomically:
+When a specific message needs restoration (e.g., on reject with requeue), a Lua script atomically:
 1. Reads `priority` and `routing_key` (queue) from the per-message hash
 2. Sets `redelivered=1` in the hash
 3. Refreshes the TTL
-4. Adds the message back to the queue with appropriate score
+4. Adds the message back to the queue with appropriate score (using global key prefix)
 
 ```lua
 -- _restore_message_lua
@@ -350,11 +378,12 @@ local message_key = KEYS[1]
 local leftmost = tonumber(ARGV[1]) == 1
 local priority_multiplier = tonumber(ARGV[2])
 local message_ttl = tonumber(ARGV[3])
+local global_keyprefix = ARGV[4]
 
 -- Get priority and routing_key (queue) from hash
 local priority = redis.call('HGET', message_key, 'priority')
-local queue = redis.call('HGET', message_key, 'routing_key')
-if not priority or not queue then
+local routing_key = redis.call('HGET', message_key, 'routing_key')
+if not priority or not routing_key then
     return 0
 end
 
@@ -373,9 +402,10 @@ else
     score = (255 - priority) * priority_multiplier + now_ms
 end
 
--- Add to queue (routing_key is the queue name)
+-- Add to queue (routing_key with global prefix)
+local queue_key = global_keyprefix .. routing_key
 local tag = string.match(message_key, ':(.+)$')
-redis.call('ZADD', queue, score, tag)
+redis.call('ZADD', queue_key, score, tag)
 
 return 1
 ```
@@ -393,7 +423,7 @@ The `redelivered` field in the hash is stored for debugging purposes only.
 | **health_check_interval** | `25` (sec) | Redis connection health check interval |
 | **stream_maxlen** | `10000` | Maximum fanout stream length (approximate) |
 | **max_connections** | `10` | Redis connection pool size |
-| **polling_interval** | `1` (sec) | Timeout for blocking BZMPOP/XREAD |
+| **polling_interval** | `10` (sec) | Timeout for blocking BZMPOP/XREAD |
 | **global_keyprefix** | `""` | Prefix for all Redis keys |
 | **fanout_prefix** | `True` | Use `/{db}.` prefix for fanout streams |
 | **fanout_patterns** | `True` | Include routing_key in stream keys |
@@ -417,7 +447,7 @@ The `redelivered` field in the hash is stored for debugging purposes only.
 
 | Key | Purpose |
 |-----|---------|
-| `{prefix}message:{delivery_tag}` | Hash: `{payload, routing_key, priority, redelivered, delayed}` with TTL |
+| `{prefix}message:{delivery_tag}` | Hash: `{payload, routing_key, priority, redelivered, native_delayed, eta}` with TTL |
 | `{prefix}messages_index` | Sorted set: `{delivery_tag: queue_at}` |
 | `{prefix}{queue}` | Sorted set: main queue with priority+timestamp scores |
 | `{prefix}_kombu.binding.{exchange}` | Set: exchange bindings |

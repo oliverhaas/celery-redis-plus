@@ -499,11 +499,12 @@ class TestChannel:
         queue_at = list(score_dict.values())[0]
         assert before + delay_seconds <= queue_at <= after + delay_seconds
 
-        # Verify per-message hash is stored with native_delayed=1
+        # Verify per-message hash is stored with native_delayed=1 and eta
         hset_call = mock_pipe.hset.call_args
         mapping = hset_call.kwargs.get("mapping", {})
         assert "priority" in mapping
         assert mapping.get("native_delayed") == 1
+        assert mapping.get("eta") == eta_timestamp
 
     def test_put_with_short_delay_goes_to_main_queue(self) -> None:
         """Test that messages with short delay go to main queue with future timestamp score."""
@@ -560,6 +561,12 @@ class TestChannel:
         expected_max = _queue_score(0, after)
         assert expected_min <= score <= expected_max
 
+        # Verify native_delayed=0 (short delay) but eta is still stored
+        hset_call = mock_pipe.hset.call_args
+        mapping = hset_call.kwargs.get("mapping", {})
+        assert mapping.get("native_delayed") == 0
+        assert mapping.get("eta") == eta_timestamp
+
     def test_put_with_no_eta(self) -> None:
         """Test that no eta means immediate delivery (no delay)."""
 
@@ -604,6 +611,12 @@ class TestChannel:
         expected_min = 255 * PRIORITY_SCORE_MULTIPLIER + int(before * 1000)
         expected_max = 255 * PRIORITY_SCORE_MULTIPLIER + int(after * 1000)
         assert expected_min <= score <= expected_max
+
+        # Verify native_delayed=0 and eta=0 (no eta provided)
+        hset_call = mock_pipe.hset.call_args
+        mapping = hset_call.kwargs.get("mapping", {})
+        assert mapping.get("native_delayed") == 0
+        assert mapping.get("eta") == 0
 
     def test_put_with_eta_in_past_treated_as_immediate(self) -> None:
         """Test that eta in the past is treated as immediate delivery."""
@@ -3048,8 +3061,8 @@ class TestPollingInterval:
     """Tests for polling_interval setting."""
 
     def test_transport_default_polling_interval(self) -> None:
-        """Test Transport default polling_interval is 1."""
-        assert Transport.polling_interval == 1
+        """Test Transport default polling_interval is 10."""
+        assert Transport.polling_interval == 10
 
 
 @pytest.mark.unit
