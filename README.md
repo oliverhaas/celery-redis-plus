@@ -2,6 +2,8 @@
 
 Enhanced Redis transport for Celery with improved reliability, priority support, and native delayed delivery.
 
+This repo is supposed to be a testing ground for all the improvements for the Celery/Kombu Redis transport I could think of, and a temporary solution until this hopefully gets merged upstream.
+
 ## Overview
 
 `celery-redis-plus` provides a drop-in replacement Redis transport for Celery that addresses three key limitations of the standard Redis transport:

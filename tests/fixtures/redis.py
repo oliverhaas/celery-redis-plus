@@ -1,9 +1,9 @@
-"""Pytest fixtures for celery-redis-plus tests."""
+"""Redis/Valkey test fixtures."""
 
 from __future__ import annotations
 
 from collections.abc import Generator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from testcontainers.core.container import DockerContainer
@@ -53,3 +53,12 @@ def redis_client(redis_container: tuple[str, int, str]) -> Generator[Redis]:
     yield client
     client.flushall()
     client.close()
+
+
+@pytest.fixture
+def clear_redis(redis_client: Any) -> None:
+    """Clear Redis database before each test.
+
+    This fixture ensures tests start with a clean state.
+    """
+    redis_client.flushdb()

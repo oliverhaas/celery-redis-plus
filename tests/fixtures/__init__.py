@@ -1,19 +1,14 @@
-"""Pytest configuration for celery-redis-plus tests."""
+"""Test fixtures for celery-redis-plus."""
 
-from __future__ import annotations
-
-# Re-export fixtures from fixtures package
-from tests.fixtures import (
+from tests.fixtures.celery import (
     celery_app,
     celery_config,
     celery_includes,
     celery_worker,
     cleanup_async_results,
     clear_kombu_global_event_loop,
-    clear_redis,
-    redis_client,
-    redis_container,
 )
+from tests.fixtures.redis import clear_redis, redis_client, redis_container
 
 __all__ = [
     "celery_app",
@@ -26,6 +21,3 @@ __all__ = [
     "redis_client",
     "redis_container",
 ]
-
-# Enable celery.contrib.pytest plugin for celery_app and celery_worker fixtures
-pytest_plugins = ("celery.contrib.pytest",)

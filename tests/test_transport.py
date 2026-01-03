@@ -3110,3 +3110,269 @@ class TestPoolDisconnect:
             # Pools should be cleared
             assert channel._pool is None
             assert channel._async_pool is None
+
+
+# =============================================================================
+# Production-like Parametrized Integration Tests
+# =============================================================================
+
+
+@pytest.mark.integration
+class TestProductionWorkloads:
+    """Production-like integration tests with heavy parametrization.
+
+    These tests exercise the transport with realistic task patterns,
+    covering immediate, delayed, priority, retry, and error scenarios.
+    """
+
+    @pytest.mark.parametrize(
+        ("task_type", "task_kwargs", "expected_result", "min_delay", "max_delay"),
+        [
+            # Immediate tasks - no delay
+            pytest.param("immediate", {}, 42, 0.0, 2.0, id="immediate-simple"),
+            pytest.param("immediate", {"priority": 9}, 42, 0.0, 2.0, id="immediate-high-priority"),
+            pytest.param("immediate", {"priority": 0}, 42, 0.0, 2.0, id="immediate-low-priority"),
+            # Short countdown (Celery handles via eta, not native delayed)
+            pytest.param("countdown", {"countdown": 1}, 42, 0.9, 3.0, id="countdown-1s"),
+            pytest.param("countdown", {"countdown": 2}, 42, 1.9, 4.0, id="countdown-2s"),
+            # ETA-based delays
+            pytest.param("eta", {"eta_seconds": 1}, 42, 0.9, 3.0, id="eta-1s"),
+            pytest.param("eta", {"eta_seconds": 2}, 42, 1.9, 4.0, id="eta-2s"),
+            # Priority combinations with countdown
+            pytest.param("countdown", {"countdown": 1, "priority": 9}, 42, 0.9, 3.0, id="countdown-1s-high-priority"),
+            pytest.param("countdown", {"countdown": 1, "priority": 0}, 42, 0.9, 3.0, id="countdown-1s-low-priority"),
+        ],
+    )
+    def test_task_execution(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+        task_type: str,
+        task_kwargs: dict[str, Any],
+        expected_result: int,
+        min_delay: float,
+        max_delay: float,
+    ) -> None:
+        """Test task execution with various configurations."""
+
+        @celery_app.task
+        def compute() -> int:
+            return 42
+
+        celery_worker.reload()
+        start = time.time()
+
+        # Build apply_async kwargs based on task type
+        apply_kwargs: dict[str, Any] = {}
+
+        if "priority" in task_kwargs:
+            apply_kwargs["priority"] = task_kwargs["priority"]
+
+        if task_type == "countdown":
+            apply_kwargs["countdown"] = task_kwargs["countdown"]
+        elif task_type == "eta":
+            eta = datetime.now(UTC) + timedelta(seconds=task_kwargs["eta_seconds"])
+            apply_kwargs["eta"] = eta
+
+        result = compute.apply_async(**apply_kwargs)
+        value = result.get(timeout=30)
+        elapsed = time.time() - start
+
+        assert value == expected_result
+        assert elapsed >= min_delay, f"Task completed too fast: {elapsed:.2f}s < {min_delay}s"
+        assert elapsed <= max_delay, f"Task took too long: {elapsed:.2f}s > {max_delay}s"
+
+    @pytest.mark.parametrize(
+        ("num_tasks", "priority_distribution"),
+        [
+            pytest.param(5, "uniform", id="5-tasks-uniform"),
+            pytest.param(10, "uniform", id="10-tasks-uniform"),
+            pytest.param(5, "mixed", id="5-tasks-mixed-priority"),
+            pytest.param(10, "mixed", id="10-tasks-mixed-priority"),
+            pytest.param(20, "uniform", id="20-tasks-uniform"),
+        ],
+    )
+    def test_concurrent_task_batch(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+        num_tasks: int,
+        priority_distribution: str,
+    ) -> None:
+        """Test concurrent execution of multiple tasks."""
+
+        @celery_app.task
+        def multiply(x: int, y: int) -> int:
+            return x * y
+
+        celery_worker.reload()
+
+        results = []
+        for i in range(num_tasks):
+            kwargs: dict[str, Any] = {"args": (i, 2)}
+            if priority_distribution == "mixed":
+                # Alternate between low (0), medium (5), and high (9) priority
+                kwargs["priority"] = [0, 5, 9][i % 3]
+            results.append(multiply.apply_async(**kwargs))
+
+        # All should complete correctly
+        values = [r.get(timeout=60) for r in results]
+        expected = [i * 2 for i in range(num_tasks)]
+        assert sorted(values) == expected
+
+    @pytest.mark.parametrize(
+        ("max_retries", "succeed_on_attempt"),
+        [
+            pytest.param(1, 1, id="succeed-first-try"),
+            pytest.param(2, 2, id="succeed-second-try"),
+            pytest.param(3, 3, id="succeed-third-try"),
+            pytest.param(3, 2, id="retry-once-then-succeed"),
+        ],
+    )
+    def test_task_retry_scenarios(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+        max_retries: int,
+        succeed_on_attempt: int,
+    ) -> None:
+        """Test task retry behavior with various retry configurations."""
+        attempt_counter = {"count": 0}
+
+        @celery_app.task(bind=True, max_retries=max_retries, default_retry_delay=1)
+        def retrying_task(self: Any, succeed_on: int) -> str:
+            attempt_counter["count"] += 1
+            if attempt_counter["count"] < succeed_on:
+                raise self.retry()
+            return f"success-{attempt_counter['count']}"
+
+        celery_worker.reload()
+        attempt_counter["count"] = 0
+
+        result = retrying_task.delay(succeed_on_attempt)
+        value = result.get(timeout=30)
+
+        assert value == f"success-{succeed_on_attempt}"
+        assert attempt_counter["count"] == succeed_on_attempt
+
+    @pytest.mark.parametrize(
+        ("exception_type", "exception_msg"),
+        [
+            pytest.param(ValueError, "value error", id="ValueError"),
+            pytest.param(RuntimeError, "runtime error", id="RuntimeError"),
+            pytest.param(TypeError, "type error", id="TypeError"),
+            pytest.param(KeyError, "missing key", id="KeyError"),
+        ],
+    )
+    def test_task_exception_propagation(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+        exception_type: type[Exception],
+        exception_msg: str,
+    ) -> None:
+        """Test that various exception types are properly propagated."""
+
+        @celery_app.task
+        def failing_task(exc_type: str, msg: str) -> None:
+            exc_class = {
+                "ValueError": ValueError,
+                "RuntimeError": RuntimeError,
+                "TypeError": TypeError,
+                "KeyError": KeyError,
+            }[exc_type]
+            raise exc_class(msg)
+
+        celery_worker.reload()
+
+        result = failing_task.delay(exception_type.__name__, exception_msg)
+
+        with pytest.raises(exception_type, match=exception_msg):
+            result.get(timeout=10)
+
+    @pytest.mark.parametrize(
+        "task_config",
+        [
+            pytest.param({"ignore_result": True}, id="ignore-result"),
+            pytest.param({"ignore_result": False}, id="track-result"),
+            pytest.param({"acks_late": True}, id="acks-late"),
+            pytest.param({"acks_late": False}, id="acks-early"),
+        ],
+    )
+    def test_task_configuration_options(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+        task_config: dict[str, Any],
+    ) -> None:
+        """Test various task configuration options."""
+        executed = {"flag": False}
+
+        @celery_app.task(**task_config)
+        def configurable_task() -> str:
+            executed["flag"] = True
+            return "done"
+
+        celery_worker.reload()
+        executed["flag"] = False
+
+        result = configurable_task.delay()
+
+        if task_config.get("ignore_result"):
+            # For ignore_result, just wait a bit and check execution
+            time.sleep(1)
+            assert executed["flag"] is True
+        else:
+            value = result.get(timeout=10)
+            assert value == "done"
+            assert executed["flag"] is True
+
+    @pytest.mark.parametrize(
+        "arg_style",
+        [
+            pytest.param("positional", id="positional-args"),
+            pytest.param("keyword", id="keyword-args"),
+            pytest.param("mixed", id="mixed-args"),
+        ],
+    )
+    def test_task_argument_styles(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+        arg_style: str,
+    ) -> None:
+        """Test different ways of passing arguments to tasks."""
+
+        @celery_app.task
+        def greet(name: str, greeting: str = "Hello", punctuation: str = "!") -> str:
+            return f"{greeting}, {name}{punctuation}"
+
+        celery_worker.reload()
+
+        if arg_style == "positional":
+            result = greet.delay("World", "Hi", "?")
+        elif arg_style == "keyword":
+            result = greet.apply_async(kwargs={"name": "World", "greeting": "Hi", "punctuation": "?"})
+        else:  # mixed
+            result = greet.apply_async(args=("World",), kwargs={"greeting": "Hi", "punctuation": "?"})
+
+        value = result.get(timeout=10)
+        assert value == "Hi, World?"
+
+    def test_queue_routing(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test task routing to default queue."""
+
+        @celery_app.task
+        def routed_task() -> str:
+            return "processed"
+
+        celery_worker.reload()
+
+        # Test routing to default queue (worker consumes from 'celery' by default)
+        result = routed_task.apply_async(queue="celery")
+        value = result.get(timeout=10)
+        assert value == "processed"
