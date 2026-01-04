@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -10,6 +9,8 @@ from testcontainers.core.container import DockerContainer
 from testcontainers.core.waiting_utils import wait_for_logs
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from redis import Redis
 
 
