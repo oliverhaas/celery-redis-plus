@@ -3060,9 +3060,13 @@ class TestBzmpopEdgeCases:
 class TestPollingInterval:
     """Tests for polling_interval setting."""
 
-    def test_transport_default_polling_interval(self) -> None:
-        """Test Transport default polling_interval is 10."""
-        assert Transport.polling_interval == 10
+    def test_transport_polling_interval_patched_for_tests(self) -> None:
+        """Test Transport polling_interval is patched to 1 for faster tests.
+
+        Note: The default is 10s, but pytest_configure patches it to 1s
+        for faster worker shutdown during tests.
+        """
+        assert Transport.polling_interval == 1
 
 
 @pytest.mark.unit
