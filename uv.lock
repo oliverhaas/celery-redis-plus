@@ -45,7 +45,7 @@ wheels = [
 
 [[package]]
 name = "celery-redis-plus"
-version = "0.1.0a5"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "celery" },
