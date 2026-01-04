@@ -1,7 +1,7 @@
 [project]
 name = "celery-redis-plus"
 version = "0.1.0a5"
-description = "Enhanced Redis transport for Celery with priority support and reliable fanout"
+description = "Enhanced Kombu Redis transport for Celery"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
@@ -44,84 +44,78 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 explicit-preview-rules = true
 fixable = ["ALL"]
 ignore = [
-  # flake8-annotations (ANN) - Type annotations
-  "ANN201", # INTENTIONAL: Missing return type - context managers and complex returns
-  "ANN401", # INTENTIONAL: Any needed for untyped external APIs (Celery, Kombu)
+  # Type annotations - Any needed for untyped Celery/Kombu APIs
+  "ANN401",
 
-  # flake8-unused-arguments (ARG) - Unused arguments
-  "ARG001", # INTENTIONAL: Too many false positives, unused-function-argument.
-  "ARG002", # INTENTIONAL: Too many false positives, unused-method-argument.
+  # Unused arguments - signal handlers and overrides have required signatures
+  "ARG001",
+  "ARG002",
 
-  # mccabe (C901) - Complexity
-  "C901", # INTENTIONAL: Some functions are inherently complex (connection params, etc.)
+  # Complexity - some functions are inherently complex
+  "C901",
 
-  # flake8-commas (COM)
-  "COM812", # INTENTIONAL: Can cause problems in combination with ruff-format
+  # Conflicts with ruff-format
+  "COM812",
 
-  # pydocstyle (D) - Documentation
-  "D", # INTENTIONAL: Too extensive, even if only partially enabled
+  # Docstring rules are too extensive
+  "D",
 
-  # pycodestyle (E5) - Line too long and similar
-  "E5", # INTENTIONAL: Line length violations - 120 char limit is sufficient
+  # Line length - 120 char limit is sufficient
+  "E5",
 
-  # flake8-errmsg (EM) - Error message patterns
-  "EM101", # INTENTIONAL: raw-string-in-exception - opinionated readability change not needed
-  "EM102", # INTENTIONAL: f-string-in-exception - opinionated readability change not needed
+  # Exception message patterns - extracting to variables hurts readability
+  "EM101",
+  "EM102",
 
-  # eradicate (ERA) - Commented-out code
-  "ERA001", # INTENTIONAL: Formula comments are documentation, not dead code
+  # Formula comments are documentation, not dead code
+  "ERA001",
 
-  # flake8-future-annotations (FA) - Future annotations
-  "FA", # INTENTIONAL: We prefer to stay with the current Python version.
+  # We use current Python version annotations
+  "FA",
 
-  # flake8-boolean-trap (FBT) - Boolean traps
-  "FBT001", # INTENTIONAL: boolean-type-hint-positional-argument - too many violations across patterns
-  "FBT002", # INTENTIONAL: boolean-default-value-positional-argument - breaks compatibility
+  # Boolean traps - too many violations, breaks compatibility
+  "FBT001",
+  "FBT002",
 
-  # pep8-naming (N) - Naming conventions
-  "N802", # INTENTIONAL: Function names follow kombu conventions (get_redis_ConnectionError, Mutex)
-  "N806", # INTENTIONAL: Variable names follow kombu conventions (DataError)
-  "N818", # INTENTIONAL: Exception names follow kombu conventions (MutexHeld)
+  # Naming follows kombu conventions
+  "N802",
+  "N806",
 
-  # pylint (PLC) - Pylint conventions
-  "PLC0415", # INTENTIONAL: import-outside-top-level - needed for optional dependencies
+  # Lazy imports for optional dependencies
+  "PLC0415",
 
-  # pylint (PLR) - Pylint refactor
-  "PLR0913", # INTENTIONAL: too-many-arguments - signal handlers have many args
-  "PLR1704", # INTENTIONAL: Redefining argument in context manager is intentional pattern
-  "PLR2004", # INTENTIONAL: magic-value-comparison - test values are fine
+  # Pylint refactor rules
+  "PLR0913", # Too many arguments - test fixtures
+  "PLR1704", # Redefining argument in context manager
+  "PLR2004", # Magic values in tests are fine
 
-  # flake8-pyi (PYI) - Type stub issues
-  "PYI024", # INTENTIONAL: namedtuple usage follows kombu patterns
+  # namedtuple usage follows kombu patterns
+  "PYI024",
 
-  # flake8-raise (RSE) - Raise issues
-  "RSE102", # INTENTIONAL: Empty() parentheses are clearer
+  # Empty() parentheses are clearer
+  "RSE102",
 
-  # Ruff-specific (RUF)
-  "RUF005", # INTENTIONAL: Tuple concatenation is clearer in error_classes_t
-  "RUF012", # INTENTIONAL: Too many false positives
-  "RUF015", # INTENTIONAL: unnecessary-iterable-allocation-for-first-element - readability
-  "RUF059", # INTENTIONAL: Keep variable as unused
+  # Ruff-specific
+  "RUF005", # Tuple concatenation is clearer
+  "RUF012", # False positives with class variables
+  "RUF015", # Readability over micro-optimization
+  "RUF059", # Keep unused variables explicit
 
-  # flake8-blind-except (BLE)
-  "BLE001", # INTENTIONAL: Broad exception catching needed for message recovery
+  # assert needed for tests
+  "S101",
 
-  # flake8-bandit (S) - Security
-  "S101", # INTENTIONAL: assert - needed for tests and type narrowing
+  # Nested ifs and try/except/pass are clearer in some cases
+  "SIM102",
+  "SIM105",
 
-  # flake8-simplify (SIM) - Simplify
-  "SIM102", # INTENTIONAL: Nested if statements are clearer in poll loops
-  "SIM105", # INTENTIONAL: try/except/pass is clearer than contextlib.suppress for specific cases
+  # Private member access needed for testing
+  "SLF001",
 
-  # flake8-self (SLF) - Private member access
-  "SLF001", # INTENTIONAL: private-member-access - needed for testing internals
+  # Prefer explicit imports over TYPE_CHECKING blocks
+  "TC003",
 
-  # flake8-type-checking (TC)
-  "TC003", # INTENTIONAL: move-stdlib-import - prefer explicit imports
-  "TC005", # INTENTIONAL: empty-type-checking-block - sometimes needed for structure
-
-  # tryceratops (TRY) - Exception handling
-  "TRY003", # INTENTIONAL: raise-vanilla-args - long exception messages are fine
+  # Long exception messages are fine
+  "TRY003",
 ]
 preview = true
 select = ["ALL", "UP045"]
@@ -135,7 +129,6 @@ markers = [
 ]
 
 [tool.coverage.run]
-# Enable thread-based concurrency measurement for Celery worker tests
 concurrency = ["thread"]
 branch = true
 source = ["celery_redis_plus"]

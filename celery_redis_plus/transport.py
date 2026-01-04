@@ -41,6 +41,9 @@ from queue import Empty
 from time import time
 from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
 from kombu.exceptions import InconsistencyError, VersionMismatch
 from kombu.log import get_logger
 from kombu.transport import virtual
@@ -316,7 +319,7 @@ class QoS(virtual.QoS):
             super().ack(delivery_tag)
 
     @contextmanager
-    def pipe_or_acquire(self, pipe: Any = None, client: Any = None):
+    def pipe_or_acquire(self, pipe: Any = None, client: Any = None) -> Generator[Any]:
         if pipe:
             yield pipe
         else:
@@ -1230,7 +1233,7 @@ class Channel(virtual.Channel):
         return redis.Redis
 
     @contextmanager
-    def conn_or_acquire(self, client: Any = None):
+    def conn_or_acquire(self, client: Any = None) -> Generator[Any]:
         if client:
             yield client
         else:
