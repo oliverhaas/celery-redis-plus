@@ -44,25 +44,34 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Check if tag exists for current version
+      - name: Check version status
         id: version
         run: |
           # Get current version
           CURRENT_VERSION=$(grep -m1 'version = ' pyproject.toml | cut -d'"' -f2)
           echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
 
+          # Check if version is already published on PyPI
+          if curl -s "https://pypi.org/pypi/celery-redis-plus/$CURRENT_VERSION/json" | grep -q '"version"'; then
+            echo "on_pypi=true" >> $GITHUB_OUTPUT
+            echo "Version $CURRENT_VERSION already published on PyPI"
+          else
+            echo "on_pypi=false" >> $GITHUB_OUTPUT
+            echo "Version $CURRENT_VERSION not on PyPI"
+          fi
+
           # Check if tag already exists (fetch tags first)
           git fetch --tags
           if git rev-parse "v$CURRENT_VERSION" >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
             echo "Tag v$CURRENT_VERSION already exists"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "Tag v$CURRENT_VERSION does not exist, will create"
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+            echo "Tag v$CURRENT_VERSION does not exist"
           fi
 
       - name: Create and push tag
-        if: steps.version.outputs.exists == 'false'
+        if: steps.version.outputs.on_pypi == 'false' && steps.version.outputs.tag_exists == 'false'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -70,7 +79,7 @@ jobs:
           git push origin "v${{ steps.version.outputs.current }}"
 
       - name: Trigger publish workflow
-        if: steps.version.outputs.exists == 'false'
+        if: steps.version.outputs.on_pypi == 'false'
         run: gh workflow run publish.yml -f version=${{ steps.version.outputs.current }}
         env:
           GH_TOKEN: ${{ github.token }}
