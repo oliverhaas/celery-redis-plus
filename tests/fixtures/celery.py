@@ -3,14 +3,8 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import patch
 
 import pytest
-
-# Patch polling_interval to 1 second for faster test teardown
-# The default 10-second BZMPOP timeout causes slow worker shutdown
-_FAST_POLLING_PATCH = patch("celery_redis_plus.transport.Transport.polling_interval", 1)
-_FAST_POLLING_PATCH.start()
 
 
 @pytest.fixture
