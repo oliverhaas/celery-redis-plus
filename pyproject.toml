@@ -108,7 +108,7 @@ ignore = [
   "SIM102",
   "SIM105",
 
-  # Private member access needed for testing
+  # Private member access needed for kombu/redis-py internals
   "SLF001",
 
   # Prefer explicit imports over TYPE_CHECKING blocks
@@ -120,6 +120,11 @@ ignore = [
 preview = true
 select = ["ALL", "UP045"]
 unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+  "S101", # assert in tests
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
