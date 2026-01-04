@@ -35,11 +35,11 @@ import numbers
 import socket as socket_module
 import uuid
 from collections import namedtuple
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from queue import Empty
 from time import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -156,7 +156,7 @@ class GlobalKeyPrefixMixin:
 
     global_keyprefix: str = ""
 
-    PREFIXED_SIMPLE_COMMANDS = [
+    PREFIXED_SIMPLE_COMMANDS: ClassVar[list[str]] = [
         "HDEL",
         "HGET",
         "HSET",
@@ -206,7 +206,7 @@ class GlobalKeyPrefixMixin:
             return args[: streams_idx + 1] + prefixed_keys + stream_ids
         return args
 
-    PREFIXED_COMPLEX_COMMANDS: dict[str, dict[str, int | None] | Any] = {
+    PREFIXED_COMPLEX_COMMANDS: ClassVar[dict[str, dict[str, int | None] | Any]] = {
         "DEL": {"args_start": 0, "args_end": None},
         "WATCH": {"args_start": 0, "args_end": None},
         "BZMPOP": _prefix_bzmpop_args,
@@ -405,10 +405,8 @@ class MultiChannelPoller:
 
     def close(self) -> None:
         for fd in self._chan_to_sock.values():
-            try:
+            with suppress(KeyError, ValueError):
                 self.poller.unregister(fd)
-            except (KeyError, ValueError):
-                pass
         self._channels.clear()
         self._fd_to_chan.clear()
         self._chan_to_sock.clear()
@@ -420,10 +418,8 @@ class MultiChannelPoller:
         self._channels.discard(channel)
 
     def _on_connection_disconnect(self, connection: Any) -> None:
-        try:
+        with suppress(AttributeError, TypeError):
             self.poller.unregister(connection._sock)
-        except (AttributeError, TypeError):
-            pass
 
     def _register(self, channel: Channel, client: Any, cmd_type: str) -> None:
         if (channel, client, cmd_type) in self._chan_to_sock:
@@ -463,12 +459,10 @@ class MultiChannelPoller:
 
     def on_poll_start(self) -> None:
         for channel in self._channels:
-            if channel.active_queues:
-                if channel.qos.can_consume():
-                    self._register_BZMPOP(channel)
-            if channel.active_fanout_queues:
-                if channel.qos.can_consume():
-                    self._register_XREAD(channel)
+            if channel.active_queues and channel.qos.can_consume():
+                self._register_BZMPOP(channel)
+            if channel.active_fanout_queues and channel.qos.can_consume():
+                self._register_XREAD(channel)
 
     def on_poll_init(self, poller: Any) -> None:
         self.poller = poller
@@ -515,12 +509,10 @@ class MultiChannelPoller:
         self._in_protected_read = True
         try:
             for channel in self._channels:
-                if channel.active_queues:
-                    if channel.qos.can_consume():
-                        self._register_BZMPOP(channel)
-                if channel.active_fanout_queues:
-                    if channel.qos.can_consume():
-                        self._register_XREAD(channel)
+                if channel.active_queues and channel.qos.can_consume():
+                    self._register_BZMPOP(channel)
+                if channel.active_fanout_queues and channel.qos.can_consume():
+                    self._register_XREAD(channel)
 
             events = self.poller.poll(timeout)
             if events:
@@ -528,7 +520,7 @@ class MultiChannelPoller:
                     ret = self.handle_event(fileno, event)
                     if ret:
                         return
-            raise Empty()
+            raise Empty
         finally:
             self._in_protected_read = False
             while self.after_read:
@@ -563,7 +555,7 @@ class Channel(virtual.Channel):
     sep = "\x06\x16"
     _in_poll = False
     _in_fanout_poll = False
-    _fanout_queues: dict[str, tuple[str, str]] = {}
+    _fanout_queues: ClassVar[dict[str, tuple[str, str]]] = {}
 
     # Message storage keys
     # Per-message hash keys use format: {message_key_prefix}{delivery_tag}
@@ -727,10 +719,8 @@ class Channel(virtual.Channel):
             queue = self._tag_to_queue[consumer_tag]
         except KeyError:
             return None
-        try:
+        with suppress(KeyError):
             self.active_fanout_queues.remove(queue)
-        except KeyError:
-            pass
         try:
             exchange, _ = self._fanout_queues[queue]
             self._fanout_to_queue.pop(exchange)
@@ -773,8 +763,8 @@ class Channel(virtual.Channel):
                 if message:
                     self.connection._deliver(message, dest)
                     return True
-                raise Empty()
-            raise Empty()
+                raise Empty
+            raise Empty
         finally:
             self._in_poll = None  # type: ignore[assignment]
 
@@ -836,7 +826,7 @@ class Channel(virtual.Channel):
                 raise
 
             if not messages:
-                raise Empty()
+                raise Empty
 
             for stream, message_list in messages:
                 stream_str = bytes_to_str(stream) if isinstance(stream, bytes) else stream
@@ -879,7 +869,7 @@ class Channel(virtual.Channel):
                     self.connection._deliver(payload, queue_name)
                     return True
 
-            raise Empty()
+            raise Empty
         finally:
             self._in_fanout_poll = None  # type: ignore[assignment]
 
@@ -897,7 +887,7 @@ class Channel(virtual.Channel):
                 message = self._get_message_from_hash(message_key, client)
                 if message:
                     return message
-            raise Empty()
+            raise Empty
 
     def _size(self, queue: str) -> int:
         with self.conn_or_acquire() as client:
@@ -1089,15 +1079,11 @@ class Channel(virtual.Channel):
     def close(self) -> None:
         self._closing = True
         if self._in_poll:
-            try:
+            with suppress(Empty):
                 self._bzmpop_read()
-            except Empty:
-                pass
         if self._in_fanout_poll:
-            try:
+            with suppress(Empty):
                 self._xread_read()
-            except Empty:
-                pass
         if not self.closed:
             self.connection.cycle.discard(self)
 
@@ -1324,10 +1310,8 @@ class Transport(virtual.Transport):
             if connection._sock:
                 loop.remove(connection._sock)
             if cycle.fds:
-                try:
+                with suppress(KeyError):
                     loop.on_tick.remove(on_poll_start)
-                except KeyError:
-                    pass
 
         cycle._on_connection_disconnect = _on_disconnect  # type: ignore[method-assign]
 

@@ -44,86 +44,37 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 explicit-preview-rules = true
 fixable = ["ALL"]
 ignore = [
-  # Type annotations - Any needed for untyped Celery/Kombu APIs
-  "ANN401",
-
-  # Unused arguments - signal handlers and overrides have required signatures
-  "ARG001",
+  "ANN401",  # Any needed for untyped Celery/Kombu APIs
+  "ARG001",  # Signal handlers and overrides have required signatures
   "ARG002",
-
-  # Complexity - some functions are inherently complex
-  "C901",
-
-  # Conflicts with ruff-format
-  "COM812",
-
-  # Docstring rules are too extensive
-  "D",
-
-  # Line length - 120 char limit is sufficient
-  "E5",
-
-  # Exception message patterns - extracting to variables hurts readability
-  "EM101",
+  "C901",    # Some functions are inherently complex
+  "COM812",  # Conflicts with ruff-format
+  "D",       # Docstring rules are too extensive
+  "E5",      # 120 char limit is sufficient
+  "EM101",   # Extracting exception messages to variables hurts readability
   "EM102",
-
-  # Formula comments are documentation, not dead code
-  "ERA001",
-
-  # We use current Python version annotations
-  "FA",
-
-  # Boolean traps - too many violations, breaks compatibility
-  "FBT001",
+  "FBT001",  # Boolean traps - too many violations, breaks compatibility
   "FBT002",
-
-  # Naming follows kombu conventions
-  "N802",
+  "N802",    # Naming follows kombu conventions
   "N806",
-
-  # Lazy imports for optional dependencies
-  "PLC0415",
-
-  # Pylint refactor rules
-  "PLR0913", # Too many arguments - test fixtures
+  "PLC0415", # Lazy imports for optional dependencies
   "PLR1704", # Redefining argument in context manager
-  "PLR2004", # Magic values in tests are fine
-
-  # namedtuple usage follows kombu patterns
-  "PYI024",
-
-  # Empty() parentheses are clearer
-  "RSE102",
-
-  # Ruff-specific
-  "RUF005", # Tuple concatenation is clearer
-  "RUF012", # False positives with class variables
-  "RUF015", # Readability over micro-optimization
-  "RUF059", # Keep unused variables explicit
-
-  # assert needed for tests
-  "S101",
-
-  # Nested ifs and try/except/pass are clearer in some cases
-  "SIM102",
-  "SIM105",
-
-  # Private member access needed for kombu/redis-py internals
-  "SLF001",
-
-  # Prefer explicit imports over TYPE_CHECKING blocks
-  "TC003",
-
-  # Long exception messages are fine
-  "TRY003",
+  "PYI024",  # namedtuple usage follows kombu patterns
+  "RUF005",  # Tuple concatenation is clearer
+  "RUF015",  # Readability over micro-optimization
+  "RUF059",  # Keep unused variables explicit
+  "SLF001",  # Private member access needed for kombu/redis-py internals
+  "TRY003",  # Long exception messages are fine
 ]
 preview = true
-select = ["ALL", "UP045"]
+select = ["ALL"]
 unfixable = []
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = [
-  "S101", # assert in tests
+  "PLR0913", # Too many arguments in test fixtures
+  "PLR2004", # Magic values in tests are fine
+  "S101",    # assert in tests
 ]
 
 [tool.pytest.ini_options]
