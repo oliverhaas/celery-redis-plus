@@ -39,7 +39,7 @@ celery-redis-plus is a drop-in replacement Redis transport for Celery that uses:
 ### Message Flow
 
 1. **Custom Transport** (`transport.py`): The `Channel._put` method parses the `eta` header (ISO datetime) to compute delay. All messages go to the main queue with score based on eta timestamp
-2. **Single Queue System**: All messages go to `{queue}` with score = `(255 - priority) × 10¹⁰ + timestamp_ms`. Delayed messages have future timestamps, causing them to be delivered later
+2. **Single Queue System**: All messages go to `{queue}` with score = `(255 - priority) × 10¹³ + timestamp_ms`. Delayed messages have future timestamps, causing them to be delivered later
 3. **Unified Requeue**: A single Lua script handles both delayed message delivery and visibility timeout restoration via the `messages_index` sorted set
 
 ### Key Components
@@ -58,7 +58,7 @@ celery_redis_plus.transport:Transport://localhost:6379/0
 
 ### Constants
 
-- `PRIORITY_SCORE_MULTIPLIER`: `10¹⁰` - multiplier for priority in score calculation
+- `PRIORITY_SCORE_MULTIPLIER`: `10¹³` - multiplier for priority in score calculation
 - `DEFAULT_VISIBILITY_TIMEOUT`: `300` - seconds before unacked messages are requeued
 - `DEFAULT_REQUEUE_CHECK_INTERVAL`: `60` - interval for checking messages to requeue
 - `DEFAULT_REQUEUE_BATCH_LIMIT`: `1000` - max messages processed per requeue cycle

@@ -5,8 +5,9 @@ MESSAGES_INDEX_SUFFIX = ":index"
 
 # Sorted set score: inverted priority scaled by this multiplier, plus timestamp_ms.
 # Higher priority yields lower score, popped first (RabbitMQ semantics).
-# Max score in 100 years is ~7.5e12, well under IEEE 754 safe limit (9e15).
-PRIORITY_SCORE_MULTIPLIER = 10**10
+# Using 10^13 gives clean digit separation: PPP|tttttttttttt (3 priority + 13 timestamp digits).
+# Max score ~2.6e15 is well under IEEE 754 exact integer limit (2^53 ≈ 9e15).
+PRIORITY_SCORE_MULTIPLIER = 10**13
 
 # Default priority value (lowest priority, matching RabbitMQ default)
 DEFAULT_PRIORITY = 0
