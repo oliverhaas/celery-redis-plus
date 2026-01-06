@@ -20,6 +20,7 @@ from celery_redis_plus.constants import (
     DEFAULT_VISIBILITY_TIMEOUT,
     MESSAGE_KEY_PREFIX,
     PRIORITY_SCORE_MULTIPLIER,
+    QUEUE_KEY_PREFIX,
 )
 from celery_redis_plus.transport import (
     DEFAULT_DB,
@@ -552,8 +553,8 @@ class TestChannel:
         queue_name, score_dict = queue_zadd_call[0]
         score = list(score_dict.values())[0]
 
-        # Queue name should be the main queue
-        assert queue_name == "my_queue"
+        # Queue name should be the main queue with queue: prefix
+        assert queue_name == f"{QUEUE_KEY_PREFIX}my_queue"
 
         # Short delays are treated as immediate (score based on now, not eta)
         # Celery's built-in eta logic will handle the actual delay
@@ -1784,7 +1785,7 @@ class TestMessagePublishing:
         add.delay(1, 2)
 
         # Check that message is in the celery queue sorted set
-        queue_size = redis_client.zcard("celery")
+        queue_size = redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery")
         assert queue_size >= 1
 
         # Check that message is in the messages index
@@ -1793,7 +1794,7 @@ class TestMessagePublishing:
 
         # Check that message payload is stored in a per-message hash
         # Get the delivery tag from the queue to verify the message hash exists
-        queue_members = redis_client.zrange("celery", 0, 0)
+        queue_members = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, 0)
         assert len(queue_members) >= 1
         delivery_tag = queue_members[0].decode() if isinstance(queue_members[0], bytes) else queue_members[0]
         message_key = f"message:{delivery_tag}"
@@ -1815,7 +1816,7 @@ class TestMessagePublishing:
         add.apply_async(args=(1, 2), countdown=10)
 
         # Get the message from the queue
-        messages = redis_client.zrange("celery", 0, -1, withscores=True)
+        messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
         assert len(messages) >= 1
 
         # The score should be in the future (approximately 10 seconds from now)
@@ -1844,7 +1845,7 @@ class TestMessagePublishing:
         add.apply_async(args=(1, 2), eta=eta)
 
         # Get the message from the queue
-        messages = redis_client.zrange("celery", 0, -1, withscores=True)
+        messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
         assert len(messages) >= 1
 
     def test_high_priority_message_has_lower_score(
@@ -1859,7 +1860,7 @@ class TestMessagePublishing:
             return x + y
 
         # Clear any existing messages
-        redis_client.delete("celery", "messages", "messages_index")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", "messages_index")
 
         # Publish low priority first, then high priority
         add.apply_async(args=(1, 1), priority=0)  # Low priority
@@ -1867,7 +1868,7 @@ class TestMessagePublishing:
         add.apply_async(args=(2, 2), priority=9)  # High priority
 
         # Get messages ordered by score (ascending)
-        messages = redis_client.zrange("celery", 0, -1, withscores=True)
+        messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
         assert len(messages) == 2
 
         # High priority (9) should have lower score, so it comes first
@@ -1890,7 +1891,7 @@ class TestMessagePublishing:
             return x + y
 
         # Clear any existing messages
-        redis_client.delete("celery", "messages", "messages_index")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", "messages_index")
 
         # Publish 5 messages with same priority
         for i in range(5):
@@ -1898,11 +1899,11 @@ class TestMessagePublishing:
             time.sleep(0.01)  # Small delay between messages
 
         # Check all messages are in the queue
-        queue_size = redis_client.zcard("celery")
+        queue_size = redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery")
         assert queue_size == 5
 
         # Messages should be ordered by timestamp (FIFO within same priority)
-        messages = redis_client.zrange("celery", 0, -1, withscores=True)
+        messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
         scores = [score for _, score in messages]
 
         # Scores should be in ascending order (earlier messages have lower scores)
@@ -1920,12 +1921,12 @@ class TestMessagePublishing:
             return x + y
 
         # Clear any existing messages
-        redis_client.delete("celery", "messages_index")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
         add.delay(42, 58)
 
         # Get the delivery tag from the queue
-        messages = redis_client.zrange("celery", 0, -1)
+        messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1)
         assert len(messages) == 1
         delivery_tag = messages[0].decode() if isinstance(messages[0], bytes) else messages[0]
 
@@ -1959,12 +1960,12 @@ class TestMessagePublishing:
             return x + y
 
         # Clear and publish
-        redis_client.delete("celery", "messages_index")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
         for _ in range(3):
             add.delay(1, 1)
 
         # Verify messages exist
-        assert redis_client.zcard("celery") == 3
+        assert redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery") == 3
 
         # Purge using the app's control interface
         with celery_app.connection() as conn:
@@ -1973,7 +1974,7 @@ class TestMessagePublishing:
             assert purged == 3
 
         # Verify queue is empty
-        assert redis_client.zcard("celery") == 0
+        assert redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery") == 0
 
     def test_queue_size_returns_correct_count(
         self,
@@ -1987,7 +1988,7 @@ class TestMessagePublishing:
             return x + y
 
         # Clear and publish
-        redis_client.delete("celery", "messages", "messages_index")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", "messages_index")
         for _ in range(5):
             add.delay(1, 1)
 
@@ -2014,9 +2015,9 @@ class TestQueueOperations:
             return x + y
 
         # Publish messages
-        redis_client.delete("celery")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery")
         add.delay(1, 1)
-        assert redis_client.zcard("celery") >= 1
+        assert redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery") >= 1
 
         # Delete the queue
         with celery_app.connection() as conn:
@@ -2024,7 +2025,7 @@ class TestQueueOperations:
             channel._delete("celery")
 
         # Queue should be gone
-        assert redis_client.zcard("celery") == 0
+        assert redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery") == 0
 
     def test_queue_exists_check(
         self,
@@ -2038,18 +2039,18 @@ class TestQueueOperations:
             return x + y
 
         # Clear and check non-existence
-        redis_client.delete("test_queue_exists")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}test_queue_exists")
 
         with celery_app.connection() as conn:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
             assert channel._has_queue("test_queue_exists") is False
 
             # Create queue by adding a message directly
-            redis_client.zadd("test_queue_exists", {"msg1": 1.0})
+            redis_client.zadd(f"{QUEUE_KEY_PREFIX}test_queue_exists", {"msg1": 1.0})
             assert channel._has_queue("test_queue_exists") is True
 
         # Cleanup
-        redis_client.delete("test_queue_exists")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}test_queue_exists")
 
     def test_get_table_returns_bindings(
         self,
@@ -2206,7 +2207,7 @@ class TestDelayedMessageStorage:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
             # Clear existing messages
-            redis_client.delete("celery", "messages_index")
+            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             delay_seconds = 120  # 2 minutes in the future (> 60s threshold)
             before_time = time.time()
@@ -2227,7 +2228,7 @@ class TestDelayedMessageStorage:
             channel._put("celery", message)
 
             # Message should NOT be in the main queue yet (native delayed delivery)
-            main_messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            main_messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
             assert len(main_messages) == 0
 
             # Message should be in messages_index with queue_at = eta
@@ -2258,7 +2259,7 @@ class TestDelayedMessageStorage:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
             # Clear existing messages
-            redis_client.delete("celery", "messages_index")
+            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             before_time = time.time()
 
@@ -2277,7 +2278,7 @@ class TestDelayedMessageStorage:
             after_time = time.time()
 
             # Get the message score
-            messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
             assert len(messages) == 1
             _tag, actual_score = messages[0]
 
@@ -2302,7 +2303,7 @@ class TestDelayedMessageStorage:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
             # Clear existing messages
-            redis_client.delete("celery", "messages_index")
+            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             now = time.time()
             # Use delay <= 60s so it's treated as immediate (Celery handles the delay)
@@ -2330,7 +2331,7 @@ class TestDelayedMessageStorage:
             channel._put("celery", short_delayed_msg)
 
             # Both messages should be in main queue (short delay is treated as immediate)
-            main_messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            main_messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
             assert len(main_messages) == 2
 
             # Both messages should have scores based on "now" (not the eta)
@@ -2352,7 +2353,7 @@ class TestDelayedMessageStorage:
             channel: Any = conn.default_channel  # type: ignore[attr-defined]
 
             # Clear existing messages
-            redis_client.delete("celery", "messages_index")
+            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             # Create low priority message first
             low_priority_msg = {
@@ -2377,7 +2378,7 @@ class TestDelayedMessageStorage:
             channel._put("celery", high_priority_msg)
 
             # High priority should be first (lower score)
-            messages = redis_client.zrange("celery", 0, -1, withscores=True)
+            messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
             assert len(messages) == 2
 
             first_tag = messages[0][0].decode() if isinstance(messages[0][0], bytes) else messages[0][0]
@@ -2402,7 +2403,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete("celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             # Simulate a message that was consumed but not acked:
             # 1. Message is in per-message hash (payload stored)
@@ -2427,7 +2428,7 @@ class TestMessageRequeue:
             client.zadd("messages_index", {delivery_tag: old_timestamp})
 
             # Message is NOT in the queue (simulates it was consumed)
-            assert client.zscore("celery", delivery_tag) is None
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None
 
             # Set up active_queues for the channel
             if "celery" not in channel._active_queues:
@@ -2439,7 +2440,7 @@ class TestMessageRequeue:
             assert requeued >= 1
 
             # Message should now be back in the queue
-            assert client.zscore("celery", delivery_tag) is not None
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None
 
     def test_requeue_skips_message_still_in_queue(
         self,
@@ -2452,7 +2453,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete("celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             # Simulate a message that is still in the queue (not yet consumed)
             delivery_tag = "queued-msg-456"
@@ -2474,9 +2475,9 @@ class TestMessageRequeue:
             client.zadd("messages_index", {delivery_tag: old_timestamp})
 
             # Message IS in the queue (not yet consumed)
-            client.zadd("celery", {delivery_tag: 100.0})
+            client.zadd(f"{QUEUE_KEY_PREFIX}celery", {delivery_tag: 100.0})
 
-            original_score = client.zscore("celery", delivery_tag)
+            original_score = client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag)
 
             # Set up active_queues for the channel
             if "celery" not in channel._active_queues:
@@ -2486,7 +2487,7 @@ class TestMessageRequeue:
             channel.enqueue_due_messages()
 
             # Score should be unchanged (ZADD NX doesn't update existing entries)
-            assert client.zscore("celery", delivery_tag) == original_score
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) == original_score
 
     def test_requeue_removes_index_for_acked_message(
         self,
@@ -2498,7 +2499,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete("celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             # Simulate a message that was already acked (per-message hash deleted)
             delivery_tag = "acked-msg-789"
@@ -2531,7 +2532,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete("celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             # Set up a message in the per-message hash
             delivery_tag = "requeue-tag-test"
@@ -2548,13 +2549,13 @@ class TestMessageRequeue:
             )
 
             # Message is not in queue
-            assert client.zscore("celery", delivery_tag) is None
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None
 
             # Requeue the message
             channel.qos.requeue_by_tag(delivery_tag)
 
             # Message should now be in the queue
-            assert client.zscore("celery", delivery_tag) is not None
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None
 
     def test_requeue_by_tag_sets_redelivered_flag(
         self,
@@ -2567,7 +2568,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete("celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             delivery_tag = "redelivered-test"
             payload = {
@@ -2600,7 +2601,7 @@ class TestMessageRequeue:
             assert redelivered == b"1"
 
             # Message should be in queue
-            assert client.zscore("celery", delivery_tag) is not None
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None
 
     def test_requeue_by_tag_leftmost_uses_zero_score(
         self,
@@ -2612,7 +2613,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete("celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             delivery_tag = "leftmost-test"
             payload = {
@@ -2641,7 +2642,7 @@ class TestMessageRequeue:
             assert result is True
 
             # Score should be 0 (highest priority, processed first)
-            score = client.zscore("celery", delivery_tag)
+            score = client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag)
             assert score == 0
 
     def test_channel_restore_with_message_object(
@@ -2655,7 +2656,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete("celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             delivery_tag = "message-restore-test"
             payload = {
@@ -2686,7 +2687,7 @@ class TestMessageRequeue:
             channel._restore(message)
 
             # Message should be in the queue
-            assert client.zscore("celery", delivery_tag) is not None
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None
 
     def test_channel_restore_at_beginning(
         self,
@@ -2699,7 +2700,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete("celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
 
             delivery_tag = "restore-beginning-test"
             payload = {
@@ -2730,7 +2731,7 @@ class TestMessageRequeue:
             channel._restore_at_beginning(message)
 
             # Message should be in queue with score 0
-            score = client.zscore("celery", delivery_tag)
+            score = client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag)
             assert score == 0
 
 
@@ -2769,14 +2770,14 @@ class TestGlobalKeyPrefix:
 
         client = redis.Redis(host=host, port=port, db=0)
 
-        # The queue should be prefixed
-        prefixed_queue_size: int = client.zcard("myapp:celery")  # type: ignore[assignment]
+        # The queue should be prefixed with both global prefix and queue: prefix
+        prefixed_queue_size: int = client.zcard(f"myapp:{QUEUE_KEY_PREFIX}celery")  # type: ignore[assignment]
 
         assert prefixed_queue_size >= 1
         # The key point is that our prefixed queue has the message
 
         # Clean up
-        client.delete("myapp:celery", "myapp:messages", "myapp:messages_index")
+        client.delete(f"myapp:{QUEUE_KEY_PREFIX}celery", "myapp:messages", "myapp:messages_index")
         client.close()
         app.close()
 
@@ -2934,7 +2935,7 @@ class TestSynchronousGet:
             client = channel.client
 
             # Clear and set up
-            client.delete("celery")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery")
 
             delivery_tag = "sync-get-test"
             payload = {
@@ -2954,7 +2955,7 @@ class TestSynchronousGet:
                     "priority": "0",
                 },
             )
-            client.zadd("celery", {delivery_tag: 100.0})
+            client.zadd(f"{QUEUE_KEY_PREFIX}celery", {delivery_tag: 100.0})
 
             # Use synchronous _get
             message = channel._get("celery")
@@ -2973,7 +2974,7 @@ class TestSynchronousGet:
             client = channel.client
 
             # Clear queue
-            client.delete("empty_test_queue")
+            client.delete(f"{QUEUE_KEY_PREFIX}empty_test_queue")
 
             # _get on empty queue should raise Empty
             with pytest.raises(Empty):
@@ -2990,11 +2991,11 @@ class TestSynchronousGet:
             client = channel.client
 
             # Clear and set up
-            client.delete("celery", "messages")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages")
 
             # Add delivery tag to queue but NOT to messages hash
             delivery_tag = "orphan-tag"
-            client.zadd("celery", {delivery_tag: 100.0})
+            client.zadd(f"{QUEUE_KEY_PREFIX}celery", {delivery_tag: 100.0})
 
             # _get should raise Empty because payload is missing
             with pytest.raises(Empty):

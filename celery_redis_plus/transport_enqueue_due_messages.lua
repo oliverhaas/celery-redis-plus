@@ -6,7 +6,8 @@
 -- Reads routing_key from hash to add message to the correct queue.
 -- KEYS: [1] = messages_index
 -- ARGV: [1] = threshold, [2] = batch_limit, [3] = visibility_timeout,
---       [4] = priority_multiplier, [5] = message_key_prefix, [6] = global_keyprefix
+--       [4] = priority_multiplier, [5] = message_key_prefix, [6] = global_keyprefix,
+--       [7] = queue_key_prefix
 -- Returns: total number of messages enqueued
 
 local messages_index = KEYS[1]
@@ -16,6 +17,7 @@ local visibility_timeout = tonumber(ARGV[3])
 local priority_multiplier = tonumber(ARGV[4])
 local message_key_prefix = ARGV[5]
 local global_keyprefix = ARGV[6]
+local queue_key_prefix = ARGV[7]
 local total_enqueued = 0
 
 -- Get current time in seconds and milliseconds
@@ -57,8 +59,8 @@ for _, tag in ipairs(ready) do
             redis.call('HSET', message_key, 'redelivered', '1')
         end
 
-        -- Add to the message's queue (with global prefix)
-        local queue_key = global_keyprefix .. routing_key
+        -- Add to the message's queue (with global prefix and queue: prefix)
+        local queue_key = global_keyprefix .. queue_key_prefix .. routing_key
         redis.call('ZADD', queue_key, 'NX', queue_score, tag)
 
         -- Update queue_at for next cycle (now + visibility_timeout)

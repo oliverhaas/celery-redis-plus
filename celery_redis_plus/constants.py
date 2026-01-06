@@ -33,3 +33,6 @@ DEFAULT_MESSAGE_TTL = 3 * 24 * 60 * 60  # 259200 seconds
 
 # Prefix for per-message hash keys
 MESSAGE_KEY_PREFIX = "message:"
+
+# Prefix for queue sorted set keys (avoids collision with list-based queues)
+QUEUE_KEY_PREFIX = "queue:"

@@ -65,6 +65,7 @@ from .constants import (
     DEFAULT_VISIBILITY_TIMEOUT,
     MESSAGE_KEY_PREFIX,
     PRIORITY_SCORE_MULTIPLIER,
+    QUEUE_KEY_PREFIX,
 )
 
 if TYPE_CHECKING:
@@ -672,6 +673,23 @@ class Channel(virtual.Channel):
         """Get the Redis key for a message's per-message hash."""
         return f"{self.message_key_prefix}{delivery_tag}"
 
+    def _queue_key(self, queue: str) -> str:
+        """Get the Redis key for a queue's sorted set.
+
+        Uses 'queue:' prefix to avoid collision with list-based queues
+        from the standard redis transport.
+        """
+        return f"{QUEUE_KEY_PREFIX}{queue}"
+
+    def _queue_name(self, queue_key: str) -> str:
+        """Extract logical queue name from a Redis queue key.
+
+        Strips the 'queue:' prefix if present.
+        """
+        if queue_key.startswith(QUEUE_KEY_PREFIX):
+            return queue_key[len(QUEUE_KEY_PREFIX) :]
+        return queue_key
+
     def _get_message_from_hash(self, message_key: str, client: Any) -> dict[str, Any] | None:
         """Fetch message payload from per-message hash.
 
@@ -737,7 +755,8 @@ class Channel(virtual.Channel):
             timeout = self.connection.polling_interval or 1
         if not self._queue_cycle:
             return
-        keys = list(self._queue_cycle)
+        # Convert logical queue names to Redis keys with queue: prefix
+        keys = [self._queue_key(q) for q in self._queue_cycle]
         self._in_poll = self.client.connection
 
         command_args: list[Any] = ["BZMPOP", timeout or 0, len(keys), *keys, "MIN"]
@@ -756,6 +775,8 @@ class Channel(virtual.Channel):
             if result:
                 dest, members = result
                 dest = bytes_to_str(dest)
+                # Strip queue: prefix to get logical queue name for delivery
+                dest = self._queue_name(dest)
                 delivery_tag, _score = members[0]
                 delivery_tag = bytes_to_str(delivery_tag)
                 message_key = self._message_key(delivery_tag)
@@ -879,7 +900,7 @@ class Channel(virtual.Channel):
     def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:  # type: ignore[override]
         """Get single message from queue (synchronous)."""
         with self.conn_or_acquire() as client:
-            result = client.zpopmin(queue, count=1)
+            result = client.zpopmin(self._queue_key(queue), count=1)
             if result:
                 delivery_tag, _score = result[0]
                 delivery_tag = bytes_to_str(delivery_tag)
@@ -891,7 +912,7 @@ class Channel(virtual.Channel):
 
     def _size(self, queue: str) -> int:
         with self.conn_or_acquire() as client:
-            return client.zcard(queue)
+            return client.zcard(self._queue_key(queue))
 
     def enqueue_due_messages(self) -> int:
         """Enqueue messages whose queue_at time has passed.
@@ -925,6 +946,7 @@ class Channel(virtual.Channel):
                     PRIORITY_SCORE_MULTIPLIER,
                     self.message_key_prefix,
                     self.global_keyprefix,
+                    QUEUE_KEY_PREFIX,
                 ],
             )
 
@@ -955,7 +977,13 @@ class Channel(virtual.Channel):
             requeue_script = client.register_script(_REQUEUE_MESSAGE_LUA)
             result = requeue_script(
                 keys=[message_key],
-                args=[1 if leftmost else 0, PRIORITY_SCORE_MULTIPLIER, self.message_ttl, self.global_keyprefix],
+                args=[
+                    1 if leftmost else 0,
+                    PRIORITY_SCORE_MULTIPLIER,
+                    self.message_ttl,
+                    self.global_keyprefix,
+                    QUEUE_KEY_PREFIX,
+                ],
             )
             return bool(result)
 
@@ -1011,7 +1039,7 @@ class Channel(virtual.Channel):
             pipe.expire(message_key, self.message_ttl)
             pipe.zadd(self.messages_index_key, {delivery_tag: queue_at})
             if not is_native_delayed:
-                pipe.zadd(queue, {delivery_tag: queue_score})
+                pipe.zadd(self._queue_key(queue), {delivery_tag: queue_score})
             pipe.execute()
 
     def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
@@ -1056,11 +1084,11 @@ class Channel(virtual.Channel):
                 self.keyprefix_queue % (exchange,),
                 self.sep.join([routing_key or "", pattern or "", queue or ""]),
             )
-            client.delete(queue)
+            client.delete(self._queue_key(queue))
 
     def _has_queue(self, queue: str, **kwargs: Any) -> bool:
         with self.conn_or_acquire() as client:
-            return bool(client.exists(queue))
+            return bool(client.exists(self._queue_key(queue)))
 
     def get_table(self, exchange: str) -> list[tuple[str, ...]]:
         key = self.keyprefix_queue % exchange
@@ -1072,8 +1100,9 @@ class Channel(virtual.Channel):
 
     def _purge(self, queue: str) -> int:
         with self.conn_or_acquire() as client:
-            size = client.zcard(queue)
-            client.delete(queue)
+            queue_key = self._queue_key(queue)
+            size = client.zcard(queue_key)
+            client.delete(queue_key)
             return size
 
     def close(self) -> None:
