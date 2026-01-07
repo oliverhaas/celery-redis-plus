@@ -6,7 +6,7 @@ import json
 import time
 from datetime import UTC, datetime, timedelta
 from queue import Empty
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -1969,7 +1969,7 @@ class TestMessagePublishing:
 
         # Purge using the app's control interface
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             purged = channel._purge("celery")
             assert purged == 3
 
@@ -1994,7 +1994,7 @@ class TestMessagePublishing:
 
         # Check size via channel
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             size = channel._size("celery")
             assert size == 5
 
@@ -2021,7 +2021,7 @@ class TestQueueOperations:
 
         # Delete the queue
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             channel._delete("celery")
 
         # Queue should be gone
@@ -2042,7 +2042,7 @@ class TestQueueOperations:
         redis_client.delete(f"{QUEUE_KEY_PREFIX}test_queue_exists")
 
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             assert channel._has_queue("test_queue_exists") is False
 
             # Create queue by adding a message directly
@@ -2059,7 +2059,7 @@ class TestQueueOperations:
     ) -> None:
         """Test that get_table returns queue bindings."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Bind a queue to an exchange
             channel._queue_bind(
@@ -2091,7 +2091,7 @@ class TestChannelConnection:
     ) -> None:
         """Test that channel creates a connection pool."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             # Accessing pool should create it
             pool = channel.pool
             assert pool is not None
@@ -2102,7 +2102,7 @@ class TestChannelConnection:
     ) -> None:
         """Test that channel creates an async connection pool."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             # Accessing async_pool should create it
             async_pool = channel.async_pool
             assert async_pool is not None
@@ -2113,7 +2113,7 @@ class TestChannelConnection:
     ) -> None:
         """Test that channel client property returns a Redis client."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
             assert client is not None
             # Should be able to ping
@@ -2125,7 +2125,7 @@ class TestChannelConnection:
     ) -> None:
         """Test that conn_or_acquire works as context manager."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Without client argument - creates new client
             with channel.conn_or_acquire() as client:
@@ -2148,7 +2148,7 @@ class TestFanoutMessaging:
     ) -> None:
         """Test that fanout stream key is generated correctly."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Test stream key generation
             stream_key = channel._fanout_stream_key("test_exchange")
@@ -2166,7 +2166,7 @@ class TestFanoutMessaging:
     ) -> None:
         """Test that fanout exchange can be declared."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             fanout_exchange = Exchange("test_fanout_decl", type="fanout")
             fanout_queue = Queue("fanout_decl_queue", exchange=fanout_exchange)
@@ -2204,7 +2204,7 @@ class TestDelayedMessageStorage:
         the eta time arrives. This prevents them from being consumed early.
         """
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
             redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
@@ -2256,7 +2256,7 @@ class TestDelayedMessageStorage:
     ) -> None:
         """Test that messages without eta have current time scores."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
             redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
@@ -2300,7 +2300,7 @@ class TestDelayedMessageStorage:
         should be in the queue immediately.
         """
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
             redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
@@ -2350,7 +2350,7 @@ class TestDelayedMessageStorage:
     ) -> None:
         """Test that high priority messages are ordered before low priority."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
             redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
@@ -2397,7 +2397,7 @@ class TestMessageRequeue:
         """Test that requeue_messages restores messages that were consumed but not acked."""
 
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Use channel's client to ensure we use the same key namespace
             client = channel.client
@@ -2449,7 +2449,7 @@ class TestMessageRequeue:
         """Test that requeue_messages skips messages still in queue."""
 
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
 
             # Clear existing data
@@ -2495,7 +2495,7 @@ class TestMessageRequeue:
     ) -> None:
         """Test that requeue_messages cleans up index for already-acked messages."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
 
             # Clear existing data
@@ -2528,7 +2528,7 @@ class TestMessageRequeue:
         """Test requeue_by_tag restores a specific message."""
 
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
 
             # Clear existing data
@@ -2564,7 +2564,7 @@ class TestMessageRequeue:
         """Test that _requeue_by_tag sets the redelivered flag in hash."""
 
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
 
             # Clear existing data
@@ -2609,7 +2609,7 @@ class TestMessageRequeue:
     ) -> None:
         """Test that _requeue_by_tag with leftmost=True uses score 0."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
 
             # Clear existing data
@@ -2652,7 +2652,7 @@ class TestMessageRequeue:
         """Test Channel._restore with a message object."""
 
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
 
             # Clear existing data
@@ -2696,7 +2696,7 @@ class TestMessageRequeue:
         """Test Channel._restore_at_beginning restores with score 0."""
 
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
 
             # Clear existing data
@@ -2806,7 +2806,7 @@ class TestFanoutPrefix:
         )
 
         with app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Verify the keyprefix_fanout is set correctly
             assert channel.keyprefix_fanout == "myfanout."
@@ -2840,7 +2840,7 @@ class TestFanoutPrefix:
         )
 
         with app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Verify the keyprefix_fanout is empty
             assert channel.keyprefix_fanout == ""
@@ -2900,7 +2900,7 @@ class TestChannelCloseWithFanout:
         )
 
         with app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Declare the queue - this adds it to auto_delete_queues
             channel.queue_declare("auto_del_queue", auto_delete=True)
@@ -2931,7 +2931,7 @@ class TestSynchronousGet:
         """Test _get returns message from queue."""
 
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
 
             # Clear and set up
@@ -2970,7 +2970,7 @@ class TestSynchronousGet:
         """Test _get raises Empty when queue is empty."""
 
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
 
             # Clear queue
@@ -2987,7 +2987,7 @@ class TestSynchronousGet:
         """Test _get raises Empty when delivery tag exists but payload is gone."""
 
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
             client = channel.client
 
             # Clear and set up
@@ -3012,7 +3012,7 @@ class TestBzmpopEdgeCases:
     ) -> None:
         """Test _bzmpop_start returns early when no active queues."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Clear active queues and reset queue cycle
             channel._active_queues.clear()
@@ -3043,7 +3043,7 @@ class TestBzmpopEdgeCases:
         )
 
         with app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Verify global_keyprefix is set
             assert channel.global_keyprefix == "prefix:"
@@ -3104,7 +3104,7 @@ class TestPoolDisconnect:
     ) -> None:
         """Test _disconnect_pools cleans up connection pools."""
         with celery_app.connection() as conn:
-            channel: Any = conn.default_channel  # type: ignore[attr-defined]
+            channel = cast("Channel", conn.default_channel)
 
             # Force pool creation by accessing client
             _ = channel.client

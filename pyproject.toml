@@ -21,14 +21,14 @@ dependencies = ["celery>=5.5.0", "kombu>=5.5.0", "redis>=7.1.0"]
 
 [dependency-groups]
 dev = [
-  "celery-types==0.24.0",
+  "celery-types-ng==0.25.4",
   "pre-commit==4.5.1",
   "pytest==9.0.2",
   "pytest-cov==7.0.0",
   "pytest-xdist>=3.8.0",
   "ruff==0.14.10",
   "testcontainers[redis]==4.13.3",
-  "ty==0.0.8",
+  "ty==0.0.9",
 ]
 
 [build-system]

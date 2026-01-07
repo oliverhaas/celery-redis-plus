@@ -285,6 +285,7 @@ class QoS(virtual.QoS):
     workers based on their index scores.
     """
 
+    channel: Channel  # Narrow type from base class for our custom Channel
     restore_at_shutdown = True
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -547,6 +548,8 @@ class Channel(virtual.Channel):
     """
 
     QoS = QoS
+    qos: QoS  # Narrow type from base class for our custom QoS
+    connection: Transport  # Narrow type from base class for our custom Transport
 
     _client: Any = None
     _closing = False
@@ -1090,7 +1093,7 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             return bool(client.exists(self._queue_key(queue)))
 
-    def get_table(self, exchange: str) -> list[tuple[str, ...]]:
+    def get_table(self, exchange: str) -> list[tuple[str, ...]]:  # type: ignore[override]
         key = self.keyprefix_queue % exchange
         with self.conn_or_acquire() as client:
             values = client.smembers(key)
@@ -1145,7 +1148,9 @@ class Channel(virtual.Channel):
                 raise ValueError(f"Database is int between 0 and limit - 1, not {vhost}") from None
         return vhost
 
-    def _connparams(self, asynchronous: bool = False) -> dict[str, Any]:
+    def _connparams(self, asynchronous: bool = False) -> dict[str, Any]:  # noqa: PLR0912
+        if self.connection.client is None:
+            raise TypeError("Transport client must be set")
         conninfo = self.connection.client
         connparams: dict[str, Any] = {
             "host": conninfo.hostname or "127.0.0.1",
@@ -1179,7 +1184,8 @@ class Channel(virtual.Channel):
         ssl_config = conninfo.ssl
         if not ssl_config:
             # Fall back to transport_options for path-based transport URLs
-            ssl_config = self.connection.client.transport_options.get("ssl")
+            transport_options = self.connection.client.transport_options or {}
+            ssl_config = transport_options.get("ssl")
 
         if ssl_config:
             try:
@@ -1193,6 +1199,8 @@ class Channel(virtual.Channel):
         if "://" in host:
             scheme, _, _, username, password, path, query = _parse_url(host)
             if scheme == "socket":
+                if path is None:
+                    raise ValueError("socket:// URL must include a path")
                 connparams.update(
                     {
                         "connection_class": redis.UnixDomainSocketConnection,
@@ -1357,6 +1365,6 @@ class Transport(virtual.Transport):
         visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]
         loop.call_repeatedly(visibility_timeout / 3, cycle.maybe_update_messages_index)
 
-    def on_readable(self, fileno: int) -> Any:
+    def on_readable(self, fileno: int) -> Any:  # type: ignore[override]
         """Handle AIO event for one of our file descriptors."""
         return self.cycle.on_readable(fileno)
