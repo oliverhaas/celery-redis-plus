@@ -27,7 +27,7 @@ dev = [
   "pytest==9.0.2",
   "pytest-cov==7.0.0",
   "pytest-xdist>=3.8.0",
-  "ruff==0.14.10",
+  "ruff==0.14.13",
   "testcontainers[redis]==4.13.3",
   "ty==0.0.9",
 ]
