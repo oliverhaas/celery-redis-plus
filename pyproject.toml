@@ -28,7 +28,7 @@ dev = [
   "pytest-cov==7.0.0",
   "pytest-xdist>=3.8.0",
   "ruff==0.14.13",
-  "testcontainers[redis]==4.13.3",
+  "testcontainers[redis]==4.14.0",
   "ty==0.0.9",
 ]
 docs = ["mkdocs>=1.6.0", "mkdocs-material>=9.5.0", "mike>=2.1.0"]
