@@ -39,7 +39,7 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from queue import Empty
 from time import time
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -119,7 +119,7 @@ def get_redis_error_classes() -> error_classes_t:
     # This exception changed name between redis-py versions
     DataError = getattr(exceptions, "InvalidData", exceptions.DataError)
     return error_classes_t(
-        virtual.Transport.connection_errors  # type: ignore[attr-defined]
+        virtual.Transport.connection_errors
         + (
             InconsistencyError,
             socket_module.error,
@@ -129,7 +129,7 @@ def get_redis_error_classes() -> error_classes_t:
             exceptions.AuthenticationError,
             exceptions.TimeoutError,
         ),
-        virtual.Transport.channel_errors  # type: ignore[attr-defined]
+        virtual.Transport.channel_errors
         + (
             DataError,
             exceptions.InvalidResponse,
@@ -261,7 +261,7 @@ class GlobalKeyPrefixMixin:
         )
 
 
-class PrefixedStrictRedis(GlobalKeyPrefixMixin, redis.Redis):  # type: ignore[misc]
+class PrefixedStrictRedis(GlobalKeyPrefixMixin, redis.Redis):
     """Redis client that prefixes all keys."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -269,7 +269,7 @@ class PrefixedStrictRedis(GlobalKeyPrefixMixin, redis.Redis):  # type: ignore[mi
         redis.Redis.__init__(self, *args, **kwargs)
 
 
-class PrefixedRedisPipeline(GlobalKeyPrefixMixin, redis.client.Pipeline):  # type: ignore[misc]
+class PrefixedRedisPipeline(GlobalKeyPrefixMixin, redis.client.Pipeline):
     """Redis pipeline that prefixes all keys."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -461,9 +461,10 @@ class MultiChannelPoller:
 
     def on_poll_start(self) -> None:
         for channel in self._channels:
-            if channel.active_queues and channel.qos.can_consume():
+            qos = channel.qos
+            if qos is not None and channel.active_queues and qos.can_consume():
                 self._register_BZMPOP(channel)
-            if channel.active_fanout_queues and channel.qos.can_consume():
+            if qos is not None and channel.active_fanout_queues and qos.can_consume():
                 self._register_XREAD(channel)
 
     def on_poll_init(self, poller: Any) -> None:
@@ -483,19 +484,22 @@ class MultiChannelPoller:
         """
         total_enqueued = 0
         for channel in self._channels:
-            if channel.active_queues:
-                total_enqueued += channel.qos.enqueue_due_messages()
+            qos = channel.qos
+            if qos is not None and channel.active_queues:
+                total_enqueued += cast("QoS", qos).enqueue_due_messages()
         return total_enqueued
 
     def maybe_update_messages_index(self) -> None:
         """Update message index scores to keep delivered messages alive."""
         for channel in self._channels:
-            if channel.active_queues:
-                channel.qos.maybe_update_messages_index()
+            qos = channel.qos
+            if qos is not None and channel.active_queues:
+                cast("QoS", qos).maybe_update_messages_index()
 
     def on_readable(self, fileno: int) -> bool | None:
         chan, cmd_type = self._fd_to_chan[fileno]
-        if chan.qos.can_consume():
+        qos = chan.qos
+        if qos is not None and qos.can_consume():
             return chan.handlers[cmd_type]()
         return None
 
@@ -511,9 +515,10 @@ class MultiChannelPoller:
         self._in_protected_read = True
         try:
             for channel in self._channels:
-                if channel.active_queues and channel.qos.can_consume():
+                qos = channel.qos
+                if qos is not None and channel.active_queues and qos.can_consume():
                     self._register_BZMPOP(channel)
-                if channel.active_fanout_queues and channel.qos.can_consume():
+                if qos is not None and channel.active_fanout_queues and qos.can_consume():
                     self._register_XREAD(channel)
 
             events = self.poller.poll(timeout)
@@ -548,7 +553,7 @@ class Channel(virtual.Channel):
     """
 
     QoS = QoS
-    qos: QoS  # Narrow type from base class for our custom QoS
+    # qos is inherited from base class and will be an instance of our QoS
     connection: Transport  # Narrow type from base class for our custom Transport
 
     _client: Any = None
@@ -706,7 +711,8 @@ class Channel(virtual.Channel):
         payload_json = client.hget(message_key, "payload")
         if not payload_json:
             return None
-        return loads(bytes_to_str(payload_json))  # type: ignore[call-arg]
+        result: dict[str, Any] | None = loads(bytes_to_str(payload_json))
+        return result
 
     def _restore(self, message: Any, leftmost: bool = False) -> None:
         """Restore a message to its queue.
@@ -731,7 +737,7 @@ class Channel(virtual.Channel):
         connection = self.connection
         if connection:
             if connection.cycle._in_protected_read:
-                return connection.cycle.after_read.add(promise(self._basic_cancel, (consumer_tag,)))  # type: ignore[call-arg]
+                return connection.cycle.after_read.add(promise(self._basic_cancel, (consumer_tag,)))
             return self._basic_cancel(consumer_tag)
         return None
 
@@ -880,14 +886,15 @@ class Channel(virtual.Channel):
                     payload_field = fields.get(b"payload") or fields.get("payload")
                     if not payload_field:
                         continue
-                    payload = loads(bytes_to_str(payload_field))  # type: ignore[call-arg]
+                    payload = loads(bytes_to_str(payload_field))
 
                     # Set delivery tag
                     delivery_tag = self._next_delivery_tag()
                     payload["properties"]["delivery_tag"] = delivery_tag
 
                     # Mark as fanout message (no ack needed)
-                    self.qos._fanout_tags.add(delivery_tag)
+                    if self.qos is not None:
+                        cast("QoS", self.qos)._fanout_tags.add(delivery_tag)
 
                     # Deliver message
                     self.connection._deliver(payload, queue_name)
@@ -900,7 +907,7 @@ class Channel(virtual.Channel):
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
         return self.client.parse_response(self.client.connection, cmd_type)
 
-    def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:  # type: ignore[override]
+    def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:
         """Get single message from queue (synchronous)."""
         with self.conn_or_acquire() as client:
             result = client.zpopmin(self._queue_key(queue), count=1)
@@ -915,7 +922,7 @@ class Channel(virtual.Channel):
 
     def _size(self, queue: str) -> int:
         with self.conn_or_acquire() as client:
-            return client.zcard(self._queue_key(queue))
+            return int(client.zcard(self._queue_key(queue)))
 
     def enqueue_due_messages(self) -> int:
         """Enqueue messages whose queue_at time has passed.
@@ -1031,7 +1038,7 @@ class Channel(virtual.Channel):
             pipe.hset(
                 message_key,
                 mapping={
-                    "payload": dumps(message),  # type: ignore[call-arg]
+                    "payload": dumps(message),
                     "routing_key": queue,
                     "priority": priority,
                     "redelivered": 0,
@@ -1053,7 +1060,7 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             client.xadd(
                 name=stream_key,
-                fields={"uuid": message_uuid, "payload": dumps(message)},  # type: ignore[call-arg]
+                fields={"uuid": message_uuid, "payload": dumps(message)},
                 id="*",
                 maxlen=self.stream_maxlen,
                 approximate=True,
@@ -1072,15 +1079,10 @@ class Channel(virtual.Channel):
                 self.sep.join([routing_key or "", pattern or "", queue or ""]),
             )
 
-    def _delete(
-        self,
-        queue: str,
-        exchange: str = "",
-        routing_key: str = "",
-        pattern: str = "",
-        *args: Any,
-        **kwargs: Any,
-    ) -> None:  # type: ignore[override]
+    def _delete(self, queue: str, *args: Any, **kwargs: Any) -> None:
+        exchange: str = kwargs.get("exchange", "")
+        routing_key: str = kwargs.get("routing_key", "")
+        pattern: str = kwargs.get("pattern", "")
         self.auto_delete_queues.discard(queue)
         with self.conn_or_acquire(client=kwargs.get("client")) as client:
             client.srem(
@@ -1093,18 +1095,26 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             return bool(client.exists(self._queue_key(queue)))
 
-    def get_table(self, exchange: str) -> list[tuple[str, ...]]:  # type: ignore[override]
+    def get_table(self, exchange: str) -> list[tuple[str, str, str]]:
         key = self.keyprefix_queue % exchange
         with self.conn_or_acquire() as client:
             values = client.smembers(key)
             if not values:
                 return []
-            return [tuple(bytes_to_str(val).split(self.sep)) for val in values]
+            result: list[tuple[str, str, str]] = []
+            binding_parts_count = 3  # routing_key, pattern, queue
+            for val in values:
+                parts = bytes_to_str(val).split(self.sep)
+                # Ensure exactly 3 parts (routing_key, pattern, queue)
+                while len(parts) < binding_parts_count:
+                    parts.append("")
+                result.append((parts[0], parts[1], parts[2]))
+            return result
 
     def _purge(self, queue: str) -> int:
         with self.conn_or_acquire() as client:
             queue_key = self._queue_key(queue)
-            size = client.zcard(queue_key)
+            size = int(client.zcard(queue_key))
             client.delete(queue_key)
             return size
 
@@ -1146,7 +1156,7 @@ class Channel(virtual.Channel):
                 vhost = int(vhost)
             except ValueError:
                 raise ValueError(f"Database is int between 0 and limit - 1, not {vhost}") from None
-        return vhost
+        return int(vhost)
 
     def _connparams(self, asynchronous: bool = False) -> dict[str, Any]:  # noqa: PLR0912
         if self.connection.client is None:
@@ -1170,12 +1180,12 @@ class Channel(virtual.Channel):
 
         conn_class = self.connection_class
 
-        if hasattr(conn_class, "__init__"):
-            classes = [conn_class]
+        if conn_class is not None and hasattr(conn_class, "__init__"):
+            classes: list[type] = [conn_class]
             if hasattr(conn_class, "__bases__"):
                 classes += list(conn_class.__bases__)
             for klass in classes:
-                if accepts_argument(klass.__init__, "health_check_interval"):
+                if accepts_argument(klass.__init__, "health_check_interval"):  # type: ignore[misc]
                     break
             else:
                 connparams.pop("health_check_interval")
@@ -1310,7 +1320,7 @@ class Transport(virtual.Transport):
     default_port = DEFAULT_PORT
     driver_type = "redis"
     driver_name = "redis"
-    cycle: MultiChannelPoller
+    cycle: MultiChannelPoller  # type: ignore[assignment]
 
     #: Flag indicating this transport supports native delayed delivery
     supports_native_delayed_delivery = True

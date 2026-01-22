@@ -2552,7 +2552,7 @@ class TestMessageRequeue:
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None
 
             # Requeue the message
-            channel.qos.requeue_by_tag(delivery_tag)
+            cast("QoS", channel.qos).requeue_by_tag(delivery_tag)
 
             # Message should now be in the queue
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None

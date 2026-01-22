@@ -22,6 +22,7 @@ dependencies = ["celery>=5.5.0", "kombu>=5.5.0", "redis>=7.1.0"]
 [dependency-groups]
 dev = [
   "celery-types-ng==0.25.4",
+  "mypy>=1.14.0",
   "pre-commit==4.5.1",
   "pytest==9.0.2",
   "pytest-cov==7.0.0",
@@ -30,6 +31,7 @@ dev = [
   "testcontainers[redis]==4.13.3",
   "ty==0.0.9",
 ]
+docs = ["mkdocs>=1.6.0", "mkdocs-material>=9.5.0", "mike>=2.1.0"]
 
 [build-system]
 requires = ["hatchling>=1.27.0"]
@@ -37,7 +39,7 @@ build-backend = "hatchling.build"
 
 [tool.ruff]
 line-length = 120
-target-version = "py313"
+target-version = "py314"
 
 [tool.ruff.lint]
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
@@ -96,3 +98,11 @@ exclude_lines = [
   "if TYPE_CHECKING:",
   "raise NotImplementedError",
 ]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
