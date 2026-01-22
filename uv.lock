@@ -103,7 +103,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "celery-types-ng", specifier = "==0.25.4" },
+    { name = "celery-types-ng", specifier = "==0.25.6" },
     { name = "mypy", specifier = ">=1.14.0" },
     { name = "pre-commit", specifier = "==4.5.1" },
     { name = "pytest", specifier = "==9.0.2" },
@@ -121,14 +121,14 @@ docs = [
 
 [[package]]
 name = "celery-types-ng"
-version = "0.25.4"
+version = "0.25.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/db/77/941d781bd77f4ed0c4c5c0b15ad891f2a47e6d2165e8e2bca2a951f79659/celery_types_ng-0.25.4.tar.gz", hash = "sha256:39317eb7cb6a0ab83d6de3de9e0f709092bf9aed156589c0941d0556618dbecb", size = 104876, upload-time = "2026-01-07T17:28:56.957Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/19/fa/79065f1b88db4b1abd6e7f24ca7a841c4c141b795c4678e54c18f87ac5df/celery_types_ng-0.25.6.tar.gz", hash = "sha256:d0968145ef7af423939e8da90dc8683e5596a02ffe3b19fa1fa970f35b93fdb2", size = 106049, upload-time = "2026-01-08T20:50:32.261Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/9e/c5eb146fc6ea31332952b6f854e3b89a5fe7d1e8e0b5f92e4a4b635f7d6b/celery_types_ng-0.25.4-py3-none-any.whl", hash = "sha256:33396d93bc808ec6a6813801c1c97378429b75f33b6e2d6e9d77dff04e245d24", size = 209081, upload-time = "2026-01-07T17:28:55.37Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/1c/97ee7043d4c20ea39937930cdf5b9c989b4de3d1d21c88f76813c10a998d/celery_types_ng-0.25.6-py3-none-any.whl", hash = "sha256:660bc355581437e32cf4be551b554243150346b35dbf1dc03bb7d84b6146eb0f", size = 211650, upload-time = "2026-01-08T20:50:30.303Z" },
 ]
 
 [[package]]
