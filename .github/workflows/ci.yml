@@ -26,10 +26,7 @@ jobs:
         run: uv run ruff format --check
 
       - name: Run ty check
-        run: uv run ty check
-
-      - name: Run mypy check
-        run: uv run mypy celery_redis_plus/
+        run: uv run ty check celery_redis_plus/
 
   test:
     runs-on: ubuntu-latest

@@ -51,6 +51,12 @@ jobs:
 
       - name: Trigger publish workflow
         if: steps.version.outputs.on_pypi == 'false'
-        run: gh workflow run publish.yml -f version=${{ steps.version.outputs.current }}
+        run: gh workflow run publish.yml -f version=${{ steps.version.outputs.current }} -R ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Trigger docs workflow for new tag
+        if: steps.version.outputs.on_pypi == 'false' && steps.version.outputs.tag_exists == 'false'
+        run: gh workflow run docs.yml --ref "v${{ steps.version.outputs.current }}" -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ github.token }}

@@ -58,14 +58,7 @@ repos:
       - id: ty
         name: ty
         language: system
-        entry: uv run ty check
-        pass_filenames: false
-        always_run: true
-        stages: [pre-push]
-      - id: mypy
-        name: mypy
-        language: system
-        entry: uv run mypy celery_redis_plus/
+        entry: uv run ty check celery_redis_plus/
         pass_filenames: false
         always_run: true
         stages: [pre-push]
