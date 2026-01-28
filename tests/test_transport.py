@@ -94,6 +94,26 @@ class TestQueueScore:
         # Allow small tolerance for int() truncation in _queue_score
         assert before - 0.001 <= timestamp <= after + 0.001
 
+    def test_priority_clamped_when_out_of_range(self) -> None:
+        """Test that out-of-range priorities are clamped to 0-255."""
+        now = time.time()
+
+        # Test priority below minimum (should clamp to 0)
+        score_negative = _queue_score(priority=-10, timestamp=now)
+        score_zero = _queue_score(priority=0, timestamp=now)
+        assert score_negative == score_zero
+
+        # Test priority above maximum (should clamp to 255)
+        score_over = _queue_score(priority=300, timestamp=now)
+        score_max = _queue_score(priority=255, timestamp=now)
+        assert score_over == score_max
+
+        # Verify extreme values also clamp correctly
+        score_very_negative = _queue_score(priority=-1000, timestamp=now)
+        score_very_high = _queue_score(priority=1000, timestamp=now)
+        assert score_very_negative == score_zero
+        assert score_very_high == score_max
+
 
 @pytest.mark.unit
 class TestRedisHelpers:

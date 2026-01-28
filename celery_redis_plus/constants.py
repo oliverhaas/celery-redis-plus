@@ -9,6 +9,10 @@ MESSAGES_INDEX_SUFFIX = ":index"
 # Max score ~2.6e15 is well under IEEE 754 exact integer limit (2^53 ≈ 9e15).
 PRIORITY_SCORE_MULTIPLIER = 10**13
 
+# Priority range (0-255, matching RabbitMQ semantics)
+MIN_PRIORITY = 0
+MAX_PRIORITY = 255
+
 # Default priority value (lowest priority, matching RabbitMQ default)
 DEFAULT_PRIORITY = 0
 

@@ -63,7 +63,9 @@ from .constants import (
     DEFAULT_REQUEUE_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
+    MAX_PRIORITY,
     MESSAGE_KEY_PREFIX,
+    MIN_PRIORITY,
     PRIORITY_SCORE_MULTIPLIER,
     QUEUE_KEY_PREFIX,
 )
@@ -99,7 +101,8 @@ def _queue_score(priority: int, timestamp: float | None = None) -> float:
     Within same priority, earlier timestamp = lower score = popped first (FIFO).
 
     Args:
-        priority: Message priority (0-255, higher is higher priority, matching RabbitMQ)
+        priority: Message priority (0-255, higher is higher priority, matching RabbitMQ).
+            Values outside this range are clamped with a warning.
         timestamp: Unix timestamp in seconds (defaults to current time)
 
     Returns:
@@ -107,9 +110,18 @@ def _queue_score(priority: int, timestamp: float | None = None) -> float:
     """
     if timestamp is None:
         timestamp = time()
+    # Clamp priority to valid range (0-255)
+    if priority < MIN_PRIORITY or priority > MAX_PRIORITY:
+        logger.warning(
+            "Priority %d out of range (%d-%d), clamping to valid range",
+            priority,
+            MIN_PRIORITY,
+            MAX_PRIORITY,
+        )
+        priority = max(MIN_PRIORITY, min(MAX_PRIORITY, priority))
     # Invert priority so higher priority number = lower score = popped first
     # Multiply by large factor to leave room for millisecond timestamps
-    return (255 - priority) * PRIORITY_SCORE_MULTIPLIER + int(timestamp * 1000)
+    return (MAX_PRIORITY - priority) * PRIORITY_SCORE_MULTIPLIER + int(timestamp * 1000)
 
 
 def get_redis_error_classes() -> error_classes_t:
