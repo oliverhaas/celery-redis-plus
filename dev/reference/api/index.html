@@ -586,6 +586,78 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="broker_transport_options">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#core-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Core Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#message-storage-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Message Storage Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#connection-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Connection Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fanout-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fanout Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#advanced-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Advanced Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#example-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example Configuration
+      
+    </span>
+  </a>
+  
 </li>
         
       </ul>
@@ -598,6 +670,17 @@
     <span class="md-ellipsis">
       
         Redis Keys
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#constants" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Constants
       
     </span>
   </a>
@@ -751,6 +834,78 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="broker_transport_options">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#core-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Core Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#message-storage-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Message Storage Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#connection-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Connection Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fanout-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fanout Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#advanced-options" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Advanced Options
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#example-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Example Configuration
+      
+    </span>
+  </a>
+  
 </li>
         
       </ul>
@@ -763,6 +918,17 @@
     <span class="md-ellipsis">
       
         Redis Keys
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#constants" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Constants
       
     </span>
   </a>
@@ -807,7 +973,7 @@
 </ul>
 <h2 id="bootstep">Bootstep<a class="headerlink" href="#bootstep" title="Permanent link">&para;</a></h2>
 <h3 id="celery_redis_plusdelayeddeliverybootstep"><code>celery_redis_plus.DelayedDeliveryBootstep</code><a class="headerlink" href="#celery_redis_plusdelayeddeliverybootstep" title="Permanent link">&para;</a></h3>
-<p>Worker bootstep for background message processing and recovery.</p>
+<p>Worker bootstep that integrates with the Celery consumer lifecycle.</p>
 <p><strong>Usage:</strong></p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">celery_redis_plus</span><span class="w"> </span><span class="kn">import</span> <span class="n">DelayedDeliveryBootstep</span>
 </span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
@@ -815,12 +981,13 @@
 </span></code></pre></div>
 <p><strong>Responsibilities:</strong></p>
 <ul>
-<li>Background thread for checking and delivering delayed messages</li>
-<li>Recovery of messages that exceeded visibility timeout</li>
-<li>Cleanup of expired message hashes</li>
+<li>Signals transport when consumer starts/stops</li>
+<li>Enables native delayed delivery mode on the transport</li>
 </ul>
 <h2 id="configuration-options">Configuration Options<a class="headerlink" href="#configuration-options" title="Permanent link">&para;</a></h2>
 <h3 id="broker_transport_options"><code>broker_transport_options</code><a class="headerlink" href="#broker_transport_options" title="Permanent link">&para;</a></h3>
+<p>All options are passed via Celery's <code>broker_transport_options</code> configuration.</p>
+<h4 id="core-options">Core Options<a class="headerlink" href="#core-options" title="Permanent link">&para;</a></h4>
 <table>
 <thead>
 <tr>
@@ -832,22 +999,114 @@
 </thead>
 <tbody>
 <tr>
-<td><code>global_keyprefix</code></td>
-<td><code>str</code></td>
-<td><code>""</code></td>
-<td>Prefix for all Redis keys</td>
-</tr>
-<tr>
 <td><code>visibility_timeout</code></td>
 <td><code>int</code></td>
 <td><code>300</code></td>
 <td>Seconds before unacked messages are reclaimed</td>
 </tr>
 <tr>
-<td><code>stream_max_length</code></td>
+<td><code>global_keyprefix</code></td>
+<td><code>str</code></td>
+<td><code>""</code></td>
+<td>Prefix for all Redis keys</td>
+</tr>
+<tr>
+<td><code>stream_maxlen</code></td>
 <td><code>int</code></td>
 <td><code>10000</code></td>
-<td>Max messages per stream (approximate)</td>
+<td>Max messages per fanout stream (approximate)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="message-storage-options">Message Storage Options<a class="headerlink" href="#message-storage-options" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>message_key_prefix</code></td>
+<td><code>str</code></td>
+<td><code>"message:"</code></td>
+<td>Prefix for per-message hash keys</td>
+</tr>
+<tr>
+<td><code>message_ttl</code></td>
+<td><code>int</code></td>
+<td><code>259200</code></td>
+<td>TTL in seconds for message hashes (default: 3 days)</td>
+</tr>
+<tr>
+<td><code>messages_index_key</code></td>
+<td><code>str</code></td>
+<td><code>"messages_index"</code></td>
+<td>Key name for the messages index sorted set</td>
+</tr>
+</tbody>
+</table>
+<h4 id="connection-options">Connection Options<a class="headerlink" href="#connection-options" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>socket_timeout</code></td>
+<td><code>float</code></td>
+<td><code>None</code></td>
+<td>Socket timeout in seconds</td>
+</tr>
+<tr>
+<td><code>socket_connect_timeout</code></td>
+<td><code>float</code></td>
+<td><code>None</code></td>
+<td>Socket connection timeout in seconds</td>
+</tr>
+<tr>
+<td><code>socket_keepalive</code></td>
+<td><code>bool</code></td>
+<td><code>None</code></td>
+<td>Enable TCP keepalive</td>
+</tr>
+<tr>
+<td><code>socket_keepalive_options</code></td>
+<td><code>dict</code></td>
+<td><code>None</code></td>
+<td>TCP keepalive options</td>
+</tr>
+<tr>
+<td><code>max_connections</code></td>
+<td><code>int</code></td>
+<td><code>10</code></td>
+<td>Maximum connections in pool</td>
+</tr>
+<tr>
+<td><code>health_check_interval</code></td>
+<td><code>int</code></td>
+<td><code>25</code></td>
+<td>Health check interval in seconds</td>
+</tr>
+<tr>
+<td><code>retry_on_timeout</code></td>
+<td><code>bool</code></td>
+<td><code>None</code></td>
+<td>Retry on timeout</td>
+</tr>
+<tr>
+<td><code>client_name</code></td>
+<td><code>str</code></td>
+<td><code>None</code></td>
+<td>Redis client name for <code>CLIENT SETNAME</code></td>
 </tr>
 <tr>
 <td><code>ssl</code></td>
@@ -857,6 +1116,63 @@
 </tr>
 </tbody>
 </table>
+<h4 id="fanout-options">Fanout Options<a class="headerlink" href="#fanout-options" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fanout_prefix</code></td>
+<td><code>bool</code> or <code>str</code></td>
+<td><code>True</code></td>
+<td>Prefix for fanout streams (<code>True</code> uses <code>/{db}.</code>)</td>
+</tr>
+<tr>
+<td><code>fanout_patterns</code></td>
+<td><code>bool</code></td>
+<td><code>True</code></td>
+<td>Enable pattern-based fanout routing</td>
+</tr>
+</tbody>
+</table>
+<h4 id="advanced-options">Advanced Options<a class="headerlink" href="#advanced-options" title="Permanent link">&para;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sep</code></td>
+<td><code>str</code></td>
+<td><code>"\x06\x16"</code></td>
+<td>Separator for binding key encoding</td>
+</tr>
+</tbody>
+</table>
+<h3 id="example-configuration">Example Configuration<a class="headerlink" href="#example-configuration" title="Permanent link">&para;</a></h3>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">app</span><span class="o">.</span><span class="n">config_from_object</span><span class="p">({</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="s1">&#39;broker_url&#39;</span><span class="p">:</span> <span class="s1">&#39;celery_redis_plus.transport:Transport://localhost:6379/0&#39;</span><span class="p">,</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="s1">&#39;broker_transport_options&#39;</span><span class="p">:</span> <span class="p">{</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>        <span class="s1">&#39;global_keyprefix&#39;</span><span class="p">:</span> <span class="s1">&#39;myapp:&#39;</span><span class="p">,</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>        <span class="s1">&#39;visibility_timeout&#39;</span><span class="p">:</span> <span class="mi">600</span><span class="p">,</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>        <span class="s1">&#39;stream_maxlen&#39;</span><span class="p">:</span> <span class="mi">50000</span><span class="p">,</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>        <span class="s1">&#39;message_ttl&#39;</span><span class="p">:</span> <span class="mi">86400</span><span class="p">,</span>  <span class="c1"># 1 day</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>        <span class="s1">&#39;max_connections&#39;</span><span class="p">:</span> <span class="mi">20</span><span class="p">,</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>        <span class="s1">&#39;health_check_interval&#39;</span><span class="p">:</span> <span class="mi">30</span><span class="p">,</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    <span class="p">},</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="p">})</span>
+</span></code></pre></div>
 <h2 id="redis-keys">Redis Keys<a class="headerlink" href="#redis-keys" title="Permanent link">&para;</a></h2>
 <p>The transport uses the following Redis key patterns:</p>
 <table>
@@ -892,6 +1208,59 @@
 <td><code>_kombu.binding.{exchange}</code></td>
 <td>Set</td>
 <td>Queue-exchange bindings</td>
+</tr>
+</tbody>
+</table>
+<h2 id="constants">Constants<a class="headerlink" href="#constants" title="Permanent link">&para;</a></h2>
+<p>The following constants are used internally and define default behavior:</p>
+<table>
+<thead>
+<tr>
+<th>Constant</th>
+<th>Value</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DEFAULT_VISIBILITY_TIMEOUT</code></td>
+<td><code>300</code></td>
+<td>Default visibility timeout (5 minutes)</td>
+</tr>
+<tr>
+<td><code>DEFAULT_REQUEUE_CHECK_INTERVAL</code></td>
+<td><code>60</code></td>
+<td>Interval for checking messages to requeue</td>
+</tr>
+<tr>
+<td><code>DEFAULT_REQUEUE_BATCH_LIMIT</code></td>
+<td><code>1000</code></td>
+<td>Max messages processed per requeue cycle</td>
+</tr>
+<tr>
+<td><code>DEFAULT_STREAM_MAXLEN</code></td>
+<td><code>10000</code></td>
+<td>Default max length for fanout streams</td>
+</tr>
+<tr>
+<td><code>DEFAULT_MESSAGE_TTL</code></td>
+<td><code>259200</code></td>
+<td>Default TTL for message hashes (3 days)</td>
+</tr>
+<tr>
+<td><code>PRIORITY_SCORE_MULTIPLIER</code></td>
+<td><code>10^13</code></td>
+<td>Multiplier for priority in score calculation</td>
+</tr>
+<tr>
+<td><code>QUEUE_KEY_PREFIX</code></td>
+<td><code>"queue:"</code></td>
+<td>Prefix for queue sorted sets</td>
+</tr>
+<tr>
+<td><code>MESSAGE_KEY_PREFIX</code></td>
+<td><code>"message:"</code></td>
+<td>Prefix for message hashes</td>
 </tr>
 </tbody>
 </table>

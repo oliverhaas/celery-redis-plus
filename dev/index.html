@@ -832,7 +832,7 @@
 <h3 id="stream-based-fanout">Stream-based Fanout<a class="headerlink" href="#stream-based-fanout" title="Permanent link">&para;</a></h3>
 <p>Fanout exchanges use Redis Streams. Messages are added with <code>XADD</code>, and each consumer uses <code>XREAD</code> tracking their own position. Old messages are trimmed based on <code>stream_maxlen</code>.</p>
 <h2 id="contributing">Contributing<a class="headerlink" href="#contributing" title="Permanent link">&para;</a></h2>
-<p>This package is intended as a temporary solution until these improvements are merged upstream into Celery/Kombu. Contributions are welcome! For consulting inquiries, contact ohaas@e1plus.de.</p>
+<p>This package is intended as a temporary solution until these improvements are merged upstream into Celery/Kombu. Contributions are welcome!</p>
 <h2 id="license">License<a class="headerlink" href="#license" title="Permanent link">&para;</a></h2>
 <p>MIT License - see <a href="https://github.com/oliverhaas/celery-redis-plus/blob/main/LICENSE">LICENSE</a> for details.</p>
 
