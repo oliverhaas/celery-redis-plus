@@ -91,17 +91,24 @@ unfixable = []
   "ANN",     # Type annotations not required in tests
   "ARG001",  # Pytest fixtures appear as unused arguments
   "ARG002",
+  "BLE001",  # Blind exceptions acceptable for test result collection
   "D",       # Docstrings not required in tests
   "PLR0913", # Too many arguments in test fixtures
+  "PLR0915", # Long test functions acceptable
   "PLR2004", # Magic values in tests are fine
+  "PLW0603", # Global statements for test state tracking
   "S101",    # assert in tests
+  "S311",    # Pseudo-random ok for tests (not cryptographic)
+  "T201",    # Print statements useful in manual tests
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not manual'"
 markers = [
   "unit: marks tests as unit tests",
   "integration: marks tests as integration tests",
+  "manual: marks tests as manual-only (excluded from normal runs, run with: pytest -m manual)",
 ]
 
 [tool.coverage.run]
