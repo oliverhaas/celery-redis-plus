@@ -564,7 +564,6 @@ class Channel(virtual.Channel):
     sep = "\x06\x16"
     _in_poll = False
     _in_fanout_poll = False
-    _fanout_queues: ClassVar[dict[str, tuple[str, str]]] = {}
 
     # Message storage keys
     # Per-message hash keys use format: {message_key_prefix}{delivery_tag}
@@ -628,6 +627,7 @@ class Channel(virtual.Channel):
         self.ResponseError = self._get_response_error()
         self.active_fanout_queues: set[str] = set()
         self.auto_delete_queues: set[str] = set()
+        self._fanout_queues: dict[str, tuple[str, str]] = {}
         self._fanout_to_queue: dict[str, str] = {}
         self.handlers = {"BZMPOP": self._bzmpop_read, "XREAD": self._xread_read}
         # Track last-read stream ID per stream for fanout (start with $ = only new messages)
@@ -1143,8 +1143,8 @@ class Channel(virtual.Channel):
             client = self.__dict__["client"]
             connection, client.connection = client.connection, None
             connection.disconnect()
-        except (KeyError, AttributeError, self.ResponseError):
-            pass
+        except (KeyError, AttributeError, self.ResponseError) as exc:
+            logger.debug("Error closing Redis client (may be expected during shutdown): %s", exc)
 
     def _prepare_virtual_host(self, vhost: Any) -> int:
         if not isinstance(vhost, numbers.Integral):

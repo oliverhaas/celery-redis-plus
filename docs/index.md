@@ -39,7 +39,7 @@ Fanout exchanges use Redis Streams. Messages are added with `XADD`, and each con
 
 ## Contributing
 
-This package is intended as a temporary solution until these improvements are merged upstream into Celery/Kombu. Contributions are welcome! For consulting inquiries, contact ohaas@e1plus.de.
+This package is intended as a temporary solution until these improvements are merged upstream into Celery/Kombu. Contributions are welcome!
 
 ## License
 

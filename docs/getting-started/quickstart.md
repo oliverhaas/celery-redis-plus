@@ -36,7 +36,7 @@ app.config_from_object({
     'broker_transport_options': {
         'global_keyprefix': 'myapp:',        # Prefix for all Redis keys
         'visibility_timeout': 300,          # Seconds before unacked messages are reclaimed
-        'stream_max_length': 10000,          # Max messages per stream (approximate)
+        'stream_maxlen': 10000,               # Max messages per stream (approximate)
     },
 })
 ```

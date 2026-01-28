@@ -25,7 +25,7 @@ app.config_from_object({
 
 ### `celery_redis_plus.DelayedDeliveryBootstep`
 
-Worker bootstep for background message processing and recovery.
+Worker bootstep that integrates with the Celery consumer lifecycle.
 
 **Usage:**
 
@@ -37,20 +37,73 @@ app.steps['consumer'].add(DelayedDeliveryBootstep)
 
 **Responsibilities:**
 
-- Background thread for checking and delivering delayed messages
-- Recovery of messages that exceeded visibility timeout
-- Cleanup of expired message hashes
+- Signals transport when consumer starts/stops
+- Enables native delayed delivery mode on the transport
 
 ## Configuration Options
 
 ### `broker_transport_options`
 
+All options are passed via Celery's `broker_transport_options` configuration.
+
+#### Core Options
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `global_keyprefix` | `str` | `""` | Prefix for all Redis keys |
 | `visibility_timeout` | `int` | `300` | Seconds before unacked messages are reclaimed |
-| `stream_max_length` | `int` | `10000` | Max messages per stream (approximate) |
+| `global_keyprefix` | `str` | `""` | Prefix for all Redis keys |
+| `stream_maxlen` | `int` | `10000` | Max messages per fanout stream (approximate) |
+
+#### Message Storage Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `message_key_prefix` | `str` | `"message:"` | Prefix for per-message hash keys |
+| `message_ttl` | `int` | `259200` | TTL in seconds for message hashes (default: 3 days) |
+| `messages_index_key` | `str` | `"messages_index"` | Key name for the messages index sorted set |
+
+#### Connection Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `socket_timeout` | `float` | `None` | Socket timeout in seconds |
+| `socket_connect_timeout` | `float` | `None` | Socket connection timeout in seconds |
+| `socket_keepalive` | `bool` | `None` | Enable TCP keepalive |
+| `socket_keepalive_options` | `dict` | `None` | TCP keepalive options |
+| `max_connections` | `int` | `10` | Maximum connections in pool |
+| `health_check_interval` | `int` | `25` | Health check interval in seconds |
+| `retry_on_timeout` | `bool` | `None` | Retry on timeout |
+| `client_name` | `str` | `None` | Redis client name for `CLIENT SETNAME` |
 | `ssl` | `bool` or `dict` | `None` | SSL/TLS configuration |
+
+#### Fanout Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `fanout_prefix` | `bool` or `str` | `True` | Prefix for fanout streams (`True` uses `/{db}.`) |
+| `fanout_patterns` | `bool` | `True` | Enable pattern-based fanout routing |
+
+#### Advanced Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `sep` | `str` | `"\x06\x16"` | Separator for binding key encoding |
+
+### Example Configuration
+
+```python
+app.config_from_object({
+    'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+    'broker_transport_options': {
+        'global_keyprefix': 'myapp:',
+        'visibility_timeout': 600,
+        'stream_maxlen': 50000,
+        'message_ttl': 86400,  # 1 day
+        'max_connections': 20,
+        'health_check_interval': 30,
+    },
+})
+```
 
 ## Redis Keys
 
@@ -63,3 +116,18 @@ The transport uses the following Redis key patterns:
 | `messages_index` | Sorted Set | Tracks `{delivery_tag: queue_at}` for visibility timeout and delayed delivery |
 | `/{db}.{exchange}` | Stream | Fanout messages |
 | `_kombu.binding.{exchange}` | Set | Queue-exchange bindings |
+
+## Constants
+
+The following constants are used internally and define default behavior:
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `DEFAULT_VISIBILITY_TIMEOUT` | `300` | Default visibility timeout (5 minutes) |
+| `DEFAULT_REQUEUE_CHECK_INTERVAL` | `60` | Interval for checking messages to requeue |
+| `DEFAULT_REQUEUE_BATCH_LIMIT` | `1000` | Max messages processed per requeue cycle |
+| `DEFAULT_STREAM_MAXLEN` | `10000` | Default max length for fanout streams |
+| `DEFAULT_MESSAGE_TTL` | `259200` | Default TTL for message hashes (3 days) |
+| `PRIORITY_SCORE_MULTIPLIER` | `10^13` | Multiplier for priority in score calculation |
+| `QUEUE_KEY_PREFIX` | `"queue:"` | Prefix for queue sorted sets |
+| `MESSAGE_KEY_PREFIX` | `"message:"` | Prefix for message hashes |
