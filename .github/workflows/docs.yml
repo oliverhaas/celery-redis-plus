@@ -43,4 +43,9 @@ jobs:
 
       - name: Deploy dev docs (main branch)
         if: github.ref == 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/')
-        run: uv run mike deploy --push dev
+        run: |
+          uv run mike deploy --push dev
+          # Set dev as default if no default exists yet (will be overridden when first version is released)
+          if ! uv run mike list | grep -q '\[default\]'; then
+            uv run mike set-default --push dev
+          fi
