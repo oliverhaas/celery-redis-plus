@@ -4,12 +4,21 @@
 
 ```python
 from celery import Celery
+import celery_redis_plus  # Register transport aliases
 from celery_redis_plus import DelayedDeliveryBootstep
 
 app = Celery('myapp')
+
+# Option 1: Use valkey:// URL scheme (simpler)
 app.config_from_object({
-    'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+    'broker_url': 'valkey://localhost:6379/0',
 })
+
+# Option 2: Use module path (explicit)
+# app.config_from_object({
+#     'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+# })
+
 app.steps['consumer'].add(DelayedDeliveryBootstep)
 
 @app.task
@@ -43,20 +52,26 @@ app.config_from_object({
 
 ### SSL/TLS Connections
 
-For secure connections to Redis, use the `ssl` transport option:
+For secure connections, use `valkeys://` or set the `ssl` transport option:
 
 ```python
+# Option 1: Use valkeys:// URL scheme (simplest)
 app.config_from_object({
-    'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+    'broker_url': 'valkeys://localhost:6379/0',
+})
+
+# Option 2: Use ssl transport option
+app.config_from_object({
+    'broker_url': 'valkey://localhost:6379/0',
     'broker_transport_options': {
         'ssl': True,  # Use default SSL settings
     },
 })
 
-# Or with custom SSL options:
+# Option 3: Custom SSL options
 import ssl
 app.config_from_object({
-    'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+    'broker_url': 'valkey://localhost:6379/0',
     'broker_transport_options': {
         'ssl': {
             'ssl_cert_reqs': ssl.CERT_REQUIRED,

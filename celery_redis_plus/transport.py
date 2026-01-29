@@ -1,11 +1,12 @@
-"""Enhanced Redis transport with BZMPOP priority queues, Streams fanout, and native delayed delivery.
+"""Enhanced Redis/Valkey transport with BZMPOP priority queues, Streams fanout, and native delayed delivery.
 
 This transport provides three key improvements over the standard Redis transport:
 1. BZMPOP + sorted sets for regular queues - enables full 0-255 priority support and better reliability
 2. Redis Streams for fanout exchanges - reliable consumer groups instead of lossy PUB/SUB
 3. Native delayed delivery - delay integrated into sorted set score calculation
 
-Requires Redis 7.0+ for BZMPOP support.
+Requires Redis 7.0+ or Valkey 7.0+ for BZMPOP support.
+Supports both redis-py and valkey-py client libraries.
 
 Connection String
 =================
@@ -73,10 +74,31 @@ from .constants import (
 if TYPE_CHECKING:
     from kombu import Connection
 
+# Try to import redis-py or valkey-py (both have compatible APIs)
+# Prefer redis-py if both are installed
+redis = None
+_client_library: str | None = None
+
 try:
-    import redis
+    import redis  # type: ignore[no-redef]
+
+    _client_library = "redis"
 except ImportError:  # pragma: no cover
-    redis = None  # type: ignore[assignment]
+    pass
+
+if redis is None:  # pragma: no cover
+    try:
+        import valkey as redis  # type: ignore[import-not-found,no-redef]
+
+        _client_library = "valkey"
+    except ImportError:
+        pass
+
+if redis is None:  # pragma: no cover
+    raise ImportError(
+        "celery-redis-plus requires either redis-py or valkey-py to be installed. "
+        "Install with: pip install celery-redis-plus[redis] or pip install celery-redis-plus[valkey]",
+    )
 
 
 logger = get_logger("kombu.transport.celery_redis_plus")
@@ -1202,12 +1224,17 @@ class Channel(virtual.Channel):
             else:
                 connparams.pop("health_check_interval")
 
-        # Check for SSL configuration from URL scheme (rediss://) or transport_options
+        # Check for SSL configuration from URL scheme (rediss:// or valkeys://) or transport_options
         ssl_config = conninfo.ssl
         if not ssl_config:
-            # Fall back to transport_options for path-based transport URLs
-            transport_options = self.connection.client.transport_options or {}
-            ssl_config = transport_options.get("ssl")
+            # Check if using valkeys:// transport (SSL variant of valkey://)
+            transport_cls = getattr(self.connection, "transport_cls", None)
+            if transport_cls == "valkeys":
+                ssl_config = True
+            else:
+                # Fall back to transport_options for path-based transport URLs
+                transport_options = self.connection.client.transport_options or {}
+                ssl_config = transport_options.get("ssl")
 
         if ssl_config:
             try:
@@ -1269,7 +1296,7 @@ class Channel(virtual.Channel):
     def _get_client(self) -> Any:
         if redis.VERSION < (3, 2, 0):
             raise VersionMismatch(
-                f"Redis transport requires redis-py versions 3.2.0 or later. You have {redis.__version__}",
+                f"Redis transport requires client library version 3.2.0 or later. You have {_client_library} {redis.__version__}",
             )
 
         if self.global_keyprefix:

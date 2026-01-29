@@ -17,7 +17,13 @@ classifiers = [
   "Topic :: System :: Distributed Computing",
   "Typing :: Typed",
 ]
-dependencies = ["celery>=5.5.0", "kombu>=5.5.0", "redis>=7.1.0"]
+dependencies = ["celery>=5.5.0", "kombu>=5.5.0"]
+
+[project.optional-dependencies]
+redis = ["redis>=7.1.0,<8"]
+hiredis = ["redis[hiredis]>=7.1.0,<8"]
+valkey = ["valkey>=6.1.0,<7"]
+libvalkey = ["valkey[libvalkey]>=6.1.0,<7"]
 
 [project.urls]
 Homepage = "https://github.com/oliverhaas/celery-redis-plus"
@@ -26,6 +32,8 @@ Repository = "https://github.com/oliverhaas/celery-redis-plus.git"
 
 [project.entry-points."kombu.transport"]
 "redis+celery-redis-plus" = "celery_redis_plus.transport:Transport"
+valkey = "celery_redis_plus.transport:Transport"
+valkeys = "celery_redis_plus.transport:Transport"
 
 [dependency-groups]
 dev = [
@@ -34,9 +42,11 @@ dev = [
   "pytest==9.0.2",
   "pytest-cov==7.0.0",
   "pytest-xdist>=3.8.0",
+  "redis[hiredis]==7.1.0",
   "ruff==0.14.13",
-  "testcontainers[redis]==4.14.0",
+  "testcontainers==4.14.0",
   "ty==0.0.13",
+  "valkey[libvalkey]==6.1.1",
 ]
 docs = ["mkdocs==1.6.1", "mkdocs-material==9.7.1", "mike==2.1.3"]
 
@@ -127,3 +137,6 @@ exclude_lines = [
 [tool.ty.rules]
 # Ignore warnings about unused type: ignore comments (compatibility with other tools)
 unused-ignore-comment = "ignore"
+# Conditional redis/valkey imports create union types that ty can't verify are non-None at runtime
+possibly-missing-attribute = "ignore"
+unsupported-base = "ignore"

@@ -8,10 +8,11 @@ import pytest
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.waiting_utils import wait_for_logs
 
+# Import redis module from transport (handles redis-py vs valkey-py)
+from celery_redis_plus.transport import redis
+
 if TYPE_CHECKING:
     from collections.abc import Generator
-
-    from redis import Redis
 
 
 # Container images for testing
@@ -38,7 +39,7 @@ def redis_container(request: pytest.FixtureRequest) -> Generator[tuple[str, int,
 
 
 @pytest.fixture
-def redis_client(redis_container: tuple[str, int, str]) -> Generator[Redis]:
+def redis_client(redis_container: tuple[str, int, str]) -> Generator[Any]:
     """Create a Redis client connected to the test container.
 
     Args:
@@ -47,8 +48,6 @@ def redis_client(redis_container: tuple[str, int, str]) -> Generator[Redis]:
     Yields:
         Connected Redis client.
     """
-    import redis
-
     host, port, _image = redis_container
     client = redis.Redis(host=host, port=port, decode_responses=False)
     yield client
