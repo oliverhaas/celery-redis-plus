@@ -31,7 +31,6 @@ Documentation = "https://oliverhaas.github.io/celery-redis-plus/"
 Repository = "https://github.com/oliverhaas/celery-redis-plus.git"
 
 [project.entry-points."kombu.transport"]
-"redis+celery-redis-plus" = "celery_redis_plus.transport:Transport"
 valkey = "celery_redis_plus.transport:Transport"
 valkeys = "celery_redis_plus.transport:Transport"
 

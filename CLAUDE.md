@@ -51,9 +51,15 @@ celery-redis-plus is a drop-in replacement Redis transport for Celery that uses:
 
 ### Configuration
 
-The broker URL must use the custom transport path:
+For Valkey, use the `valkey://` URL scheme:
 ```
-celery_redis_plus.transport:Transport://localhost:6379/0
+valkey://localhost:6379/0
+```
+
+For Redis, use `broker_transport` with a standard `redis://` URL:
+```python
+broker_url = "redis://localhost:6379/0"
+broker_transport = "celery_redis_plus.transport:Transport"
 ```
 
 ### Constants

@@ -9,8 +9,15 @@ Custom transport with sorted set queues, priority encoding, delayed delivery, an
 **Usage:**
 
 ```python
+# For Valkey
 app.config_from_object({
-    'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+    'broker_url': 'valkey://localhost:6379/0',
+})
+
+# For Redis
+app.config_from_object({
+    'broker_url': 'redis://localhost:6379/0',
+    'broker_transport': 'celery_redis_plus.transport:Transport',
 })
 ```
 
@@ -93,7 +100,7 @@ All options are passed via Celery's `broker_transport_options` configuration.
 
 ```python
 app.config_from_object({
-    'broker_url': 'celery_redis_plus.transport:Transport://localhost:6379/0',
+    'broker_url': 'valkey://localhost:6379/0',
     'broker_transport_options': {
         'global_keyprefix': 'myapp:',
         'visibility_timeout': 600,
