@@ -12,6 +12,11 @@ permissions:
   pages: write
   id-token: write
 
+# Prevent concurrent deployments to gh-pages
+concurrency:
+  group: docs-deploy
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -33,6 +38,9 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --group docs
+
+      - name: Fetch gh-pages branch
+        run: git fetch origin gh-pages:gh-pages || true
 
       - name: Deploy versioned docs (tags)
         if: startsWith(github.ref, 'refs/tags/v')
