@@ -583,7 +583,7 @@
 
 
 <h1 id="migrating-from-standard-redis-transport">Migrating from Standard Redis Transport<a class="headerlink" href="#migrating-from-standard-redis-transport" title="Permanent link">&para;</a></h1>
-<p>The two transports use different Redis data structures (LIST vs sorted set), so existing tasks won't be picked up after switching. Use Celery's built-in migration to move them:</p>
+<p>The two transports use different Redis data structures (list vs sorted set), so existing tasks won't be picked up after switching. Use Celery's built-in migration to move them:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">celery</span><span class="w"> </span><span class="kn">import</span> <span class="n">Celery</span>
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">celery.contrib.migrate</span><span class="w"> </span><span class="kn">import</span> <span class="n">migrate_tasks</span>
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
@@ -603,7 +603,8 @@
 </span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>    <span class="n">state</span> <span class="o">=</span> <span class="n">migrate_tasks</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">app</span><span class="o">=</span><span class="n">dest_app</span><span class="p">,</span> <span class="n">ack_messages</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 </span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Migrated </span><span class="si">{</span><span class="n">state</span><span class="o">.</span><span class="n">count</span><span class="si">}</span><span class="s2"> tasks&quot;</span><span class="p">)</span>
 </span></code></pre></div>
-<p>Workers can remain running during migration. Deploy new code, run the migration script, done.</p>
+<p>The <code>dest_app</code> is probably just the app of your new deployment and does not need to be explicitely defined, while <code>source_app</code> is a temporary dummy app for the old transports.</p>
+<p>For most cases where a few minutes of task delays do not matter, the migration is fairly straight forward. Deploy new code with the backwards-compatible <code>source_app</code>, run the migration script, migration itself is already done, then remove the <code>source_app</code> or any other leftovers in the next deployment.</p>
 
 
 

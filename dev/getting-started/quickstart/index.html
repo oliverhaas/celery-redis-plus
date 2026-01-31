@@ -461,17 +461,6 @@
   
 </li>
         
-          <li class="md-nav__item">
-  <a href="#ssltls-connections" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        SSL/TLS Connections
-      
-    </span>
-  </a>
-  
-</li>
-        
       </ul>
     </nav>
   
@@ -691,17 +680,6 @@
   
 </li>
         
-          <li class="md-nav__item">
-  <a href="#ssltls-connections" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        SSL/TLS Connections
-      
-    </span>
-  </a>
-  
-</li>
-        
       </ul>
     </nav>
   
@@ -739,65 +717,40 @@
 </span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="s1">&#39;broker_url&#39;</span><span class="p">:</span> <span class="s1">&#39;valkey://localhost:6379/0&#39;</span><span class="p">,</span>
 </span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="p">})</span>
 </span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>
-</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="c1"># For Redis: use redis:// with broker_transport</span>
-</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="c1"># app.config_from_object({</span>
-</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="c1">#     &#39;broker_url&#39;: &#39;redis://localhost:6379/0&#39;,</span>
-</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="c1">#     &#39;broker_transport&#39;: &#39;celery_redis_plus.transport:Transport&#39;,</span>
-</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="c1"># })</span>
-</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>
-</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="n">app</span><span class="o">.</span><span class="n">steps</span><span class="p">[</span><span class="s1">&#39;consumer&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">DelayedDeliveryBootstep</span><span class="p">)</span>
-</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>
-</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="nd">@app</span><span class="o">.</span><span class="n">task</span>
-</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="k">def</span><span class="w"> </span><span class="nf">my_task</span><span class="p">():</span>
-</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Hello!&quot;</span><span class="p">)</span>
-</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a>
-</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="c1"># Tasks with countdown/eta will use native delayed delivery</span>
-</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="n">my_task</span><span class="o">.</span><span class="n">apply_async</span><span class="p">(</span><span class="n">countdown</span><span class="o">=</span><span class="mi">120</span><span class="p">)</span>
-</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a>
-</span><span id="__span-0-26"><a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a><span class="c1"># Priority support (RabbitMQ semantics: higher = more important)</span>
-</span><span id="__span-0-27"><a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="n">my_task</span><span class="o">.</span><span class="n">apply_async</span><span class="p">(</span><span class="n">priority</span><span class="o">=</span><span class="mi">90</span><span class="p">)</span>   <span class="c1"># High priority</span>
-</span><span id="__span-0-28"><a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a><span class="n">my_task</span><span class="o">.</span><span class="n">apply_async</span><span class="p">(</span><span class="n">priority</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>    <span class="c1"># Low priority (default)</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="c1"># For Redis: use redis:// but with broker_transport,</span>
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="c1"># since the official Redis transport is otherwise used.</span>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="c1"># app.config_from_object({</span>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a><span class="c1">#     &#39;broker_url&#39;: &#39;redis://localhost:6379/0&#39;,</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="c1">#     &#39;broker_transport&#39;: &#39;celery_redis_plus.transport:Transport&#39;,</span>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="c1"># })</span>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="n">app</span><span class="o">.</span><span class="n">steps</span><span class="p">[</span><span class="s1">&#39;consumer&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">DelayedDeliveryBootstep</span><span class="p">)</span>
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="nd">@app</span><span class="o">.</span><span class="n">task</span>
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="k">def</span><span class="w"> </span><span class="nf">my_task</span><span class="p">():</span>
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Hello!&quot;</span><span class="p">)</span>
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a>
+</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="c1"># Use tasks as always</span>
+</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a><span class="n">my_task</span><span class="o">.</span><span class="n">delay</span><span class="p">()</span>
+</span><span id="__span-0-26"><a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a>
+</span><span id="__span-0-27"><a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a><span class="c1"># Tasks with countdown/eta will use native delayed delivery</span>
+</span><span id="__span-0-28"><a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a><span class="n">my_task</span><span class="o">.</span><span class="n">apply_async</span><span class="p">(</span><span class="n">countdown</span><span class="o">=</span><span class="mi">120</span><span class="p">)</span>
+</span><span id="__span-0-29"><a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a>
+</span><span id="__span-0-30"><a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a><span class="c1"># Priority support (RabbitMQ semantics: higher = more important)</span>
+</span><span id="__span-0-31"><a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a><span class="n">my_task</span><span class="o">.</span><span class="n">apply_async</span><span class="p">(</span><span class="n">priority</span><span class="o">=</span><span class="mi">200</span><span class="p">)</span>   <span class="c1"># High priority</span>
+</span><span id="__span-0-32"><a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a><span class="n">my_task</span><span class="o">.</span><span class="n">apply_async</span><span class="p">(</span><span class="n">priority</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>    <span class="c1"># Low priority (default)</span>
 </span></code></pre></div>
 <h2 id="configuration">Configuration<a class="headerlink" href="#configuration" title="Permanent link">&para;</a></h2>
 <h3 id="transport-options">Transport Options<a class="headerlink" href="#transport-options" title="Permanent link">&para;</a></h3>
-<p>Configure via Celery's <code>broker_transport_options</code>:</p>
+<p>Configure via Celery's <code>broker_transport_options</code>. Many options are the same as in the official Redis transport:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">app</span><span class="o">.</span><span class="n">config_from_object</span><span class="p">({</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>    <span class="s1">&#39;broker_url&#39;</span><span class="p">:</span> <span class="s1">&#39;valkey://localhost:6379/0&#39;</span><span class="p">,</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>    <span class="s1">&#39;broker_url&#39;</span><span class="p">:</span> <span class="s1">&#39;valkey://localhost:6379/0&#39;</span><span class="p">,</span> <span class="c1"># or valkeys:// for ssl</span>
 </span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>    <span class="s1">&#39;broker_transport_options&#39;</span><span class="p">:</span> <span class="p">{</span>
 </span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>        <span class="s1">&#39;global_keyprefix&#39;</span><span class="p">:</span> <span class="s1">&#39;myapp:&#39;</span><span class="p">,</span>        <span class="c1"># Prefix for all Redis keys</span>
 </span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>        <span class="s1">&#39;visibility_timeout&#39;</span><span class="p">:</span> <span class="mi">300</span><span class="p">,</span>           <span class="c1"># Seconds before unacked messages are reclaimed</span>
 </span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>        <span class="s1">&#39;stream_maxlen&#39;</span><span class="p">:</span> <span class="mi">10000</span><span class="p">,</span>              <span class="c1"># Max messages per stream (approximate)</span>
 </span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>    <span class="p">},</span>
 </span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="p">})</span>
-</span></code></pre></div>
-<h3 id="ssltls-connections">SSL/TLS Connections<a class="headerlink" href="#ssltls-connections" title="Permanent link">&para;</a></h3>
-<p>For secure connections, use <code>valkeys://</code> or set the <code>ssl</code> transport option:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Option 1: Use valkeys:// URL scheme</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">app</span><span class="o">.</span><span class="n">config_from_object</span><span class="p">({</span>
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="s1">&#39;broker_url&#39;</span><span class="p">:</span> <span class="s1">&#39;valkeys://localhost:6379/0&#39;</span><span class="p">,</span>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="p">})</span>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="c1"># Option 2: Use ssl transport option</span>
-</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="n">app</span><span class="o">.</span><span class="n">config_from_object</span><span class="p">({</span>
-</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    <span class="s1">&#39;broker_url&#39;</span><span class="p">:</span> <span class="s1">&#39;valkey://localhost:6379/0&#39;</span><span class="p">,</span>
-</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    <span class="s1">&#39;broker_transport_options&#39;</span><span class="p">:</span> <span class="p">{</span>
-</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>        <span class="s1">&#39;ssl&#39;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>  <span class="c1"># Use default SSL settings</span>
-</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>    <span class="p">},</span>
-</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="p">})</span>
-</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>
-</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="c1"># Option 3: Custom SSL options</span>
-</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="kn">import</span><span class="w"> </span><span class="nn">ssl</span>
-</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="n">app</span><span class="o">.</span><span class="n">config_from_object</span><span class="p">({</span>
-</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a>    <span class="s1">&#39;broker_url&#39;</span><span class="p">:</span> <span class="s1">&#39;valkey://localhost:6379/0&#39;</span><span class="p">,</span>
-</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>    <span class="s1">&#39;broker_transport_options&#39;</span><span class="p">:</span> <span class="p">{</span>
-</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>        <span class="s1">&#39;ssl&#39;</span><span class="p">:</span> <span class="p">{</span>
-</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>            <span class="s1">&#39;ssl_cert_reqs&#39;</span><span class="p">:</span> <span class="n">ssl</span><span class="o">.</span><span class="n">CERT_REQUIRED</span><span class="p">,</span>
-</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>            <span class="s1">&#39;ssl_ca_certs&#39;</span><span class="p">:</span> <span class="s1">&#39;/path/to/ca.crt&#39;</span><span class="p">,</span>
-</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a>            <span class="s1">&#39;ssl_certfile&#39;</span><span class="p">:</span> <span class="s1">&#39;/path/to/client.crt&#39;</span><span class="p">,</span>
-</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a>            <span class="s1">&#39;ssl_keyfile&#39;</span><span class="p">:</span> <span class="s1">&#39;/path/to/client.key&#39;</span><span class="p">,</span>
-</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a>        <span class="p">},</span>
-</span><span id="__span-2-25"><a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a>    <span class="p">},</span>
-</span><span id="__span-2-26"><a id="__codelineno-2-26" name="__codelineno-2-26" href="#__codelineno-2-26"></a><span class="p">})</span>
 </span></code></pre></div>
 
 
