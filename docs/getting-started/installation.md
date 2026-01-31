@@ -6,16 +6,26 @@
 - Celery >= 5.5.0
 - Redis >= 7.0 (for BZMPOP) or Valkey (any version)
 
-## Install with uv
+## Install
 
 ```bash
 uv add celery-redis-plus
 ```
 
-## Install with pip
+You'll also need a client library. Choose one:
 
 ```bash
-pip install celery-redis-plus
+# For Valkey (recommended)
+uv add celery-redis-plus[valkey]
+
+# For Valkey with libvalkey C extension (faster)
+uv add celery-redis-plus[libvalkey]
+
+# For Redis
+uv add celery-redis-plus[redis]
+
+# For Redis with hiredis C extension (faster)
+uv add celery-redis-plus[hiredis]
 ```
 
 ## Development Installation

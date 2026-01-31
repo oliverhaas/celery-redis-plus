@@ -1,6 +1,6 @@
 # Migrating from Standard Redis Transport
 
-The two transports use different Redis data structures (LIST vs sorted set), so existing tasks won't be picked up after switching. Use Celery's built-in migration to move them:
+The two transports use different Redis data structures (list vs sorted set), so existing tasks won't be picked up after switching. Use Celery's built-in migration to move them:
 
 ```python
 from celery import Celery
@@ -23,4 +23,6 @@ with source_app.connection() as src, dest_app.connection() as dst:
     print(f"Migrated {state.count} tasks")
 ```
 
-Workers can remain running during migration. Deploy new code, run the migration script, done.
+The `dest_app` is probably just the app of your new deployment and does not need to be explicitely defined, while `source_app` is a temporary dummy app for the old transports.
+
+For most cases where a few minutes of task delays do not matter, the migration is fairly straight forward. Deploy new code with the backwards-compatible `source_app`, run the migration script, migration itself is already done, then remove the `source_app` or any other leftovers in the next deployment.
