@@ -806,14 +806,14 @@
 
 
 <h1 id="celery-redis-plus">Celery Redis Plus<a class="headerlink" href="#celery-redis-plus" title="Permanent link">&para;</a></h1>
-<p>Enhanced Redis/Valkey transport for Celery with native delayed delivery, improved reliability, full priority support, and reliable fanout.</p>
+<p>Enhanced Redis/Valkey transport for Celery/Kombu with native delayed delivery, improved reliability, full priority support, and reliable fanout.</p>
 <h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
 <p><code>celery-redis-plus</code> is a replacement Redis/Valkey transport for Celery that addresses key limitations of the standard transport:</p>
 <ol>
 <li><strong>Native Delayed Delivery</strong> - Tasks with long <code>countdown</code> or <code>eta</code> are stored in Redis and delivered when due, instead of being held in worker memory.</li>
 <li><strong>Improved Reliability</strong> - Atomic message consumption via BZMPOP with improvements regarding visibility timeout ensures zero message loss.</li>
 <li><strong>Full Priority Support</strong> - All 256 priority levels (0-255) with RabbitMQ-compatible semantics (higher number = higher priority).</li>
-<li><strong>Reliable Fanout</strong> - Redis Streams replace lossy PUB/SUB for durable broadcast messaging.</li>
+<li><strong>Reliable Fanout</strong> - Redis Streams replace lossy PUB/SUB for durable broadcast event messaging.</li>
 </ol>
 <h2 id="requirements">Requirements<a class="headerlink" href="#requirements" title="Permanent link">&para;</a></h2>
 <p>We target recent versions for BZMPOP support and to simplify development.</p>
@@ -832,7 +832,7 @@
 <h3 id="stream-based-fanout">Stream-based Fanout<a class="headerlink" href="#stream-based-fanout" title="Permanent link">&para;</a></h3>
 <p>Fanout exchanges use Redis Streams. Messages are added with <code>XADD</code>, and each consumer uses <code>XREAD</code> tracking their own position. Old messages are trimmed based on <code>stream_maxlen</code>.</p>
 <h2 id="contributing">Contributing<a class="headerlink" href="#contributing" title="Permanent link">&para;</a></h2>
-<p>This package is intended as a temporary solution until these improvements are merged upstream into Celery/Kombu. Contributions are welcome!</p>
+<p>This package is intended as a temporary solution until these improvements are hopefully merged upstream into Celery/Kombu. Contributions are welcome!</p>
 <h2 id="license">License<a class="headerlink" href="#license" title="Permanent link">&para;</a></h2>
 <p>MIT License - see <a href="https://github.com/oliverhaas/celery-redis-plus/blob/main/LICENSE">LICENSE</a> for details.</p>
 
