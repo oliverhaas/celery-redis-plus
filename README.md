@@ -3,7 +3,7 @@
 [![PyPI version](https://img.shields.io/pypi/v/celery-redis-plus.svg)](https://pypi.org/project/celery-redis-plus/)
 [![CI](https://github.com/oliverhaas/celery-redis-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/oliverhaas/celery-redis-plus/actions/workflows/ci.yml)
 
-Enhanced Redis/Valkey transport for Celery with native delayed delivery, improved reliability, full priority support, and reliable fanout.
+Enhanced Redis/Valkey transport for Celery/Kombu with native delayed delivery, improved reliability, full priority support, and reliable fanout.
 
 ## Quick Example
 

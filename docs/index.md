@@ -1,6 +1,6 @@
 # Celery Redis Plus
 
-Enhanced Redis/Valkey transport for Celery with native delayed delivery, improved reliability, full priority support, and reliable fanout.
+Enhanced Redis/Valkey transport for Celery/Kombu with native delayed delivery, improved reliability, full priority support, and reliable fanout.
 
 ## Overview
 
@@ -9,7 +9,7 @@ Enhanced Redis/Valkey transport for Celery with native delayed delivery, improve
 1. **Native Delayed Delivery** - Tasks with long `countdown` or `eta` are stored in Redis and delivered when due, instead of being held in worker memory.
 2. **Improved Reliability** - Atomic message consumption via BZMPOP with improvements regarding visibility timeout ensures zero message loss.
 3. **Full Priority Support** - All 256 priority levels (0-255) with RabbitMQ-compatible semantics (higher number = higher priority).
-4. **Reliable Fanout** - Redis Streams replace lossy PUB/SUB for durable broadcast messaging.
+4. **Reliable Fanout** - Redis Streams replace lossy PUB/SUB for durable broadcast event messaging.
 
 ## Requirements
 
@@ -39,7 +39,7 @@ Fanout exchanges use Redis Streams. Messages are added with `XADD`, and each con
 
 ## Contributing
 
-This package is intended as a temporary solution until these improvements are merged upstream into Celery/Kombu. Contributions are welcome!
+This package is intended as a temporary solution until these improvements are hopefully merged upstream into Celery/Kombu. Contributions are welcome!
 
 ## License
 

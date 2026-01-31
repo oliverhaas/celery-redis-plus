@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-01-29
+
+### Added
+- Support for both redis-py and valkey-py client libraries (optional dependencies)
+- `valkey://` and `valkeys://` URL scheme support for easier configuration
+- SSL/TLS detection from `valkeys://` URL scheme
+- Priority clamping for out-of-range values (clamps to 0-255 range with warning)
+
+### Fixed
+- Documentation site 404 by setting dev as default version
+
 ## [0.2.2] - 2025-01-22
 
 ### Changed

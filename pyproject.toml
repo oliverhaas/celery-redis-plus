@@ -1,6 +1,6 @@
 [project]
 name = "celery-redis-plus"
-version = "0.2.2"
+version = "0.2.3"
 description = "Enhanced Kombu Redis transport for Celery"
 readme = "README.md"
 license = { text = "MIT" }
