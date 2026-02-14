@@ -1165,6 +1165,10 @@ class Channel(virtual.Channel):
             pipe.zadd(self._messages_index_key(queue), {delivery_tag: queue_at})
             if not is_native_delayed:
                 pipe.zadd(self._queue_key(queue), {delivery_tag: queue_score})
+            if queue in self._expires:
+                ttl_ms = self._expires[queue]
+                pipe.pexpire(self._queue_key(queue), ttl_ms)
+                pipe.pexpire(self._messages_index_key(queue), ttl_ms)
             pipe.execute()
 
     def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
@@ -1192,9 +1196,13 @@ class Channel(virtual.Channel):
         if x_expires is not None:
             x_expires = int(x_expires)
             if x_expires < MIN_QUEUE_EXPIRES:
-                raise ValueError(
-                    f"x-expires must be at least {MIN_QUEUE_EXPIRES}ms (30s), got {x_expires}ms",
+                warning(
+                    "x-expires %dms is below minimum %dms (30s), clamping to %dms",
+                    x_expires,
+                    MIN_QUEUE_EXPIRES,
+                    MIN_QUEUE_EXPIRES,
                 )
+                x_expires = MIN_QUEUE_EXPIRES
             self._expires[queue] = x_expires
             self.connection.cycle._update_expires_timer()
         x_message_ttl = arguments.get("x-message-ttl")

@@ -20,6 +20,7 @@ from celery_redis_plus.constants import (
     DEFAULT_VISIBILITY_TIMEOUT,
     MESSAGE_KEY_PREFIX,
     MESSAGES_INDEX_PREFIX,
+    MIN_QUEUE_EXPIRES,
     PRIORITY_SCORE_MULTIPLIER,
     QUEUE_KEY_PREFIX,
 )
@@ -430,6 +431,7 @@ class TestChannel:
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
         channel._message_ttls = {}
+        channel._expires = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -477,6 +479,7 @@ class TestChannel:
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
         channel._message_ttls = {}
+        channel._expires = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -533,6 +536,7 @@ class TestChannel:
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
         channel._message_ttls = {}
+        channel._expires = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -594,6 +598,7 @@ class TestChannel:
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
         channel._message_ttls = {}
+        channel._expires = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -645,6 +650,7 @@ class TestChannel:
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
         channel._message_ttls = {}
+        channel._expires = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -917,6 +923,7 @@ class TestChannel:
         channel.auto_delete_queues = set()
         channel._expires = {}
         channel._message_ttls = {}
+        channel._expires = {}
         channel.connection = MagicMock()
 
         channel._new_queue("my_queue", arguments={"x-expires": 60000})
@@ -924,16 +931,18 @@ class TestChannel:
         assert channel._expires["my_queue"] == 60000
         channel.connection.cycle._update_expires_timer.assert_called_once()
 
-    def test_new_queue_rejects_short_expires(self) -> None:
-        """Test that _new_queue rejects x-expires below 30 seconds."""
+    def test_new_queue_clamps_short_expires(self) -> None:
+        """Test that _new_queue clamps x-expires below 30s to the minimum."""
         channel = object.__new__(Channel)
         channel.auto_delete_queues = set()
         channel._expires = {}
         channel._message_ttls = {}
+        channel._expires = {}
         channel.connection = MagicMock()
 
-        with pytest.raises(ValueError, match="x-expires must be at least 30000ms"):
-            channel._new_queue("my_queue", arguments={"x-expires": 10000})
+        channel._new_queue("my_queue", arguments={"x-expires": 10000})
+
+        assert channel._expires["my_queue"] == MIN_QUEUE_EXPIRES
 
     def test_new_queue_stores_message_ttl(self) -> None:
         """Test that _new_queue stores x-message-ttl in _message_ttls dict."""
@@ -941,6 +950,7 @@ class TestChannel:
         channel.auto_delete_queues = set()
         channel._expires = {}
         channel._message_ttls = {}
+        channel._expires = {}
 
         channel._new_queue("my_queue", arguments={"x-message-ttl": 30000})
 
@@ -952,6 +962,7 @@ class TestChannel:
         channel.auto_delete_queues = set()
         channel._expires = {}
         channel._message_ttls = {}
+        channel._expires = {}
 
         channel._new_queue("my_queue")
 
@@ -966,6 +977,7 @@ class TestChannel:
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
         channel._message_ttls = {"my_queue": 60000}  # 60 seconds
+        channel._expires = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
