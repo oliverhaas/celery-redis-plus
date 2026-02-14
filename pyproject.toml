@@ -1,11 +1,18 @@
 [project]
 name = "celery-redis-plus"
-version = "0.2.5"
+version = "0.3.0"
 description = "Enhanced Kombu Valkey/Redis transport for Celery"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.13"
-keywords = ["celery", "redis", "message-queue", "priority-queue", "kombu"]
+keywords = [
+  "celery",
+  "redis",
+  "valkey",
+  "message-queue",
+  "priority-queue",
+  "kombu",
+]
 authors = [{ name = "Oliver Haas", email = "ohaas@e1plus.de" }]
 classifiers = [
   "Development Status :: 3 - Alpha",
