@@ -52,8 +52,6 @@ jobs:
       - name: Deploy main docs
         if: github.ref == 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/')
         run: |
-          # Remove old "dev" version if it exists (renamed to "main")
-          uv run mike delete --push dev 2>/dev/null || true
           uv run mike deploy --push main
           # Set main as default if no default exists yet (will be overridden when first version is released)
           if ! uv run mike list | grep -q '\[default\]'; then
