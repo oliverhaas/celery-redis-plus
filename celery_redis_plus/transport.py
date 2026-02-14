@@ -116,7 +116,6 @@ _channel_errors = virtual.Transport.channel_errors + (
 )
 
 logger = get_logger("kombu.transport.celery_redis_plus")
-crit, warning = logger.critical, logger.warning
 
 
 DEFAULT_PORT = 6379
@@ -1069,7 +1068,7 @@ class Channel(virtual.Channel):
                 total_enqueued += count or 0
 
         if total_enqueued >= DEFAULT_REQUEUE_BATCH_LIMIT:
-            warning(
+            logger.warning(
                 "Enqueue hit batch limit of %d. There may be more messages waiting.",
                 DEFAULT_REQUEUE_BATCH_LIMIT,
             )
@@ -1198,7 +1197,7 @@ class Channel(virtual.Channel):
             x_expires = int(x_expires)
             if x_expires < MIN_QUEUE_EXPIRES:
                 if not self._warned_expires_clamp:
-                    warning(
+                    logger.warning(
                         "x-expires %dms is below minimum %dms (30s), clamping",
                         x_expires,
                         MIN_QUEUE_EXPIRES,
