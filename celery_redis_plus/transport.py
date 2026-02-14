@@ -35,7 +35,6 @@ import functools
 import numbers
 import socket as socket_module
 import uuid
-from collections import namedtuple
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from queue import Empty
@@ -79,30 +78,48 @@ if TYPE_CHECKING:
 
 # Try to import redis-py or valkey-py (both have compatible APIs)
 # Prefer redis-py if both are installed
-redis = None
-_client_library: str | None = None
+client_lib: Any = None
+_client_lib_name: str | None = None
 
 try:
-    import redis  # type: ignore[no-redef]
+    import redis as client_lib
 
-    _client_library = "redis"
+    _client_lib_name = "redis"
 except ImportError:  # pragma: no cover
     pass
 
-if redis is None:  # pragma: no cover
+if client_lib is None:  # pragma: no cover
     try:
-        import valkey as redis  # type: ignore[import-not-found,no-redef]
+        import valkey as client_lib  # type: ignore[import-not-found,no-redef]
 
-        _client_library = "valkey"
+        _client_lib_name = "valkey"
     except ImportError:
         pass
 
-if redis is None:  # pragma: no cover
+if client_lib is None:  # pragma: no cover
     raise ImportError(
         "celery-redis-plus requires either redis-py or valkey-py to be installed. "
         "Install with: pip install celery-redis-plus[redis] or pip install celery-redis-plus[valkey]",
     )
 
+# Exception classes (compatible between redis-py and valkey-py)
+_client_exceptions = client_lib.exceptions
+_DataError = getattr(_client_exceptions, "InvalidData", _client_exceptions.DataError)
+
+_connection_errors = virtual.Transport.connection_errors + (
+    InconsistencyError,
+    socket_module.error,
+    OSError,
+    _client_exceptions.ConnectionError,
+    _client_exceptions.BusyLoadingError,
+    _client_exceptions.AuthenticationError,
+    _client_exceptions.TimeoutError,
+)
+_channel_errors = virtual.Transport.channel_errors + (
+    _DataError,
+    _client_exceptions.InvalidResponse,
+    _client_exceptions.ResponseError,
+)
 
 logger = get_logger("kombu.transport.celery_redis_plus")
 crit, warning = logger.critical, logger.warning
@@ -114,8 +131,6 @@ DEFAULT_DB = 0
 _PACKAGE_DIR = Path(__file__).parent
 _ENQUEUE_DUE_MESSAGES_LUA = (_PACKAGE_DIR / "transport_enqueue_due_messages.lua").read_text()
 _REQUEUE_MESSAGE_LUA = (_PACKAGE_DIR / "transport_requeue_message.lua").read_text()
-
-error_classes_t = namedtuple("error_classes_t", ("connection_errors", "channel_errors"))
 
 
 def _queue_score(priority: int, timestamp: float | None = None) -> float:
@@ -147,39 +162,6 @@ def _queue_score(priority: int, timestamp: float | None = None) -> float:
     # Invert priority so higher priority number = lower score = popped first
     # Multiply by large factor to leave room for millisecond timestamps
     return (MAX_PRIORITY - priority) * PRIORITY_SCORE_MULTIPLIER + int(timestamp * 1000)
-
-
-def get_redis_error_classes() -> error_classes_t:
-    """Return tuple of redis error classes."""
-    from redis import exceptions
-
-    # This exception changed name between redis-py versions
-    DataError = getattr(exceptions, "InvalidData", exceptions.DataError)
-    return error_classes_t(
-        virtual.Transport.connection_errors
-        + (
-            InconsistencyError,
-            socket_module.error,
-            OSError,
-            exceptions.ConnectionError,
-            exceptions.BusyLoadingError,
-            exceptions.AuthenticationError,
-            exceptions.TimeoutError,
-        ),
-        virtual.Transport.channel_errors
-        + (
-            DataError,
-            exceptions.InvalidResponse,
-            exceptions.ResponseError,
-        ),
-    )
-
-
-def get_redis_ConnectionError() -> type[Exception]:
-    """Return the redis ConnectionError exception class."""
-    from redis import exceptions
-
-    return exceptions.ConnectionError
 
 
 def _after_fork_cleanup_channel(channel: Channel) -> None:
@@ -300,20 +282,20 @@ class GlobalKeyPrefixMixin:
         )
 
 
-class PrefixedStrictRedis(GlobalKeyPrefixMixin, redis.Redis):
-    """Redis client that prefixes all keys."""
+class PrefixedStrictRedis(GlobalKeyPrefixMixin, client_lib.Redis):
+    """Redis/Valkey client that prefixes all keys."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.global_keyprefix = kwargs.pop("global_keyprefix", "")
-        redis.Redis.__init__(self, *args, **kwargs)
+        client_lib.Redis.__init__(self, *args, **kwargs)
 
 
-class PrefixedRedisPipeline(GlobalKeyPrefixMixin, redis.client.Pipeline):
-    """Redis pipeline that prefixes all keys."""
+class PrefixedRedisPipeline(GlobalKeyPrefixMixin, client_lib.client.Pipeline):
+    """Redis/Valkey pipeline that prefixes all keys."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.global_keyprefix = kwargs.pop("global_keyprefix", "")
-        redis.client.Pipeline.__init__(self, *args, **kwargs)
+        client_lib.client.Pipeline.__init__(self, *args, **kwargs)
 
 
 class QoS(virtual.QoS):
@@ -694,8 +676,8 @@ class Channel(virtual.Channel):
         "stream_maxlen",
     )
 
-    connection_class = redis.Connection if redis else None
-    connection_class_ssl = redis.SSLConnection if redis else None
+    connection_class = client_lib.Connection if client_lib else None
+    connection_class_ssl = client_lib.SSLConnection if client_lib else None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -703,7 +685,7 @@ class Channel(virtual.Channel):
         self._registered = False
         self._queue_cycle: list[str] = []
         self.Client = self._get_client()
-        self.ResponseError = self._get_response_error()
+        self.ResponseError = _client_exceptions.ResponseError
         self.active_fanout_queues: set[str] = set()
         self.auto_delete_queues: set[str] = set()
         self._fanout_queues: dict[str, tuple[str, str]] = {}
@@ -1380,7 +1362,7 @@ class Channel(virtual.Channel):
                     raise ValueError("socket:// URL must include a path")
                 connparams.update(
                     {
-                        "connection_class": redis.UnixDomainSocketConnection,
+                        "connection_class": client_lib.UnixDomainSocketConnection,
                         "path": "/" + path,
                     },
                     **query,
@@ -1419,18 +1401,18 @@ class Channel(virtual.Channel):
     def _get_pool(self, asynchronous: bool = False) -> Any:
         params = self._connparams(asynchronous=asynchronous)
         self.keyprefix_fanout = self.keyprefix_fanout.format(db=params["db"])
-        return redis.ConnectionPool(**params)
+        return client_lib.ConnectionPool(**params)
 
     def _get_client(self) -> Any:
-        if redis.VERSION < (3, 2, 0):
+        if client_lib.VERSION < (3, 2, 0):
             raise VersionMismatch(
-                f"Redis transport requires client library version 3.2.0 or later. You have {_client_library} {redis.__version__}",
+                f"Transport requires client library version 3.2.0 or later. You have {_client_lib_name} {client_lib.__version__}",
             )
 
         if self.global_keyprefix:
             return functools.partial(PrefixedStrictRedis, global_keyprefix=self.global_keyprefix)
 
-        return redis.Redis
+        return client_lib.Redis
 
     @contextmanager
     def conn_or_acquire(self, client: Any = None) -> Generator[Any]:
@@ -1461,11 +1443,6 @@ class Channel(virtual.Channel):
         """Dedicated client for XREAD fanout polling (needs its own connection)."""
         return self._create_client(asynchronous=True)
 
-    def _get_response_error(self) -> type[Exception]:
-        from redis import exceptions
-
-        return exceptions.ResponseError
-
     @property
     def active_queues(self) -> set[str]:
         """Set of queues being consumed from (excluding fanout queues)."""
@@ -1487,8 +1464,8 @@ class Transport(virtual.Transport):
 
     polling_interval = 10  # Timeout for blocking BZMPOP/XREADGROUP calls in seconds
     default_port = DEFAULT_PORT
-    driver_type = "redis"
-    driver_name = "redis"
+    driver_type = _client_lib_name or "redis"
+    driver_name = _client_lib_name or "redis"
     cycle: MultiChannelPoller  # type: ignore[assignment]
 
     #: Flag indicating this transport supports native delayed delivery
@@ -1499,12 +1476,16 @@ class Transport(virtual.Transport):
         exchange_type=frozenset(["direct", "topic", "fanout"]),
     )
 
-    if redis:
-        connection_errors, channel_errors = get_redis_error_classes()
+    if client_lib:
+        connection_errors = _connection_errors
+        channel_errors = _channel_errors
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        if redis is None:
-            raise ImportError("Missing redis library (pip install redis)")
+        if client_lib is None:
+            raise ImportError(
+                "celery-redis-plus requires either redis-py or valkey-py. "
+                "Install with: pip install celery-redis-plus[redis] or pip install celery-redis-plus[valkey]",
+            )
         super().__init__(*args, **kwargs)
 
         # Import signals module to register signal handlers when transport is used
@@ -1513,7 +1494,7 @@ class Transport(virtual.Transport):
         self.cycle = MultiChannelPoller()
 
     def driver_version(self) -> str:
-        return redis.__version__
+        return client_lib.__version__
 
     def register_with_event_loop(self, connection: Connection, loop: Any) -> None:
         cycle = self.cycle

@@ -33,9 +33,11 @@ from celery_redis_plus.transport import (
     QoS,
     Transport,
     _after_fork_cleanup_channel,
+    _channel_errors,
+    _client_exceptions,
+    _connection_errors,
     _queue_score,
-    get_redis_ConnectionError,
-    get_redis_error_classes,
+    client_lib,
 )
 
 if TYPE_CHECKING:
@@ -120,20 +122,14 @@ class TestQueueScore:
 class TestRedisHelpers:
     """Tests for Redis helper functions."""
 
-    def test_get_redis_error_classes(self) -> None:
-        """Test that get_redis_error_classes returns proper error tuples."""
-        error_classes = get_redis_error_classes()
-        assert hasattr(error_classes, "connection_errors")
-        assert hasattr(error_classes, "channel_errors")
-        assert isinstance(error_classes.connection_errors, tuple)
-        assert isinstance(error_classes.channel_errors, tuple)
+    def test_error_class_tuples(self) -> None:
+        """Test that error class tuples are properly defined."""
+        assert isinstance(_connection_errors, tuple)
+        assert isinstance(_channel_errors, tuple)
 
-    def test_get_redis_connection_error(self) -> None:
-        """Test that get_redis_ConnectionError returns the right exception."""
-        from redis import exceptions
-
-        error_class = get_redis_ConnectionError()
-        assert error_class is exceptions.ConnectionError
+    def test_connection_error_in_tuples(self) -> None:
+        """Test that ConnectionError is included in connection_errors."""
+        assert _client_exceptions.ConnectionError in _connection_errors
 
 
 @pytest.mark.unit
@@ -821,19 +817,15 @@ class TestChannel:
 
     def test_get_client_without_global_keyprefix(self) -> None:
         """Test _get_client returns redis.Redis when no global_keyprefix."""
-        import redis as redis_module
-
         channel = object.__new__(Channel)
         channel.global_keyprefix = ""
 
         client_class = channel._get_client()
 
-        assert client_class is redis_module.Redis
+        assert client_class is client_lib.Redis
 
     def test_connparams_with_ssl_dict(self) -> None:
         """Test _connparams applies SSL config from dict."""
-        import redis as redis_module
-
         channel = object.__new__(Channel)
         channel.global_keyprefix = ""
         channel.max_connections = 10
@@ -844,8 +836,8 @@ class TestChannel:
         channel.health_check_interval = 25
         channel.retry_on_timeout = False
         channel.client_name = None
-        channel.connection_class = redis_module.Connection
-        channel.connection_class_ssl = redis_module.SSLConnection
+        channel.connection_class = client_lib.Connection
+        channel.connection_class_ssl = client_lib.SSLConnection
 
         # Mock connection with SSL config as dict
         mock_conninfo = MagicMock()
@@ -864,13 +856,11 @@ class TestChannel:
 
         params = channel._connparams()
 
-        assert params["connection_class"] is redis_module.SSLConnection
+        assert params["connection_class"] is client_lib.SSLConnection
         assert params["ssl_cert_reqs"] == "required"
 
     def test_connparams_with_ssl_true(self) -> None:
         """Test _connparams applies SSL config when ssl=True."""
-        import redis as redis_module
-
         channel = object.__new__(Channel)
         channel.global_keyprefix = ""
         channel.max_connections = 10
@@ -881,8 +871,8 @@ class TestChannel:
         channel.health_check_interval = 25
         channel.retry_on_timeout = False
         channel.client_name = None
-        channel.connection_class = redis_module.Connection
-        channel.connection_class_ssl = redis_module.SSLConnection
+        channel.connection_class = client_lib.Connection
+        channel.connection_class_ssl = client_lib.SSLConnection
 
         # Mock connection with SSL = True
         mock_conninfo = MagicMock()
@@ -901,7 +891,7 @@ class TestChannel:
 
         params = channel._connparams()
 
-        assert params["connection_class"] is redis_module.SSLConnection
+        assert params["connection_class"] is client_lib.SSLConnection
 
     def test_prepare_queue_arguments(self) -> None:
         """Test that prepare_queue_arguments converts expires/message_ttl to ms."""
@@ -1410,12 +1400,10 @@ class TestTransport:
 
     def test_driver_version(self) -> None:
         """Test that driver_version returns redis version string."""
-        import redis as redis_module
-
         transport = MagicMock(spec=Transport)
         transport.driver_version = Transport.driver_version
         version = transport.driver_version(transport)
-        assert version == redis_module.__version__
+        assert version == client_lib.__version__
 
     def test_connection_errors_defined(self) -> None:
         """Test that connection and channel errors are defined."""
@@ -3359,9 +3347,7 @@ class TestQueueTTL:
             task_always_eager=False,
         )
 
-        import redis as redis_module
-
-        raw_client = redis_module.Redis(host=host, port=port, db=0)
+        raw_client = client_lib.Redis(host=host, port=port, db=0)
 
         try:
             with app.connection() as conn:
@@ -3448,9 +3434,7 @@ class TestGlobalKeyPrefix:
         add.delay(2, 3)
 
         # Verify the message is stored with the prefix
-        import redis
-
-        client = redis.Redis(host=host, port=port, db=0)
+        client = client_lib.Redis(host=host, port=port, db=0)
 
         # The queue should be prefixed with both global prefix and queue: prefix
         prefixed_queue_size: int = client.zcard(f"myapp:{QUEUE_KEY_PREFIX}celery")  # type: ignore[assignment]
