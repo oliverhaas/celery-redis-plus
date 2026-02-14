@@ -622,6 +622,7 @@ class Channel(virtual.Channel):
     sep = "\x06\x16"
     _in_poll = False
     _in_fanout_poll = False
+    _warned_expires_clamp = False
 
     # Message storage keys
     # Per-message hash keys use format: {message_key_prefix}{delivery_tag}
@@ -691,7 +692,6 @@ class Channel(virtual.Channel):
         # Per-queue TTL state from x-expires and x-message-ttl queue arguments
         self._expires: dict[str, int] = {}  # queue_name → TTL in ms
         self._message_ttls: dict[str, int] = {}  # queue_name → message TTL in ms
-        self._warned_expires_clamp = False
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -1203,7 +1203,7 @@ class Channel(virtual.Channel):
                         x_expires,
                         MIN_QUEUE_EXPIRES,
                     )
-                    self._warned_expires_clamp = True
+                    Channel._warned_expires_clamp = True
                 x_expires = MIN_QUEUE_EXPIRES
             self._expires[queue] = x_expires
             self.connection.cycle._update_expires_timer()

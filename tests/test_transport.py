@@ -923,7 +923,6 @@ class TestChannel:
         channel.auto_delete_queues = set()
         channel._expires = {}
         channel._message_ttls = {}
-        channel._warned_expires_clamp = False
         channel.connection = MagicMock()
 
         channel._new_queue("my_queue", arguments={"x-expires": 60000})
@@ -937,8 +936,8 @@ class TestChannel:
         channel.auto_delete_queues = set()
         channel._expires = {}
         channel._message_ttls = {}
-        channel._warned_expires_clamp = False
         channel.connection = MagicMock()
+        Channel._warned_expires_clamp = False
 
         channel._new_queue("my_queue", arguments={"x-expires": 10000})
 
