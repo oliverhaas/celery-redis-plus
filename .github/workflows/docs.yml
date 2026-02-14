@@ -1,8 +1,9 @@
-name: Documentation
+name: Docs
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -12,7 +13,6 @@ permissions:
   pages: write
   id-token: write
 
-# Prevent concurrent deployments to gh-pages
 concurrency:
   group: docs-deploy
   cancel-in-progress: false
@@ -27,11 +27,14 @@ jobs:
 
       - name: Configure Git
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name github-actions[bot]
+          git config user.email github-actions[bot]@users.noreply.github.com
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
 
       - name: Set up Python
         run: uv python install 3.13
@@ -39,21 +42,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --group docs
 
-      - name: Fetch gh-pages branch
-        run: git fetch origin gh-pages:gh-pages || true
-
-      - name: Deploy versioned docs (tags)
+      - name: Deploy docs (version tag)
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           uv run mike deploy --push --update-aliases $VERSION latest
           uv run mike set-default --push latest
 
-      - name: Deploy main docs
-        if: github.ref == 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/')
+      - name: Deploy docs (main branch)
+        if: github.ref == 'refs/heads/main'
         run: |
           uv run mike deploy --push main
-          # Set main as default if no default exists yet (will be overridden when first version is released)
-          if ! uv run mike list | grep -q '\[default\]'; then
-            uv run mike set-default --push main
-          fi
