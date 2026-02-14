@@ -49,11 +49,13 @@ jobs:
           uv run mike deploy --push --update-aliases $VERSION latest
           uv run mike set-default --push latest
 
-      - name: Deploy dev docs (main branch)
+      - name: Deploy main docs
         if: github.ref == 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/')
         run: |
-          uv run mike deploy --push dev
-          # Set dev as default if no default exists yet (will be overridden when first version is released)
+          # Remove old "dev" version if it exists (renamed to "main")
+          uv run mike delete --push dev 2>/dev/null || true
+          uv run mike deploy --push main
+          # Set main as default if no default exists yet (will be overridden when first version is released)
           if ! uv run mike list | grep -q '\[default\]'; then
-            uv run mike set-default --push dev
+            uv run mike set-default --push main
           fi
