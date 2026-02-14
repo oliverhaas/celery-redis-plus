@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+         <loc>https://oliverhaas.github.io/celery-redis-plus/0.2.5/</loc>
+         <lastmod>2026-02-14</lastmod>
+    </url>
+    <url>
+         <loc>https://oliverhaas.github.io/celery-redis-plus/0.2.5/getting-started/installation/</loc>
+         <lastmod>2026-02-14</lastmod>
+    </url>
+    <url>
+         <loc>https://oliverhaas.github.io/celery-redis-plus/0.2.5/getting-started/migration/</loc>
+         <lastmod>2026-02-14</lastmod>
+    </url>
+    <url>
+         <loc>https://oliverhaas.github.io/celery-redis-plus/0.2.5/getting-started/quickstart/</loc>
+         <lastmod>2026-02-14</lastmod>
+    </url>
+    <url>
+         <loc>https://oliverhaas.github.io/celery-redis-plus/0.2.5/reference/api/</loc>
+         <lastmod>2026-02-14</lastmod>
+    </url>
+    <url>
+         <loc>https://oliverhaas.github.io/celery-redis-plus/0.2.5/reference/changelog/</loc>
+         <lastmod>2026-02-14</lastmod>
+    </url>
+</urlset>
