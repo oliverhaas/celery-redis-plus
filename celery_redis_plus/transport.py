@@ -118,7 +118,6 @@ _channel_errors = virtual.Transport.channel_errors + (
 logger = get_logger("kombu.transport.celery_redis_plus")
 crit, warning = logger.critical, logger.warning
 
-_warned_expires_clamp: list[bool] = []
 
 DEFAULT_PORT = 6379
 DEFAULT_DB = 0
@@ -692,6 +691,7 @@ class Channel(virtual.Channel):
         # Per-queue TTL state from x-expires and x-message-ttl queue arguments
         self._expires: dict[str, int] = {}  # queue_name → TTL in ms
         self._message_ttls: dict[str, int] = {}  # queue_name → message TTL in ms
+        self._warned_expires_clamp = False
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -1197,13 +1197,13 @@ class Channel(virtual.Channel):
         if x_expires is not None and queue not in self._expires:
             x_expires = int(x_expires)
             if x_expires < MIN_QUEUE_EXPIRES:
-                if not _warned_expires_clamp:
+                if not self._warned_expires_clamp:
                     warning(
                         "x-expires %dms is below minimum %dms (30s), clamping",
                         x_expires,
                         MIN_QUEUE_EXPIRES,
                     )
-                    _warned_expires_clamp.append(True)
+                    self._warned_expires_clamp = True
                 x_expires = MIN_QUEUE_EXPIRES
             self._expires[queue] = x_expires
             self.connection.cycle._update_expires_timer()
