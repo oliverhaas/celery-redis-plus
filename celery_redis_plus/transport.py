@@ -523,8 +523,8 @@ class MultiChannelPoller:
     def _update_expires_timer(self) -> None:
         """Register or update the periodic PEXPIRE timer based on configured TTLs.
 
-        Interval = min(all configured x-expires) / 5, so the TTL is refreshed
-        ~5 times before it would expire.
+        Interval = min(all configured x-expires) / 2, so the TTL is refreshed
+        ~2 times before it would expire.
         """
         min_ttl_ms: int | None = None
         for channel in self._channels:
@@ -539,7 +539,7 @@ class MultiChannelPoller:
                 self._expires_timer_interval = None
             return
 
-        interval = min_ttl_ms / 5 / 1000  # ms → seconds, divided by 5
+        interval = min_ttl_ms / 2 / 1000  # ms → seconds, divided by 2
 
         if self._expires_timer_interval == interval:
             return
