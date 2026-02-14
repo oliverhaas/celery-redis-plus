@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Example project in `examples/simple/` demonstrating tasks, delayed delivery, priority, retries, and Flower
 
+## [0.2.4] - 2026-01-31
+
+### Added
+- Migration support from standard Redis transport
+
+### Fixed
+- Simplified transport configuration in docs
+
 ## [0.2.3] - 2026-01-29
 
 ### Added
