@@ -2854,7 +2854,7 @@ class TestMessageRequeue:
             client.hset(
                 message_key,
                 mapping={
-                    "payload": json_dumps(payload),  # type: ignore[call-arg]
+                    "payload": json_dumps(payload),
                     "exchange": "",
                     "routing_key": "celery",
                     "priority": "0",
@@ -2902,7 +2902,7 @@ class TestMessageRequeue:
             client.hset(
                 message_key,
                 mapping={
-                    "payload": json_dumps(payload),  # type: ignore[call-arg]
+                    "payload": json_dumps(payload),
                     "exchange": "",
                     "routing_key": "celery",
                     "priority": "0",
@@ -2983,7 +2983,7 @@ class TestMessageRequeue:
             client.hset(
                 message_key,
                 mapping={
-                    "payload": json_dumps(payload),  # type: ignore[call-arg]
+                    "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
                 },
@@ -3026,7 +3026,7 @@ class TestMessageRequeue:
             client.hset(
                 message_key,
                 mapping={
-                    "payload": json_dumps(payload),  # type: ignore[call-arg]
+                    "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
                     "redelivered": "0",
@@ -3071,7 +3071,7 @@ class TestMessageRequeue:
             client.hset(
                 message_key,
                 mapping={
-                    "payload": json_dumps(payload),  # type: ignore[call-arg]
+                    "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
                     "redelivered": "0",
@@ -3114,7 +3114,7 @@ class TestMessageRequeue:
             client.hset(
                 message_key,
                 mapping={
-                    "payload": json_dumps(payload),  # type: ignore[call-arg]
+                    "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
                 },
@@ -3158,7 +3158,7 @@ class TestMessageRequeue:
             client.hset(
                 message_key,
                 mapping={
-                    "payload": json_dumps(payload),  # type: ignore[call-arg]
+                    "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
                 },
@@ -3547,7 +3547,7 @@ class TestChannelConnectionFailure:
 
         with pytest.raises(OperationalError, match="Connection refused"), app.connection() as conn:
             # Force channel creation
-            _ = conn.default_channel  # type: ignore[attr-defined]
+            _ = conn.default_channel
 
         app.close()
 
@@ -3623,7 +3623,7 @@ class TestSynchronousGet:
             client.hset(
                 message_key,
                 mapping={
-                    "payload": json_dumps(payload),  # type: ignore[call-arg]
+                    "payload": json_dumps(payload),
                     "exchange": "",
                     "routing_key": "celery",
                     "priority": "0",

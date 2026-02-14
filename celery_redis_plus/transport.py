@@ -78,29 +78,23 @@ if TYPE_CHECKING:
 
 # Try to import redis-py or valkey-py (both have compatible APIs)
 # Prefer redis-py if both are installed
-client_lib: Any = None
-_client_lib_name: str | None = None
+client_lib: Any
+_client_lib_name: str
 
 try:
     import redis as client_lib
 
     _client_lib_name = "redis"
 except ImportError:  # pragma: no cover
-    pass
-
-if client_lib is None:  # pragma: no cover
     try:
-        import valkey as client_lib  # type: ignore[import-not-found,no-redef]
+        import valkey as client_lib
 
         _client_lib_name = "valkey"
     except ImportError:
-        pass
-
-if client_lib is None:  # pragma: no cover
-    raise ImportError(
-        "celery-redis-plus requires either redis-py or valkey-py to be installed. "
-        "Install with: pip install celery-redis-plus[redis] or pip install celery-redis-plus[valkey]",
-    )
+        raise ImportError(
+            "celery-redis-plus requires either redis-py or valkey-py to be installed. "
+            "Install with: pip install celery-redis-plus[redis] or pip install celery-redis-plus[valkey]",
+        ) from None
 
 # Exception classes (compatible between redis-py and valkey-py)
 _client_exceptions = client_lib.exceptions
@@ -735,9 +729,9 @@ class Channel(virtual.Channel):
 
     def _on_connection_disconnect(self, connection: Any) -> None:
         if self._in_poll is connection:
-            self._in_poll = None  # type: ignore[assignment]
+            self._in_poll = None
         if self._in_fanout_poll is connection:
-            self._in_fanout_poll = None  # type: ignore[assignment]
+            self._in_fanout_poll = None
         if self.connection and self.connection.cycle:
             self.connection.cycle._on_connection_disconnect(connection)
 
@@ -898,7 +892,7 @@ class Channel(virtual.Channel):
                 return self._drain_expired_and_deliver(dest)
             raise Empty
         finally:
-            self._in_poll = None  # type: ignore[assignment]
+            self._in_poll = None
 
     # --- XREADGROUP (Streams) methods for fanout ---
 
@@ -1007,7 +1001,7 @@ class Channel(virtual.Channel):
 
             raise Empty
         finally:
-            self._in_fanout_poll = None  # type: ignore[assignment]
+            self._in_fanout_poll = None
 
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
         return self.client.parse_response(self.client.connection, cmd_type)
@@ -1342,7 +1336,7 @@ class Channel(virtual.Channel):
             if hasattr(conn_class, "__bases__"):
                 classes += list(conn_class.__bases__)
             for klass in classes:
-                if accepts_argument(klass.__init__, "health_check_interval"):  # type: ignore[misc]
+                if accepts_argument(klass.__init__, "health_check_interval"):
                     break
             else:
                 connparams.pop("health_check_interval")
@@ -1395,7 +1389,7 @@ class Channel(virtual.Channel):
 
         if asynchronous:
 
-            class Connection(connection_cls):  # type: ignore[valid-type, misc]
+            class Connection(connection_cls):
                 def disconnect(self, *args: Any) -> None:
                     super().disconnect(*args)
                     if channel._registered:
@@ -1479,7 +1473,7 @@ class Transport(virtual.Transport):
     default_port = DEFAULT_PORT
     driver_type = _client_lib_name or "redis"
     driver_name = _client_lib_name or "redis"
-    cycle: MultiChannelPoller  # type: ignore[assignment]
+    cycle: MultiChannelPoller
 
     #: Flag indicating this transport supports native delayed delivery
     supports_native_delayed_delivery = True
