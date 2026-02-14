@@ -1199,7 +1199,8 @@ class Channel(virtual.Channel):
             if x_expires < MIN_QUEUE_EXPIRES:
                 if not self._warned_expires_clamp:
                     logger.warning(
-                        "x-expires %dms is below minimum %dms (30s), clamping",
+                        "x-expires %dms is below minimum %dms (30s), clamping."
+                        " This warning is shown once; other queues may also be affected.",
                         x_expires,
                         MIN_QUEUE_EXPIRES,
                     )
