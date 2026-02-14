@@ -1193,15 +1193,7 @@ class Channel(virtual.Channel):
         arguments = kwargs.get("arguments") or {}
         x_expires = arguments.get("x-expires")
         if x_expires is not None and queue not in self._expires:
-            x_expires = int(x_expires)
-            if x_expires < MIN_QUEUE_EXPIRES:
-                warning(
-                    "x-expires %dms is below minimum %dms (30s), clamping to %dms",
-                    x_expires,
-                    MIN_QUEUE_EXPIRES,
-                    MIN_QUEUE_EXPIRES,
-                )
-                x_expires = MIN_QUEUE_EXPIRES
+            x_expires = max(int(x_expires), MIN_QUEUE_EXPIRES)
             self._expires[queue] = x_expires
             self.connection.cycle._update_expires_timer()
         x_message_ttl = arguments.get("x-message-ttl")
