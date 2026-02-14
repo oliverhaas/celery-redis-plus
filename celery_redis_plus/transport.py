@@ -66,6 +66,7 @@ from .constants import (
     DEFAULT_VISIBILITY_TIMEOUT,
     MAX_PRIORITY,
     MESSAGE_KEY_PREFIX,
+    MESSAGES_INDEX_PREFIX,
     MIN_PRIORITY,
     PRIORITY_SCORE_MULTIPLIER,
     QUEUE_KEY_PREFIX,
@@ -364,8 +365,10 @@ class QoS(virtual.QoS):
 
     def _remove_from_indices(self, delivery_tag: str, pipe: Any = None) -> Any:
         message_key = self.channel._message_key(delivery_tag)
+        queue = cast("dict", self._delivered)[delivery_tag].delivery_info["routing_key"]
+        index_key = self.channel._messages_index_key(queue)
         with self.pipe_or_acquire(pipe) as pipe:
-            return pipe.zrem(self.messages_index_key, delivery_tag).delete(message_key)
+            return pipe.zrem(index_key, delivery_tag).delete(message_key)
 
     def maybe_update_messages_index(self) -> None:
         """Update scores of delivered messages to now + visibility_timeout.
@@ -381,11 +384,13 @@ class QoS(virtual.QoS):
             return
         queue_at = time() + self.visibility_timeout
         with self.channel.conn_or_acquire() as client, client.pipeline() as pipe:
-            for tag in self._delivered:
+            for tag, message in self._delivered.items():
                 # Skip fanout messages (they don't use the index)
                 if tag not in self._fanout_tags:
+                    queue = message.delivery_info["routing_key"]
+                    index_key = self.channel._messages_index_key(queue)
                     # XX = only update if member already exists (prevents re-adding acked messages)
-                    pipe.zadd(self.messages_index_key, {tag: queue_at}, xx=True)
+                    pipe.zadd(index_key, {tag: queue_at}, xx=True)
             pipe.execute()
 
     def enqueue_due_messages(self) -> int:
@@ -414,10 +419,6 @@ class QoS(virtual.QoS):
             leftmost: If True, requeue to front of queue (score=0).
         """
         self.channel._requeue_by_tag(tag, leftmost)
-
-    @cached_property
-    def messages_index_key(self) -> str:
-        return self.channel.messages_index_key
 
     @cached_property
     def visibility_timeout(self) -> float:
@@ -603,7 +604,6 @@ class Channel(virtual.Channel):
     # Per-message hash keys use format: {message_key_prefix}{delivery_tag}
     message_key_prefix = MESSAGE_KEY_PREFIX
     message_ttl = DEFAULT_MESSAGE_TTL  # TTL for per-message hashes (3 days default)
-    messages_index_key = "messages_index"
 
     # Visibility and timeout settings
     visibility_timeout: float = DEFAULT_VISIBILITY_TIMEOUT
@@ -633,7 +633,6 @@ class Channel(virtual.Channel):
         "sep",
         "message_key_prefix",
         "message_ttl",
-        "messages_index_key",
         "visibility_timeout",
         "fanout_prefix",
         "fanout_patterns",
@@ -732,6 +731,10 @@ class Channel(virtual.Channel):
             return queue_key[len(QUEUE_KEY_PREFIX) :]
         return queue_key
 
+    def _messages_index_key(self, queue: str) -> str:
+        """Get the Redis key for a queue's messages index sorted set."""
+        return f"{MESSAGES_INDEX_PREFIX}{queue}"
+
     def _get_message_from_hash(self, message_key: str, client: Any) -> dict[str, Any] | None:
         """Fetch message payload from per-message hash.
 
@@ -764,7 +767,7 @@ class Channel(virtual.Channel):
             self.active_fanout_queues.add(queue)
             self._fanout_to_queue[exchange] = queue
         ret = super().basic_consume(queue, *args, **kwargs)
-        self._update_queue_cycle()
+        self._queue_cycle = list(self.active_queues)
         return ret
 
     def basic_cancel(self, consumer_tag: str) -> Any:
@@ -788,7 +791,7 @@ class Channel(virtual.Channel):
         except KeyError:
             pass
         ret = super().basic_cancel(consumer_tag)
-        self._update_queue_cycle()
+        self._queue_cycle = list(self.active_queues)
         return ret
 
     # --- BZMPOP (sorted set) methods for regular queues ---
@@ -968,34 +971,38 @@ class Channel(virtual.Channel):
         - Delayed messages that are now ready to be processed (first delivery)
         - Messages that were consumed but not acked (redelivery)
 
-        Uses ZADD NX to avoid re-adding messages that are already in the queue.
-        The Lua script reads routing_key from each message's hash to add it to the
-        correct queue, and calculates new_queue_at = now + visibility_timeout.
+        Iterates over each active queue's per-queue messages index and runs
+        a Lua script that atomically moves due messages into the queue.
 
         Returns:
             Number of messages enqueued.
         """
+        if not self._queue_cycle:
+            return 0
+
         now = time()
-        # Check messages that will need enqueuing by next interval
         threshold = now + DEFAULT_REQUEUE_CHECK_INTERVAL
+        total_enqueued = 0
 
         with self.conn_or_acquire() as client:
             enqueue_script = client.register_script(_ENQUEUE_DUE_MESSAGES_LUA)
 
-            # Only pass messages_index as a key; routing_key is read from each message's hash
-            keys = [self.messages_index_key]
-            total_enqueued = enqueue_script(
-                keys=keys,
-                args=[
-                    threshold,
-                    DEFAULT_REQUEUE_BATCH_LIMIT,
-                    self.visibility_timeout,
-                    PRIORITY_SCORE_MULTIPLIER,
-                    self.message_key_prefix,
-                    self.global_keyprefix,
-                    QUEUE_KEY_PREFIX,
-                ],
-            )
+            for queue in self._queue_cycle:
+                # Pass prefixed key since EVALSHA doesn't auto-prefix KEYS
+                index_key = f"{self.global_keyprefix}{self._messages_index_key(queue)}"
+                count = enqueue_script(
+                    keys=[index_key],
+                    args=[
+                        threshold,
+                        DEFAULT_REQUEUE_BATCH_LIMIT,
+                        self.visibility_timeout,
+                        PRIORITY_SCORE_MULTIPLIER,
+                        self.message_key_prefix,
+                        self.global_keyprefix,
+                        QUEUE_KEY_PREFIX,
+                    ],
+                )
+                total_enqueued += count or 0
 
         if total_enqueued >= DEFAULT_REQUEUE_BATCH_LIMIT:
             warning(
@@ -1003,7 +1010,7 @@ class Channel(virtual.Channel):
                 DEFAULT_REQUEUE_BATCH_LIMIT,
             )
 
-        return total_enqueued or 0
+        return total_enqueued
 
     def _requeue_by_tag(self, delivery_tag: str, leftmost: bool = False) -> bool:
         """Requeue a rejected message to its queue using Lua script.
@@ -1084,7 +1091,7 @@ class Channel(virtual.Channel):
                 },
             )
             pipe.expire(message_key, self.message_ttl)
-            pipe.zadd(self.messages_index_key, {delivery_tag: queue_at})
+            pipe.zadd(self._messages_index_key(queue), {delivery_tag: queue_at})
             if not is_native_delayed:
                 pipe.zadd(self._queue_key(queue), {delivery_tag: queue_score})
             pipe.execute()
@@ -1126,7 +1133,7 @@ class Channel(virtual.Channel):
                 self.keyprefix_queue % (exchange,),
                 self.sep.join([routing_key or "", pattern or "", queue or ""]),
             )
-            client.delete(self._queue_key(queue))
+            client.delete(self._queue_key(queue), self._messages_index_key(queue))
 
     def _has_queue(self, queue: str, **kwargs: Any) -> bool:
         with self.conn_or_acquire() as client:
@@ -1336,9 +1343,6 @@ class Channel(virtual.Channel):
     def subclient(self) -> Any:
         """Dedicated client for XREAD fanout polling (needs its own connection)."""
         return self._create_client(asynchronous=True)
-
-    def _update_queue_cycle(self) -> None:
-        self._queue_cycle = list(self.active_queues)
 
     def _get_response_error(self) -> type[Exception]:
         from redis import exceptions

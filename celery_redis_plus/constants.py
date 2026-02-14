@@ -1,7 +1,7 @@
 """Shared constants for celery-redis-plus."""
 
-# Suffix for the messages index sorted set (tracks message visibility)
-MESSAGES_INDEX_SUFFIX = ":index"
+# Prefix for per-queue messages index sorted sets (tracks message visibility)
+MESSAGES_INDEX_PREFIX = "messages_index:"
 
 # Sorted set score: inverted priority scaled by this multiplier, plus timestamp_ms.
 # Higher priority yields lower score, popped first (RabbitMQ semantics).

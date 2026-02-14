@@ -4,7 +4,7 @@
 -- For native_delayed messages: set native_delayed=0 (first delivery, not a redelivery)
 -- For timed-out messages: set redelivered=1 (message was consumed but not acked)
 -- Reads routing_key from hash to add message to the correct queue.
--- KEYS: [1] = messages_index
+-- KEYS: [1] = messages_index:{queue} (per-queue index, passed with global_keyprefix applied)
 -- ARGV: [1] = threshold, [2] = batch_limit, [3] = visibility_timeout,
 --       [4] = priority_multiplier, [5] = message_key_prefix, [6] = global_keyprefix,
 --       [7] = queue_key_prefix

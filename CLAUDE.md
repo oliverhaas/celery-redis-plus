@@ -67,6 +67,7 @@ broker_transport = "celery_redis_plus.transport:Transport"
 - `PRIORITY_SCORE_MULTIPLIER`: `10¹³` - multiplier for priority in score calculation
 - `QUEUE_KEY_PREFIX`: `queue:` - prefix for queue sorted sets (avoids collision with list-based queues)
 - `MESSAGE_KEY_PREFIX`: `message:` - prefix for per-message hash keys
+- `MESSAGES_INDEX_PREFIX`: `messages_index:` - prefix for per-queue message index sorted sets
 - `DEFAULT_VISIBILITY_TIMEOUT`: `300` - seconds before unacked messages are requeued
 - `DEFAULT_REQUEUE_CHECK_INTERVAL`: `60` - interval for checking messages to requeue
 - `DEFAULT_REQUEUE_BATCH_LIMIT`: `1000` - max messages processed per requeue cycle
@@ -75,7 +76,7 @@ broker_transport = "celery_redis_plus.transport:Transport"
 
 - `queue:{name}`: Sorted set storing delivery_tags with priority+timestamp scores (uses `queue:` prefix to avoid collision with list-based queues)
 - `message:{delivery_tag}`: Hash storing message payload, routing_key, priority, and flags
-- `messages_index`: Sorted set storing `{delivery_tag: queue_at}` for visibility timeout and delayed delivery
+- `messages_index:{name}`: Per-queue sorted set storing `{delivery_tag: queue_at}` for visibility timeout and delayed delivery
 - `/{db}.{exchange}`: Redis Stream for fanout messages
 - `_kombu.binding.{exchange}`: Set storing queue-exchange bindings
 

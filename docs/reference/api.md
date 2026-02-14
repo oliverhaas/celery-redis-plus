@@ -67,7 +67,7 @@ All options are passed via Celery's `broker_transport_options` configuration.
 |--------|------|---------|-------------|
 | `message_key_prefix` | `str` | `"message:"` | Prefix for per-message hash keys |
 | `message_ttl` | `int` | `259200` | TTL in seconds for message hashes (default: 3 days) |
-| `messages_index_key` | `str` | `"messages_index"` | Key name for the messages index sorted set |
+| `messages_index_prefix` | `str` | `"messages_index:"` | Prefix for per-queue messages index sorted sets |
 
 #### Connection Options
 
@@ -120,7 +120,7 @@ The transport uses the following Redis key patterns:
 |---------|------|-------------|
 | `queue:{name}` | Sorted Set | Queue storing delivery tags with priority+timestamp scores |
 | `message:{delivery_tag}` | Hash | Message payload, routing key, priority, and flags |
-| `messages_index` | Sorted Set | Tracks `{delivery_tag: queue_at}` for visibility timeout and delayed delivery |
+| `messages_index:{name}` | Sorted Set | Per-queue index tracking `{delivery_tag: queue_at}` for visibility timeout and delayed delivery |
 | `/{db}.{exchange}` | Stream | Fanout messages |
 | `_kombu.binding.{exchange}` | Set | Queue-exchange bindings |
 
@@ -138,3 +138,4 @@ The following constants are used internally and define default behavior:
 | `PRIORITY_SCORE_MULTIPLIER` | `10^13` | Multiplier for priority in score calculation |
 | `QUEUE_KEY_PREFIX` | `"queue:"` | Prefix for queue sorted sets |
 | `MESSAGE_KEY_PREFIX` | `"message:"` | Prefix for message hashes |
+| `MESSAGES_INDEX_PREFIX` | `"messages_index:"` | Prefix for per-queue message index sorted sets |

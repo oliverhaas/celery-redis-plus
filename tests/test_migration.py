@@ -117,11 +117,7 @@ class TestMigrationFromStandardRedisTransport:
         assert len(members) == 3
 
         for delivery_tag_raw in members:
-            delivery_tag = (
-                delivery_tag_raw.decode()
-                if isinstance(delivery_tag_raw, bytes)
-                else delivery_tag_raw
-            )
+            delivery_tag = delivery_tag_raw.decode() if isinstance(delivery_tag_raw, bytes) else delivery_tag_raw
             message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
             assert redis_client.exists(message_key), f"Message hash {message_key} not found"
 
@@ -280,18 +276,12 @@ class TestMigrationFromStandardRedisTransport:
         assert sorted_set_length == 3, f"Expected 3 in sorted set, got {sorted_set_length}"
 
         # Verify messages are ordered correctly (high priority = lower score)
-        members_with_scores = redis_client.zrange(
-            f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True
-        )
+        members_with_scores = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
 
         # Extract task names from payloads to verify ordering
         task_order = []
         for delivery_tag_raw, _score in members_with_scores:
-            delivery_tag = (
-                delivery_tag_raw.decode()
-                if isinstance(delivery_tag_raw, bytes)
-                else delivery_tag_raw
-            )
+            delivery_tag = delivery_tag_raw.decode() if isinstance(delivery_tag_raw, bytes) else delivery_tag_raw
             message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
             payload_json = redis_client.hget(message_key, "payload")
             payload = json.loads(payload_json)

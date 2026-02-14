@@ -51,7 +51,7 @@ def _convert_eta_to_properties(
             if eta_dt.tzinfo is None:
                 eta_dt = eta_dt.replace(tzinfo=UTC)
             properties["eta"] = eta_dt.timestamp()
-        except (ValueError, TypeError):
+        except (ValueError, TypeError):  # fmt: skip
             # If parsing fails, skip - transport will handle as immediate
             pass
     elif isinstance(eta_value, datetime):

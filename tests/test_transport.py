@@ -19,6 +19,7 @@ from celery_redis_plus.constants import (
     DEFAULT_MESSAGE_TTL,
     DEFAULT_VISIBILITY_TIMEOUT,
     MESSAGE_KEY_PREFIX,
+    MESSAGES_INDEX_PREFIX,
     PRIORITY_SCORE_MULTIPLIER,
     QUEUE_KEY_PREFIX,
 )
@@ -430,7 +431,6 @@ class TestChannel:
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.message_ttl = DEFAULT_MESSAGE_TTL
-        channel.messages_index_key = "messages_index"
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
 
@@ -468,16 +468,15 @@ class TestChannel:
         mock_pipe.execute.assert_called_once()
 
     def test_put_with_long_delay_goes_to_messages_index(self) -> None:
-        """Test that native delayed messages (delay > 60s) go to messages_index, not queue.
+        """Test that native delayed messages (delay > 60s) go to messages_index:{queue}, not queue.
 
-        Native delayed delivery stores the message only in messages_index with
+        Native delayed delivery stores the message only in messages_index:{queue} with
         queue_at = eta. The requeue mechanism will add it to the queue when eta arrives.
         """
 
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.message_ttl = DEFAULT_MESSAGE_TTL
-        channel.messages_index_key = "messages_index"
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
 
@@ -513,10 +512,10 @@ class TestChannel:
         zadd_calls = mock_pipe.zadd.call_args_list
         assert len(zadd_calls) == 1
 
-        # The single zadd should be for messages_index with queue_at = eta
+        # The single zadd should be for messages_index:{queue} with queue_at = eta
         index_zadd_call = zadd_calls[0]
         index_name, score_dict = index_zadd_call[0]
-        assert index_name == "messages_index"
+        assert index_name == f"{MESSAGES_INDEX_PREFIX}my_queue"
         queue_at = list(score_dict.values())[0]
         assert before + delay_seconds <= queue_at <= after + delay_seconds
 
@@ -533,7 +532,6 @@ class TestChannel:
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.message_ttl = DEFAULT_MESSAGE_TTL
-        channel.messages_index_key = "messages_index"
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
 
@@ -594,7 +592,6 @@ class TestChannel:
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.message_ttl = DEFAULT_MESSAGE_TTL
-        channel.messages_index_key = "messages_index"
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
 
@@ -645,7 +642,6 @@ class TestChannel:
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.message_ttl = DEFAULT_MESSAGE_TTL
-        channel.messages_index_key = "messages_index"
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
 
@@ -1048,7 +1044,14 @@ class TestQoS:
     def test_maybe_update_messages_index_updates_scores(self) -> None:
         """Test maybe_update_messages_index updates scores for non-fanout messages."""
         qos = object.__new__(QoS)
-        qos._delivered = {"tag1": MagicMock(), "tag2": MagicMock(), "fanout_tag": MagicMock()}
+        # Create mock messages with delivery_info for routing_key lookup
+        msg1 = MagicMock()
+        msg1.delivery_info = {"routing_key": "celery"}
+        msg2 = MagicMock()
+        msg2.delivery_info = {"routing_key": "celery"}
+        fanout_msg = MagicMock()
+        fanout_msg.delivery_info = {"routing_key": "fanout_queue"}
+        qos._delivered = {"tag1": msg1, "tag2": msg2, "fanout_tag": fanout_msg}
         qos._fanout_tags = {"fanout_tag"}
 
         mock_pipe = MagicMock()
@@ -1062,18 +1065,15 @@ class TestQoS:
 
         mock_channel = MagicMock()
         mock_channel.conn_or_acquire.return_value = mock_client
-        mock_channel.messages_index_key = "messages_index"
+        mock_channel._messages_index_key.side_effect = lambda q: f"{MESSAGES_INDEX_PREFIX}{q}"
         qos.channel = mock_channel
-
-        # Create cached_property attributes
-        qos.__dict__["messages_index_key"] = "messages_index"
 
         qos.maybe_update_messages_index()
 
-        # Should update scores for tag1 and tag2, but NOT stream_tag
+        # Should update scores for tag1 and tag2, but NOT fanout_tag
         assert mock_pipe.zadd.call_count == 2
         zadd_calls = [call[0][0] for call in mock_pipe.zadd.call_args_list]
-        assert "messages_index" in zadd_calls
+        assert f"{MESSAGES_INDEX_PREFIX}celery" in zadd_calls
 
     def test_pipe_or_acquire_with_existing_pipe(self) -> None:
         """Test pipe_or_acquire returns existing pipe when provided."""
@@ -1613,8 +1613,8 @@ class TestTransportFeatures:
         time.sleep(0.5)
 
         # Check that message index is eventually cleaned up
-        # The messages_index key tracks all messages
-        index_count = redis_client.zcard("messages_index")
+        # The per-queue messages_index key tracks messages for this queue
+        index_count = redis_client.zcard(f"{MESSAGES_INDEX_PREFIX}celery")
         # Should be 0 or very small after successful processing
         assert index_count <= 1  # Allow some tolerance for timing
 
@@ -1805,8 +1805,8 @@ class TestMessagePublishing:
         queue_size = redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery")
         assert queue_size >= 1
 
-        # Check that message is in the messages index
-        index_size = redis_client.zcard("messages_index")
+        # Check that message is in the per-queue messages index
+        index_size = redis_client.zcard(f"{MESSAGES_INDEX_PREFIX}celery")
         assert index_size >= 1
 
         # Check that message payload is stored in a per-message hash
@@ -1877,7 +1877,7 @@ class TestMessagePublishing:
             return x + y
 
         # Clear any existing messages
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", "messages_index")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", f"{MESSAGES_INDEX_PREFIX}celery")
 
         # Publish low priority first, then high priority
         add.apply_async(args=(1, 1), priority=0)  # Low priority
@@ -1908,7 +1908,7 @@ class TestMessagePublishing:
             return x + y
 
         # Clear any existing messages
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", "messages_index")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", f"{MESSAGES_INDEX_PREFIX}celery")
 
         # Publish 5 messages with same priority
         for i in range(5):
@@ -1938,7 +1938,7 @@ class TestMessagePublishing:
             return x + y
 
         # Clear any existing messages
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
         add.delay(42, 58)
 
@@ -1977,7 +1977,7 @@ class TestMessagePublishing:
             return x + y
 
         # Clear and publish
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
         for _ in range(3):
             add.delay(1, 1)
 
@@ -2005,7 +2005,7 @@ class TestMessagePublishing:
             return x + y
 
         # Clear and publish
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", "messages_index")
+        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", f"{MESSAGES_INDEX_PREFIX}celery")
         for _ in range(5):
             add.delay(1, 1)
 
@@ -2350,9 +2350,9 @@ class TestDelayedMessageStorage:
         celery_app: Celery,
         redis_client: Any,
     ) -> None:
-        """Test that native delayed messages go to messages_index, not queue immediately.
+        """Test that native delayed messages go to messages_index:{queue}, not queue immediately.
 
-        Native delayed messages (delay > 60s) are stored in messages_index with
+        Native delayed messages (delay > 60s) are stored in messages_index:{queue} with
         queue_at = eta. The requeue mechanism will add them to the queue when
         the eta time arrives. This prevents them from being consumed early.
         """
@@ -2360,7 +2360,7 @@ class TestDelayedMessageStorage:
             channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
-            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             delay_seconds = 120  # 2 minutes in the future (> 60s threshold)
             before_time = time.time()
@@ -2384,8 +2384,8 @@ class TestDelayedMessageStorage:
             main_messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
             assert len(main_messages) == 0
 
-            # Message should be in messages_index with queue_at = eta
-            index_entries = redis_client.zrange("messages_index", 0, -1, withscores=True)
+            # Message should be in messages_index:{queue} with queue_at = eta
+            index_entries = redis_client.zrange(f"{MESSAGES_INDEX_PREFIX}celery", 0, -1, withscores=True)
             assert len(index_entries) == 1
             tag, queue_at = index_entries[0]
             assert tag.decode() if isinstance(tag, bytes) else tag == delivery_tag
@@ -2412,7 +2412,7 @@ class TestDelayedMessageStorage:
             channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
-            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             before_time = time.time()
 
@@ -2456,7 +2456,7 @@ class TestDelayedMessageStorage:
             channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
-            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             now = time.time()
             # Use delay <= 60s so it's treated as immediate (Celery handles the delay)
@@ -2506,7 +2506,7 @@ class TestDelayedMessageStorage:
             channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
-            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             # Create low priority message first
             low_priority_msg = {
@@ -2556,11 +2556,11 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             # Simulate a message that was consumed but not acked:
             # 1. Message is in per-message hash (payload stored)
-            # 2. Message is in messages_index with try_requeue_at in the past
+            # 2. Message is in messages_index:{queue} with try_requeue_at in the past
             # 3. Message is NOT in the queue (was popped)
             delivery_tag = "unacked-msg-123"
             payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
@@ -2578,7 +2578,7 @@ class TestMessageRequeue:
 
             # Set index score to past timestamp (ready for requeue)
             old_timestamp = time.time() - 100
-            client.zadd("messages_index", {delivery_tag: old_timestamp})
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: old_timestamp})
 
             # Message is NOT in the queue (simulates it was consumed)
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None
@@ -2586,6 +2586,7 @@ class TestMessageRequeue:
             # Set up active_queues for the channel
             if "celery" not in channel._active_queues:
                 channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
 
             # Call enqueue_due_messages - should restore the message
             requeued = channel.enqueue_due_messages()
@@ -2606,7 +2607,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             # Simulate a message that is still in the queue (not yet consumed)
             delivery_tag = "queued-msg-456"
@@ -2625,7 +2626,7 @@ class TestMessageRequeue:
 
             # Set index score to old timestamp (ready for requeue)
             old_timestamp = time.time() - 100
-            client.zadd("messages_index", {delivery_tag: old_timestamp})
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: old_timestamp})
 
             # Message IS in the queue (not yet consumed)
             client.zadd(f"{QUEUE_KEY_PREFIX}celery", {delivery_tag: 100.0})
@@ -2635,6 +2636,7 @@ class TestMessageRequeue:
             # Set up active_queues for the channel
             if "celery" not in channel._active_queues:
                 channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
 
             # Call enqueue_due_messages - should skip (message still in queue via ZADD NX)
             channel.enqueue_due_messages()
@@ -2652,27 +2654,28 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             # Simulate a message that was already acked (per-message hash deleted)
             delivery_tag = "acked-msg-789"
 
             # Message is in index but NOT in per-message hash (already acked)
             old_timestamp = time.time() - 100
-            client.zadd("messages_index", {delivery_tag: old_timestamp})
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: old_timestamp})
 
             # Verify it's in the index
-            assert client.zscore("messages_index", delivery_tag) is not None
+            assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is not None
 
             # Set up active_queues for the channel
             if "celery" not in channel._active_queues:
                 channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
 
             # Call enqueue_due_messages - should remove from index
             channel.enqueue_due_messages()
 
             # Should be removed from index (cleaned up by Lua script)
-            assert client.zscore("messages_index", delivery_tag) is None
+            assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is None
 
     def test_requeue_by_tag(
         self,
@@ -2685,7 +2688,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             # Set up a message in the per-message hash
             delivery_tag = "requeue-tag-test"
@@ -2721,7 +2724,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             delivery_tag = "redelivered-test"
             payload = {
@@ -2766,7 +2769,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             delivery_tag = "leftmost-test"
             payload = {
@@ -2809,7 +2812,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             delivery_tag = "message-restore-test"
             payload = {
@@ -2853,7 +2856,7 @@ class TestMessageRequeue:
             client = channel.client
 
             # Clear existing data
-            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages_index")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             delivery_tag = "restore-beginning-test"
             payload = {
@@ -2930,7 +2933,7 @@ class TestGlobalKeyPrefix:
         # The key point is that our prefixed queue has the message
 
         # Clean up
-        client.delete(f"myapp:{QUEUE_KEY_PREFIX}celery", "myapp:messages", "myapp:messages_index")
+        client.delete(f"myapp:{QUEUE_KEY_PREFIX}celery", "myapp:messages", f"myapp:{MESSAGES_INDEX_PREFIX}celery")
         client.close()
         app.close()
 
@@ -3165,7 +3168,7 @@ class TestBzmpopEdgeCases:
 
             # Clear active queues and reset queue cycle
             channel._active_queues.clear()
-            channel._update_queue_cycle()
+            channel._queue_cycle = list(channel.active_queues)
 
             # Should return without error (early return when no queues)
             channel._bzmpop_start(timeout=1)
@@ -3198,7 +3201,7 @@ class TestBzmpopEdgeCases:
             assert channel.global_keyprefix == "prefix:"
 
             # The _queue_cycle is now a simple list
-            channel._update_queue_cycle()
+            channel._queue_cycle = list(channel.active_queues)
 
             # We can verify the channel has global_keyprefix set
             # The actual BZMPOP call would use prefixed keys
