@@ -1077,10 +1077,10 @@
 <td>TTL in seconds for message hashes (default: 3 days)</td>
 </tr>
 <tr>
-<td><code>messages_index_key</code></td>
+<td><code>messages_index_prefix</code></td>
 <td><code>str</code></td>
-<td><code>"messages_index"</code></td>
-<td>Key name for the messages index sorted set</td>
+<td><code>"messages_index:"</code></td>
+<td>Prefix for per-queue messages index sorted sets</td>
 </tr>
 </tbody>
 </table>
@@ -1230,9 +1230,9 @@
 <td>Message payload, routing key, priority, and flags</td>
 </tr>
 <tr>
-<td><code>messages_index</code></td>
+<td><code>messages_index:{name}</code></td>
 <td>Sorted Set</td>
-<td>Tracks <code>{delivery_tag: queue_at}</code> for visibility timeout and delayed delivery</td>
+<td>Per-queue index tracking <code>{delivery_tag: queue_at}</code> for visibility timeout and delayed delivery</td>
 </tr>
 <tr>
 <td><code>/{db}.{exchange}</code></td>
@@ -1296,6 +1296,11 @@
 <td><code>MESSAGE_KEY_PREFIX</code></td>
 <td><code>"message:"</code></td>
 <td>Prefix for message hashes</td>
+</tr>
+<tr>
+<td><code>MESSAGES_INDEX_PREFIX</code></td>
+<td><code>"messages_index:"</code></td>
+<td>Prefix for per-queue message index sorted sets</td>
 </tr>
 </tbody>
 </table>
