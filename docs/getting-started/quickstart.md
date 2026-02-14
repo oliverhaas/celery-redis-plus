@@ -37,6 +37,10 @@ my_task.apply_async(priority=200)   # High priority
 my_task.apply_async(priority=0)    # Low priority (default)
 ```
 
+## Example Project
+
+See [`examples/simple/`](https://github.com/oliverhaas/celery-redis-plus/tree/main/examples/simple) for a runnable example with Docker Compose, Flower, and tasks exercising all key features.
+
 ## Configuration
 
 ### Transport Options
