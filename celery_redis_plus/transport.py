@@ -631,7 +631,7 @@ class Channel(virtual.Channel):
     # Message storage keys
     # Per-message hash keys use format: {message_key_prefix}{delivery_tag}
     message_key_prefix = MESSAGE_KEY_PREFIX
-    message_ttl = DEFAULT_MESSAGE_TTL  # TTL for per-message hashes (3 days default)
+    message_ttl = DEFAULT_MESSAGE_TTL  # TTL for per-message hashes (-1 = no TTL)
 
     # Visibility and timeout settings
     visibility_timeout: float = DEFAULT_VISIBILITY_TIMEOUT
@@ -1160,8 +1160,13 @@ class Channel(virtual.Channel):
             )
             effective_message_ttl = self.message_ttl
             if queue in self._message_ttls:
-                effective_message_ttl = min(self.message_ttl, self._message_ttls[queue] // 1000)
-            pipe.expire(message_key, effective_message_ttl)
+                queue_ttl_s = self._message_ttls[queue] // 1000
+                if effective_message_ttl < 0:
+                    effective_message_ttl = queue_ttl_s
+                else:
+                    effective_message_ttl = min(effective_message_ttl, queue_ttl_s)
+            if effective_message_ttl >= 0:
+                pipe.expire(message_key, effective_message_ttl)
             pipe.zadd(self._messages_index_key(queue), {delivery_tag: queue_at})
             if not is_native_delayed:
                 pipe.zadd(self._queue_key(queue), {delivery_tag: queue_score})
@@ -1193,7 +1198,7 @@ class Channel(virtual.Channel):
             self.auto_delete_queues.add(queue)
         arguments = kwargs.get("arguments") or {}
         x_expires = arguments.get("x-expires")
-        if x_expires is not None:
+        if x_expires is not None and queue not in self._expires:
             x_expires = int(x_expires)
             if x_expires < MIN_QUEUE_EXPIRES:
                 warning(
@@ -1206,7 +1211,7 @@ class Channel(virtual.Channel):
             self._expires[queue] = x_expires
             self.connection.cycle._update_expires_timer()
         x_message_ttl = arguments.get("x-message-ttl")
-        if x_message_ttl is not None:
+        if x_message_ttl is not None and queue not in self._message_ttls:
             self._message_ttls[queue] = int(x_message_ttl)
 
     def _queue_bind(self, exchange: str, routing_key: str, pattern: str, queue: str) -> None:

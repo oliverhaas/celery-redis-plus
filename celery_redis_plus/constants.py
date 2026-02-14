@@ -31,9 +31,10 @@ DEFAULT_REQUEUE_CHECK_INTERVAL = 60
 # Batch limit for requeue operations (max messages processed per queue per cycle)
 DEFAULT_REQUEUE_BATCH_LIMIT = 1000
 
-# Default TTL for per-message hashes in seconds (3 days)
-# Messages are cleaned up on ack, but this TTL ensures orphaned messages are eventually removed
-DEFAULT_MESSAGE_TTL = 3 * 24 * 60 * 60  # 259200 seconds
+# Default TTL for per-message hashes in seconds
+# -1 means no TTL (messages persist until acked or deleted)
+# Set to a positive value (e.g., 259200 for 3 days) to auto-expire orphaned messages
+DEFAULT_MESSAGE_TTL = -1
 
 # Prefix for per-message hash keys
 MESSAGE_KEY_PREFIX = "message:"

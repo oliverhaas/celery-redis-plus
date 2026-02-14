@@ -22,7 +22,9 @@ end
 
 -- Mark as redelivered
 redis.call('HSET', message_key, 'redelivered', '1')
-redis.call('EXPIRE', message_key, message_ttl)
+if message_ttl >= 0 then
+    redis.call('EXPIRE', message_key, message_ttl)
+end
 
 -- Calculate score
 local score

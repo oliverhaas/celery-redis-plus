@@ -460,8 +460,8 @@ class TestChannel:
         mock_client.pipeline.assert_called_once()
         # Verify hset was called once with mapping for per-message hash
         assert mock_pipe.hset.call_count == 1
-        # Verify expire was called for the message TTL
-        mock_pipe.expire.assert_called_once()
+        # No expire when message_ttl is -1 (default)
+        mock_pipe.expire.assert_not_called()
         # Verify zadd was called twice (once for index, once for queue)
         assert mock_pipe.zadd.call_count == 2
         mock_pipe.execute.assert_called_once()
