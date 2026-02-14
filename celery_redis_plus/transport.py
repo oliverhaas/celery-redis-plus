@@ -44,8 +44,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+import logging
+
 from kombu.exceptions import InconsistencyError, VersionMismatch
-from kombu.log import get_logger
 from kombu.transport import virtual
 from kombu.transport.base import to_rabbitmq_queue_arguments  # type: ignore[attr-defined]
 from kombu.utils.compat import register_after_fork
@@ -115,7 +116,7 @@ _channel_errors = virtual.Transport.channel_errors + (
     _client_exceptions.ResponseError,
 )
 
-logger = get_logger("kombu.transport.celery_redis_plus")
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_PORT = 6379
