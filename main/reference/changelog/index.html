@@ -572,7 +572,18 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="[Unreleased]">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#030-2026-02-14" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        [0.3.0] - 2026-02-14
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="[0.3.0] - 2026-02-14">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -904,7 +915,18 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="[Unreleased]">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#030-2026-02-14" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        [0.3.0] - 2026-02-14
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="[0.3.0] - 2026-02-14">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -1210,6 +1232,7 @@
 <p>The format is based on <a href="https://keepachangelog.com/en/1.0.0/">Keep a Changelog</a>,
 and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning</a>.</p>
 <h2 id="unreleased">[Unreleased]<a class="headerlink" href="#unreleased" title="Permanent link">&para;</a></h2>
+<h2 id="030-2026-02-14">[0.3.0] - 2026-02-14<a class="headerlink" href="#030-2026-02-14" title="Permanent link">&para;</a></h2>
 <h3 id="added">Added<a class="headerlink" href="#added" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Queue TTL (<code>x-expires</code>): queues auto-expire when no worker refreshes them, via periodic PEXPIRE with dynamic interval (TTL/5)</li>
@@ -1219,11 +1242,16 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <h3 id="changed">Changed<a class="headerlink" href="#changed" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Split global <code>messages_index</code> sorted set into per-queue <code>messages_index:{queue}</code> keys for scoped recovery, clean queue lifecycle, and correct <code>global_keyprefix</code> behavior with Lua scripts</li>
+<li>Renamed internal redis-specific naming to client-library-agnostic (<code>client_lib</code>, <code>_client_exceptions</code>) for better redis-py/valkey-py compatibility</li>
+<li>Default message TTL changed from 3 days to <code>-1</code> (no TTL); configurable via <code>message_ttl</code> channel attribute</li>
+<li>CI/CD: tag workflow now gates on CI success instead of running on every push</li>
 </ul>
 <h3 id="fixed">Fixed<a class="headerlink" href="#fixed" title="Permanent link">&para;</a></h3>
 <ul>
 <li><code>EXPIRE</code> and <code>PEXPIRE</code> commands now correctly prefixed when <code>global_keyprefix</code> is set</li>
 <li><code>_bzmpop_read</code> and <code>_get</code> now skip expired message hashes and try the next message instead of raising <code>Empty</code></li>
+<li><code>x-expires</code> below 30s now clamped with warning instead of raising <code>ValueError</code></li>
+<li>Removed redundant redis-specific getter functions (<code>get_redis_error_classes</code>, <code>get_redis_ConnectionError</code>, <code>_get_response_error</code>)</li>
 </ul>
 <h2 id="025-2026-02-14">[0.2.5] - 2026-02-14<a class="headerlink" href="#025-2026-02-14" title="Permanent link">&para;</a></h2>
 <h3 id="fixed_1">Fixed<a class="headerlink" href="#fixed_1" title="Permanent link">&para;</a></h3>
