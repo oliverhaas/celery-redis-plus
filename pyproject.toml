@@ -62,7 +62,7 @@ include = ["celery_redis_plus"]
 [tool.ruff]
 line-length = 120
 target-version = "py314"
-extend-exclude = ["docs"]
+extend-exclude = ["docs", "examples"]
 
 [tool.ruff.lint]
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"

@@ -687,18 +687,15 @@ class TestChannel:
         assert expected_min <= score <= expected_max
 
     def test_fanout_stream_key(self) -> None:
-        """Test fanout stream key generation."""
+        """Test fanout stream key generation.
+
+        Fanout uses a single stream per exchange (routing key is ignored).
+        """
         channel = object.__new__(Channel)
         channel.keyprefix_fanout = "/0."
-        channel.fanout_patterns = True
 
-        # Without routing key
         key = channel._fanout_stream_key("myexchange")
         assert key == "/0.myexchange"
-
-        # With routing key
-        key = channel._fanout_stream_key("myexchange", "myroute")
-        assert key == "/0.myexchange/myroute"
 
     def test_prepare_virtual_host_with_slash(self) -> None:
         """Test _prepare_virtual_host with '/' returns default db."""
@@ -2170,14 +2167,9 @@ class TestFanoutMessaging:
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
 
-            # Test stream key generation
+            # Fanout uses a single stream per exchange (routing key ignored)
             stream_key = channel._fanout_stream_key("test_exchange")
             assert "test_exchange" in stream_key
-
-            # Test with routing key
-            stream_key_with_route = channel._fanout_stream_key("test_exchange", "my_route")
-            assert "test_exchange" in stream_key_with_route
-            assert "my_route" in stream_key_with_route
 
     def test_fanout_exchange_declaration(
         self,
@@ -2201,6 +2193,147 @@ class TestFanoutMessaging:
 
             # Cleanup
             redis_client.delete(bindings_key)
+
+    def test_subclient_is_separate_from_client(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that subclient uses a different connection than client.
+
+        BZMPOP (regular queues) and XREAD (fanout) are both blocking commands
+        and cannot share a Redis connection. The subclient provides a dedicated
+        connection for XREAD.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            # They must be separate client instances so BZMPOP and XREAD
+            # can block on independent connections
+            assert channel.client is not channel.subclient
+
+    def test_fanout_publish_and_consume(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that a message published to a fanout exchange can be consumed.
+
+        This verifies the full fanout path: _put_fanout writes to a stream,
+        and a consumer reading from that exchange receives the message.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            fanout_exchange = Exchange("test_fanout_e2e", type="fanout")
+            fanout_queue = Queue("fanout_e2e_queue", exchange=fanout_exchange)
+            bound_queue = fanout_queue.bind(channel)
+            bound_queue.declare()  # type: ignore[attr-defined]
+
+            # Publish a message with a routing key (should be ignored for fanout)
+            message = {
+                "body": '{"hello": "world"}',
+                "properties": {
+                    "delivery_tag": "fanout-test-tag",
+                    "delivery_info": {"exchange": "test_fanout_e2e", "routing_key": "some.routing.key"},
+                },
+            }
+            channel._put_fanout("test_fanout_e2e", message, routing_key="some.routing.key")
+
+            # The message should be in a single stream (no routing key in key name)
+            stream_key = channel._fanout_stream_key("test_fanout_e2e")
+            assert redis_client.xlen(stream_key) == 1
+
+            # There should NOT be a per-routing-key stream
+            per_route_key = f"{stream_key}/some.routing.key"
+            assert not redis_client.exists(per_route_key)
+
+            # Cleanup
+            redis_client.delete(stream_key)
+            redis_client.delete("_kombu.binding.test_fanout_e2e")
+
+    def test_fanout_with_wildcard_routing_key_binding(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that a consumer bound with '#' wildcard receives fanout messages.
+
+        This catches the bug where per-routing-key streams caused XREAD to listen
+        on a non-existent stream name like '/0.exchange/*' instead of '/0.exchange'.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            fanout_exchange = Exchange("test_fanout_wildcard", type="fanout")
+            # Binding with routing_key="#" (wildcard) - like celery events do
+            fanout_queue = Queue("fanout_wildcard_queue", exchange=fanout_exchange, routing_key="#")
+            bound_queue = fanout_queue.bind(channel)
+            bound_queue.declare()  # type: ignore[attr-defined]
+
+            # After _queue_bind, the queue should be in _fanout_queues
+            assert "fanout_wildcard_queue" in channel._fanout_queues
+            exchange, stored_rk = channel._fanout_queues["fanout_wildcard_queue"]
+
+            # The stream key for consuming must match the stream key for publishing
+            # (both should be just '/db.exchange' with no routing key suffix)
+            publish_stream = channel._fanout_stream_key("test_fanout_wildcard")
+            consume_stream = channel._fanout_stream_key(exchange)
+            assert publish_stream == consume_stream
+
+            # Cleanup
+            redis_client.delete("_kombu.binding.test_fanout_wildcard")
+
+    def test_fanout_end_to_end_via_xread(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test end-to-end fanout: publish to stream, consume via XREAD.
+
+        This is the test that would have caught both fanout bugs:
+        1. Shared client connection (BZMPOP + XREAD on same connection)
+        2. Per-routing-key streams (XREAD can't match wildcard stream names)
+
+        Publishes a message to the stream first, then uses XREAD with offset '0'
+        to read from the beginning, avoiding timing issues with '$' offset.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            fanout_exchange = Exchange("test_e2e_xread", type="fanout")
+            fanout_queue = Queue("e2e_xread_queue", exchange=fanout_exchange, routing_key="#")
+            bound_queue = fanout_queue.bind(channel)
+            bound_queue.declare()  # type: ignore[attr-defined]
+            channel.basic_consume(
+                "e2e_xread_queue",
+                no_ack=True,
+                callback=lambda *_a: None,
+                consumer_tag="ctag-e2e",
+            )
+
+            # Publish with a routing key (like celery events do)
+            message = {
+                "body": '{"hello": "fanout"}',
+                "properties": {
+                    "delivery_tag": "e2e-xread-tag",
+                    "delivery_info": {"exchange": "test_e2e_xread", "routing_key": "worker.heartbeat"},
+                },
+            }
+            channel._put_fanout("test_e2e_xread", message, routing_key="worker.heartbeat")
+
+            # Verify the message is in the correct stream
+            stream_key = channel._fanout_stream_key("test_e2e_xread")
+            assert redis_client.xlen(stream_key) >= 1
+
+            # Read via XREAD from offset 0 (beginning of stream)
+            # Initialize subclient connection (normally done by MultiChannelPoller)
+            if channel.subclient.connection is None:
+                channel.subclient.connection = channel.subclient.connection_pool.get_connection()
+            channel._stream_offsets[stream_key] = "0"
+            channel._xread_start(timeout=1)
+            delivered = channel._xread_read()
+
+            assert delivered is True
 
 
 @pytest.mark.integration
@@ -2834,10 +2967,6 @@ class TestFanoutPrefix:
             # Get the stream key - should use our prefix
             stream_key = channel._fanout_stream_key("test_fanout")
             assert stream_key == "myfanout.test_fanout"
-
-            # With routing key
-            stream_key_routed = channel._fanout_stream_key("test_fanout", "my.route")
-            assert stream_key_routed == "myfanout.test_fanout/my.route"
 
         app.close()
 

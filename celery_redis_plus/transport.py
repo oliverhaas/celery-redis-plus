@@ -486,8 +486,8 @@ class MultiChannelPoller:
 
     def _register_XREAD(self, channel: Channel) -> None:
         """Enable XREAD mode for channel (fanout streams)."""
-        ident = channel, channel.client, "XREAD"
-        if not self._client_registered(channel, channel.client, "XREAD"):
+        ident = channel, channel.subclient, "XREAD"
+        if not self._client_registered(channel, channel.subclient, "XREAD"):
             channel._in_fanout_poll = False
             self._register(*ident)
         if not channel._in_fanout_poll:
@@ -834,10 +834,13 @@ class Channel(virtual.Channel):
 
     # --- XREADGROUP (Streams) methods for fanout ---
 
-    def _fanout_stream_key(self, exchange: str, routing_key: str = "") -> str:
-        """Get stream key for fanout exchange."""
-        if routing_key and self.fanout_patterns:
-            return f"{self.keyprefix_fanout}{exchange}/{routing_key}"
+    def _fanout_stream_key(self, exchange: str) -> str:
+        """Get stream key for fanout exchange.
+
+        Fanout exchanges use a single stream per exchange (routing key is ignored).
+        This is correct because fanout semantics deliver every message to every consumer,
+        and XREAD does not support wildcard stream names.
+        """
         return f"{self.keyprefix_fanout}{exchange}"
 
     def _xread_start(self, timeout: float | None = None) -> None:
@@ -849,8 +852,8 @@ class Channel(virtual.Channel):
 
         for queue in self.active_fanout_queues:
             if queue in self._fanout_queues:
-                exchange, routing_key = self._fanout_queues[queue]
-                stream_key = self._fanout_stream_key(exchange, routing_key)
+                exchange, _routing_key = self._fanout_queues[queue]
+                stream_key = self._fanout_stream_key(exchange)
                 # Use stored offset or "$" for only new messages
                 offset = self._stream_offsets.get(stream_key, "$")
                 streams[stream_key] = offset
@@ -858,7 +861,7 @@ class Channel(virtual.Channel):
         if not streams:
             return
 
-        self._in_fanout_poll = self.client.connection
+        self._in_fanout_poll = self.subclient.connection
 
         # Build XREAD command
         stream_keys = list(streams.keys())
@@ -876,17 +879,17 @@ class Channel(virtual.Channel):
         ]
 
         if self.global_keyprefix:
-            command_args = self.client._prefix_args(command_args)
+            command_args = self.subclient._prefix_args(command_args)
 
-        self.client.connection.send_command(*command_args)
+        self.subclient.connection.send_command(*command_args)
 
     def _xread_read(self, **options: Any) -> bool:
         """Read messages from XREAD (fanout broadcast)."""
         try:
             try:
-                messages = self.client.parse_response(self.client.connection, "XREAD", **options)
+                messages = self.subclient.parse_response(self.subclient.connection, "XREAD", **options)
             except self.connection_errors:
-                self.client.connection.disconnect()
+                self.subclient.connection.disconnect()
                 raise
 
             if not messages:
@@ -907,8 +910,8 @@ class Channel(virtual.Channel):
 
                     # Find which queue this stream belongs to
                     queue_name = None
-                    for queue, (exchange, routing_key) in self._fanout_queues.items():
-                        fanout_stream = self._fanout_stream_key(exchange, routing_key)
+                    for queue, (exchange, _routing_key) in self._fanout_queues.items():
+                        fanout_stream = self._fanout_stream_key(exchange)
                         if stream_str.endswith(fanout_stream) or stream_str == fanout_stream:
                             queue_name = queue
                             break
@@ -1077,7 +1080,7 @@ class Channel(virtual.Channel):
                     "priority": priority,
                     "redelivered": 0,
                     "native_delayed": 1 if is_native_delayed else 0,
-                    "eta": eta_timestamp if eta_timestamp else 0,
+                    "eta": eta_timestamp or 0,
                 },
             )
             pipe.expire(message_key, self.message_ttl)
@@ -1088,7 +1091,7 @@ class Channel(virtual.Channel):
 
     def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
         """Deliver fanout message using Redis Streams."""
-        stream_key = self._fanout_stream_key(exchange, routing_key)
+        stream_key = self._fanout_stream_key(exchange)
         message_uuid = str(uuid.uuid4())
 
         with self.conn_or_acquire() as client:
@@ -1173,12 +1176,13 @@ class Channel(virtual.Channel):
         super().close()
 
     def _close_clients(self) -> None:
-        try:
-            client = self.__dict__["client"]
-            connection, client.connection = client.connection, None
-            connection.disconnect()
-        except (KeyError, AttributeError, self.ResponseError) as exc:
-            logger.debug("Error closing Redis client (may be expected during shutdown): %s", exc)
+        for name in ("client", "subclient"):
+            try:
+                client = self.__dict__[name]
+                connection, client.connection = client.connection, None
+                connection.disconnect()
+            except (KeyError, AttributeError, self.ResponseError) as exc:
+                logger.debug("Error closing Redis %s (may be expected during shutdown): %s", name, exc)
 
     def _prepare_virtual_host(self, vhost: Any) -> int:
         if not isinstance(vhost, numbers.Integral):
@@ -1326,6 +1330,11 @@ class Channel(virtual.Channel):
     @cached_property
     def client(self) -> Any:
         """Client used to publish messages, BZMPOP etc."""
+        return self._create_client(asynchronous=True)
+
+    @cached_property
+    def subclient(self) -> Any:
+        """Dedicated client for XREAD fanout polling (needs its own connection)."""
         return self._create_client(asynchronous=True)
 
     def _update_queue_cycle(self) -> None:
