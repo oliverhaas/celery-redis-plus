@@ -42,5 +42,6 @@ MESSAGE_KEY_PREFIX = "message:"
 # Prefix for queue sorted set keys (avoids collision with list-based queues)
 QUEUE_KEY_PREFIX = "queue:"
 
-# Minimum allowed x-expires value in milliseconds (30 seconds)
-MIN_QUEUE_EXPIRES = 30_000
+# Minimum allowed x-expires value in milliseconds (10 seconds)
+# Celery's control/reply queues use 10s by default
+MIN_QUEUE_EXPIRES = 10_000
