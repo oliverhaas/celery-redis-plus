@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Queue TTL (`x-expires`): queues auto-expire when no worker refreshes them, via periodic PEXPIRE with dynamic interval (TTL/5)
+- Message TTL (`x-message-ttl`): per-queue message expiry via shorter EXPIRE on message hashes
+- `prepare_queue_arguments` override using kombu's `to_rabbitmq_queue_arguments` for RabbitMQ-compatible queue argument handling
+
 ### Changed
 - Split global `messages_index` sorted set into per-queue `messages_index:{queue}` keys for scoped recovery, clean queue lifecycle, and correct `global_keyprefix` behavior with Lua scripts
+
+### Fixed
+- `EXPIRE` and `PEXPIRE` commands now correctly prefixed when `global_keyprefix` is set
+- `_bzmpop_read` and `_get` now skip expired message hashes and try the next message instead of raising `Empty`
 
 ## [0.2.5] - 2026-02-14
 

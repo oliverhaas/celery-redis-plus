@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 from kombu.exceptions import InconsistencyError, VersionMismatch
 from kombu.log import get_logger
 from kombu.transport import virtual
+from kombu.transport.base import to_rabbitmq_queue_arguments  # type: ignore[attr-defined]
 from kombu.utils.compat import register_after_fork
 from kombu.utils.encoding import bytes_to_str
 from kombu.utils.eventio import ERR, READ, poll
@@ -68,6 +69,7 @@ from .constants import (
     MESSAGE_KEY_PREFIX,
     MESSAGES_INDEX_PREFIX,
     MIN_PRIORITY,
+    MIN_QUEUE_EXPIRES,
     PRIORITY_SCORE_MULTIPLIER,
     QUEUE_KEY_PREFIX,
 )
@@ -193,9 +195,11 @@ class GlobalKeyPrefixMixin:
     global_keyprefix: str = ""
 
     PREFIXED_SIMPLE_COMMANDS: ClassVar[list[str]] = [
+        "EXPIRE",
         "HDEL",
         "HGET",
         "HSET",
+        "PEXPIRE",
         "SADD",
         "SREM",
         "SMEMBERS",
@@ -439,6 +443,9 @@ class MultiChannelPoller:
         self._chan_to_sock: dict[tuple[Channel, Any, str], Any] = {}
         self.poller = poll()
         self.after_read = set()
+        self._loop: Any = None
+        self._expires_timer_entry: Any = None
+        self._expires_timer_interval: float | None = None
 
     def close(self) -> None:
         for fd in self._chan_to_sock.values():
@@ -530,6 +537,45 @@ class MultiChannelPoller:
             qos = channel.qos
             if qos is not None and channel.active_queues:
                 cast("QoS", qos).maybe_update_messages_index()
+
+    def maybe_refresh_queue_expires(self) -> None:
+        """Refresh PEXPIRE on queue keys with x-expires TTL."""
+        for channel in self._channels:
+            channel._refresh_queue_expires()
+
+    def _update_expires_timer(self) -> None:
+        """Register or update the periodic PEXPIRE timer based on configured TTLs.
+
+        Interval = min(all configured x-expires) / 5, so the TTL is refreshed
+        ~5 times before it would expire.
+        """
+        min_ttl_ms: int | None = None
+        for channel in self._channels:
+            for ttl_ms in channel._expires.values():
+                if min_ttl_ms is None or ttl_ms < min_ttl_ms:
+                    min_ttl_ms = ttl_ms
+
+        if min_ttl_ms is None:
+            if self._expires_timer_entry is not None:
+                self._expires_timer_entry.cancel()
+                self._expires_timer_entry = None
+                self._expires_timer_interval = None
+            return
+
+        interval = min_ttl_ms / 5 / 1000  # ms → seconds, divided by 5
+
+        if self._expires_timer_interval == interval:
+            return
+
+        if self._expires_timer_entry is not None:
+            self._expires_timer_entry.cancel()
+
+        if self._loop is not None:
+            self._expires_timer_entry = self._loop.call_repeatedly(
+                interval,
+                self.maybe_refresh_queue_expires,
+            )
+            self._expires_timer_interval = interval
 
     def on_readable(self, fileno: int) -> bool | None:
         chan, cmd_type = self._fd_to_chan[fileno]
@@ -665,6 +711,9 @@ class Channel(virtual.Channel):
         self.handlers = {"BZMPOP": self._bzmpop_read, "XREAD": self._xread_read}
         # Track last-read stream ID per stream for fanout (start with $ = only new messages)
         self._stream_offsets: dict[str, str] = {}
+        # Per-queue TTL state from x-expires and x-message-ttl queue arguments
+        self._expires: dict[str, int] = {}  # queue_name → TTL in ms
+        self._message_ttls: dict[str, int] = {}  # queue_name → message TTL in ms
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -751,6 +800,37 @@ class Channel(virtual.Channel):
         result: dict[str, Any] | None = loads(bytes_to_str(payload_json))
         return result
 
+    def _cleanup_expired_message(self, queue: str, delivery_tag: str, client: Any | None = None) -> None:
+        """Remove messages_index entry for a message whose hash has expired."""
+        if client is None:
+            with self.conn_or_acquire() as client:
+                client.zrem(self._messages_index_key(queue), delivery_tag)
+        else:
+            client.zrem(self._messages_index_key(queue), delivery_tag)
+
+    def _drain_expired_and_deliver(self, queue: str) -> bool:
+        """Pop messages from queue until one with a valid hash is found.
+
+        Used after BZMPOP returns an expired message to avoid going back to
+        blocking when there are still deliverable messages in the queue.
+
+        Returns:
+            True if a message was delivered, raises Empty otherwise.
+        """
+        queue_key = self._queue_key(queue)
+        while True:
+            result = self.client.zpopmin(queue_key, count=1)
+            if not result:
+                raise Empty
+            delivery_tag, _score = result[0]
+            delivery_tag = bytes_to_str(delivery_tag)
+            message_key = self._message_key(delivery_tag)
+            message = self._get_message_from_hash(message_key, self.client)
+            if message:
+                self.connection._deliver(message, queue)
+                return True
+            self._cleanup_expired_message(queue, delivery_tag, self.client)
+
     def _restore(self, message: Any, leftmost: bool = False) -> None:
         """Restore a message to its queue.
 
@@ -830,7 +910,10 @@ class Channel(virtual.Channel):
                 if message:
                     self.connection._deliver(message, dest)
                     return True
-                raise Empty
+                # Message hash expired (x-message-ttl) — clean up index
+                self._cleanup_expired_message(dest, delivery_tag, self.client)
+                # Try remaining messages synchronously via zpopmin
+                return self._drain_expired_and_deliver(dest)
             raise Empty
         finally:
             self._in_poll = None  # type: ignore[assignment]
@@ -950,15 +1033,18 @@ class Channel(virtual.Channel):
     def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:
         """Get single message from queue (synchronous)."""
         with self.conn_or_acquire() as client:
-            result = client.zpopmin(self._queue_key(queue), count=1)
-            if result:
+            while True:
+                result = client.zpopmin(self._queue_key(queue), count=1)
+                if not result:
+                    raise Empty
                 delivery_tag, _score = result[0]
                 delivery_tag = bytes_to_str(delivery_tag)
                 message_key = self._message_key(delivery_tag)
                 message = self._get_message_from_hash(message_key, client)
                 if message:
                     return message
-            raise Empty
+                # Message hash expired (x-message-ttl) — clean up and try next
+                self._cleanup_expired_message(queue, delivery_tag, client)
 
     def _size(self, queue: str) -> int:
         with self.conn_or_acquire() as client:
@@ -1090,7 +1176,10 @@ class Channel(virtual.Channel):
                     "eta": eta_timestamp or 0,
                 },
             )
-            pipe.expire(message_key, self.message_ttl)
+            effective_message_ttl = self.message_ttl
+            if queue in self._message_ttls:
+                effective_message_ttl = min(self.message_ttl, self._message_ttls[queue] // 1000)
+            pipe.expire(message_key, effective_message_ttl)
             pipe.zadd(self._messages_index_key(queue), {delivery_tag: queue_at})
             if not is_native_delayed:
                 pipe.zadd(self._queue_key(queue), {delivery_tag: queue_score})
@@ -1110,9 +1199,25 @@ class Channel(virtual.Channel):
                 approximate=True,
             )
 
+    def prepare_queue_arguments(self, arguments: dict[str, Any] | None, **kwargs: Any) -> dict[str, Any] | None:
+        return to_rabbitmq_queue_arguments(arguments, **kwargs)
+
     def _new_queue(self, queue: str, auto_delete: bool = False, **kwargs: Any) -> None:
         if auto_delete:
             self.auto_delete_queues.add(queue)
+        arguments = kwargs.get("arguments") or {}
+        x_expires = arguments.get("x-expires")
+        if x_expires is not None:
+            x_expires = int(x_expires)
+            if x_expires < MIN_QUEUE_EXPIRES:
+                raise ValueError(
+                    f"x-expires must be at least {MIN_QUEUE_EXPIRES}ms (30s), got {x_expires}ms",
+                )
+            self._expires[queue] = x_expires
+            self.connection.cycle._update_expires_timer()
+        x_message_ttl = arguments.get("x-message-ttl")
+        if x_message_ttl is not None:
+            self._message_ttls[queue] = int(x_message_ttl)
 
     def _queue_bind(self, exchange: str, routing_key: str, pattern: str, queue: str) -> None:
         if self.typeof(exchange).type == "fanout":
@@ -1128,12 +1233,24 @@ class Channel(virtual.Channel):
         routing_key: str = kwargs.get("routing_key", "")
         pattern: str = kwargs.get("pattern", "")
         self.auto_delete_queues.discard(queue)
+        self._expires.pop(queue, None)
+        self._message_ttls.pop(queue, None)
         with self.conn_or_acquire(client=kwargs.get("client")) as client:
             client.srem(
                 self.keyprefix_queue % (exchange,),
                 self.sep.join([routing_key or "", pattern or "", queue or ""]),
             )
             client.delete(self._queue_key(queue), self._messages_index_key(queue))
+
+    def _refresh_queue_expires(self) -> None:
+        """Refresh PEXPIRE on queue and index keys for queues with x-expires."""
+        if not self._expires:
+            return
+        with self.conn_or_acquire() as client, client.pipeline() as pipe:
+            for queue, ttl_ms in self._expires.items():
+                pipe.pexpire(self._queue_key(queue), ttl_ms)
+                pipe.pexpire(self._messages_index_key(queue), ttl_ms)
+            pipe.execute()
 
     def _has_queue(self, queue: str, **kwargs: Any) -> bool:
         with self.conn_or_acquire() as client:
@@ -1426,6 +1543,9 @@ class Transport(virtual.Transport):
         # Heartbeat to keep in-flight messages alive
         visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]
         loop.call_repeatedly(visibility_timeout / 3, cycle.maybe_update_messages_index)
+
+        # Store loop for dynamic timer registration (queue TTL refresh)
+        cycle._loop = loop
 
     def on_readable(self, fileno: int) -> Any:  # type: ignore[override]
         """Handle AIO event for one of our file descriptors."""

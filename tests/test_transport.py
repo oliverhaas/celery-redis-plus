@@ -433,6 +433,7 @@ class TestChannel:
         channel.message_ttl = DEFAULT_MESSAGE_TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
+        channel._message_ttls = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -479,6 +480,7 @@ class TestChannel:
         channel.message_ttl = DEFAULT_MESSAGE_TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
+        channel._message_ttls = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -534,6 +536,7 @@ class TestChannel:
         channel.message_ttl = DEFAULT_MESSAGE_TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
+        channel._message_ttls = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -594,6 +597,7 @@ class TestChannel:
         channel.message_ttl = DEFAULT_MESSAGE_TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
+        channel._message_ttls = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -644,6 +648,7 @@ class TestChannel:
         channel.message_ttl = DEFAULT_MESSAGE_TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         channel.global_keyprefix = ""
+        channel._message_ttls = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -897,6 +902,286 @@ class TestChannel:
         params = channel._connparams()
 
         assert params["connection_class"] is redis_module.SSLConnection
+
+    def test_prepare_queue_arguments(self) -> None:
+        """Test that prepare_queue_arguments converts expires/message_ttl to ms."""
+        channel = object.__new__(Channel)
+
+        result = channel.prepare_queue_arguments({}, expires=60.0, message_ttl=30.0)
+
+        assert result["x-expires"] == 60000
+        assert result["x-message-ttl"] == 30000
+
+    def test_prepare_queue_arguments_preserves_existing(self) -> None:
+        """Test that prepare_queue_arguments preserves existing queue arguments."""
+        channel = object.__new__(Channel)
+
+        result = channel.prepare_queue_arguments({"x-custom": "value"}, expires=60.0)
+
+        assert result["x-expires"] == 60000
+        assert result["x-custom"] == "value"
+
+    def test_new_queue_stores_expires(self) -> None:
+        """Test that _new_queue stores x-expires in _expires dict."""
+        channel = object.__new__(Channel)
+        channel.auto_delete_queues = set()
+        channel._expires = {}
+        channel._message_ttls = {}
+        channel.connection = MagicMock()
+
+        channel._new_queue("my_queue", arguments={"x-expires": 60000})
+
+        assert channel._expires["my_queue"] == 60000
+        channel.connection.cycle._update_expires_timer.assert_called_once()
+
+    def test_new_queue_rejects_short_expires(self) -> None:
+        """Test that _new_queue rejects x-expires below 30 seconds."""
+        channel = object.__new__(Channel)
+        channel.auto_delete_queues = set()
+        channel._expires = {}
+        channel._message_ttls = {}
+        channel.connection = MagicMock()
+
+        with pytest.raises(ValueError, match="x-expires must be at least 30000ms"):
+            channel._new_queue("my_queue", arguments={"x-expires": 10000})
+
+    def test_new_queue_stores_message_ttl(self) -> None:
+        """Test that _new_queue stores x-message-ttl in _message_ttls dict."""
+        channel = object.__new__(Channel)
+        channel.auto_delete_queues = set()
+        channel._expires = {}
+        channel._message_ttls = {}
+
+        channel._new_queue("my_queue", arguments={"x-message-ttl": 30000})
+
+        assert channel._message_ttls["my_queue"] == 30000
+
+    def test_new_queue_no_ttl_arguments(self) -> None:
+        """Test that _new_queue with no TTL arguments doesn't add to dicts."""
+        channel = object.__new__(Channel)
+        channel.auto_delete_queues = set()
+        channel._expires = {}
+        channel._message_ttls = {}
+
+        channel._new_queue("my_queue")
+
+        assert "my_queue" not in channel._expires
+        assert "my_queue" not in channel._message_ttls
+
+    def test_put_uses_queue_message_ttl(self) -> None:
+        """Test that _put uses per-queue message TTL when configured."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.message_ttl = DEFAULT_MESSAGE_TTL  # 3 days
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.global_keyprefix = ""
+        channel._message_ttls = {"my_queue": 60000}  # 60 seconds
+
+        mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        channel._get_message_priority = MagicMock(return_value=0)
+
+        message = {
+            "body": '{"task": "test"}',
+            "properties": {
+                "delivery_tag": "tag123",
+                "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+            },
+        }
+
+        channel._put("my_queue", message)
+
+        # EXPIRE should use 60 seconds (60000ms // 1000), not default 3 days
+        mock_pipe.expire.assert_called_once()
+        expire_args = mock_pipe.expire.call_args[0]
+        assert expire_args[1] == 60  # 60000 // 1000
+
+    def test_refresh_queue_expires(self) -> None:
+        """Test that _refresh_queue_expires PEXPIREs correct keys."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._expires = {"celery": 60000, "priority": 120000}
+
+        mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        channel._refresh_queue_expires()
+
+        pexpire_calls = mock_pipe.pexpire.call_args_list
+        assert len(pexpire_calls) == 4  # 2 queues x 2 keys each
+        # Check all expected calls are present
+        call_args_set = {(call[0][0], call[0][1]) for call in pexpire_calls}
+        assert (f"{QUEUE_KEY_PREFIX}celery", 60000) in call_args_set
+        assert (f"{MESSAGES_INDEX_PREFIX}celery", 60000) in call_args_set
+        assert (f"{QUEUE_KEY_PREFIX}priority", 120000) in call_args_set
+        assert (f"{MESSAGES_INDEX_PREFIX}priority", 120000) in call_args_set
+        mock_pipe.execute.assert_called_once()
+
+    def test_refresh_queue_expires_empty(self) -> None:
+        """Test that _refresh_queue_expires is a no-op when _expires is empty."""
+        channel = object.__new__(Channel)
+        channel._expires = {}
+        channel.conn_or_acquire = MagicMock()
+
+        channel._refresh_queue_expires()
+
+        channel.conn_or_acquire.assert_not_called()
+
+    def test_get_skips_expired_messages(self) -> None:
+        """Test that _get skips messages whose hash has expired and tries the next."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = ""
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        # First zpopmin returns expired message, second returns valid message
+        mock_client.zpopmin.side_effect = [
+            [(b"expired_tag", 1.0)],
+            [(b"valid_tag", 2.0)],
+        ]
+        mock_client.hget.side_effect = [
+            None,  # expired_tag hash gone
+            b'{"body": "test"}',  # valid_tag
+        ]
+
+        result = channel._get("my_queue")
+
+        assert result == {"body": "test"}
+        # Should have cleaned up index for expired tag
+        mock_client.zrem.assert_called_once_with(
+            f"{MESSAGES_INDEX_PREFIX}my_queue",
+            "expired_tag",
+        )
+
+    def test_get_raises_empty_when_all_expired(self) -> None:
+        """Test that _get raises Empty when all messages have expired."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = ""
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        # First returns expired, second returns empty (queue drained)
+        mock_client.zpopmin.side_effect = [
+            [(b"expired_tag", 1.0)],
+            [],
+        ]
+        mock_client.hget.return_value = None
+
+        with pytest.raises(Empty):
+            channel._get("my_queue")
+
+        mock_client.zrem.assert_called_once()
+
+    def test_bzmpop_read_drains_expired_messages(self) -> None:
+        """Test that _bzmpop_read falls back to zpopmin after expired BZMPOP result."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = ""
+        channel._in_poll = True
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        # BZMPOP returns expired message
+        mock_client.parse_response.return_value = (
+            b"queue:my_queue",
+            [(b"expired_tag", 1.0)],
+        )
+        # zpopmin returns valid message
+        mock_client.zpopmin.return_value = [(b"valid_tag", 2.0)]
+        mock_client.hget.side_effect = [
+            None,  # expired_tag
+            b'{"body": "test"}',  # valid_tag
+        ]
+
+        result = channel._bzmpop_read()
+
+        assert result is True
+        mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
+        # Should have cleaned up index for expired tag
+        assert mock_client.zrem.call_count == 1
+
+    def test_cleanup_expired_message(self) -> None:
+        """Test that _cleanup_expired_message removes the messages_index entry."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        channel._cleanup_expired_message("my_queue", "tag123")
+
+        mock_client.zrem.assert_called_once_with(
+            f"{MESSAGES_INDEX_PREFIX}my_queue",
+            "tag123",
+        )
+
+    def test_cleanup_expired_message_with_client(self) -> None:
+        """Test _cleanup_expired_message with explicit client."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+
+        mock_client = MagicMock()
+        channel._cleanup_expired_message("my_queue", "tag123", client=mock_client)
+
+        mock_client.zrem.assert_called_once_with(
+            f"{MESSAGES_INDEX_PREFIX}my_queue",
+            "tag123",
+        )
+
+    def test_delete_cleans_up_ttl_state(self) -> None:
+        """Test that _delete removes queue from _expires and _message_ttls."""
+        channel = object.__new__(Channel)
+        channel.auto_delete_queues = {"my_queue"}
+        channel._expires = {"my_queue": 60000}
+        channel._message_ttls = {"my_queue": 30000}
+        channel.global_keyprefix = ""
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        channel._delete("my_queue")
+
+        assert "my_queue" not in channel._expires
+        assert "my_queue" not in channel._message_ttls
+        assert "my_queue" not in channel.auto_delete_queues
 
 
 @pytest.mark.unit
@@ -2889,6 +3174,247 @@ class TestMessageRequeue:
             # Message should be in queue with score 0
             score = client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag)
             assert score == 0
+
+
+@pytest.mark.integration
+class TestQueueTTL:
+    """Tests for queue TTL (x-expires) and message TTL (x-message-ttl)."""
+
+    def test_queue_expires_after_ttl(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that queue keys expire after the configured TTL when not refreshed."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            # Clear existing data
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            # Set _expires directly to use a short TTL for fast test
+            # (validation in _new_queue enforces >= 30s, but PEXPIRE itself works with any value)
+            channel._expires["celery"] = 2000
+
+            # Publish a message to create the keys
+            channel._put(
+                "celery",
+                {
+                    "body": "test",
+                    "properties": {
+                        "delivery_tag": "ttl-test-1",
+                        "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    },
+                },
+            )
+
+            # Refresh once to set the TTL
+            channel._refresh_queue_expires()
+
+            # Verify keys exist and have TTL
+            assert client.exists(f"{QUEUE_KEY_PREFIX}celery")
+            queue_ttl = client.pttl(f"{QUEUE_KEY_PREFIX}celery")
+            assert 0 < queue_ttl <= 2000
+            index_ttl = client.pttl(f"{MESSAGES_INDEX_PREFIX}celery")
+            assert 0 < index_ttl <= 2000
+
+            # Wait for TTL to expire (no refresh)
+            time.sleep(2.5)
+
+            # Keys should be gone
+            assert not client.exists(f"{QUEUE_KEY_PREFIX}celery")
+            assert not client.exists(f"{MESSAGES_INDEX_PREFIX}celery")
+
+    def test_queue_stays_alive_with_refresh(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that queue keys stay alive when refreshed periodically."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            # Clear existing data
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            # Set _expires directly to use a short TTL for fast test
+            channel._expires["celery"] = 2000
+
+            # Publish a message to create the keys
+            channel._put(
+                "celery",
+                {
+                    "body": "test",
+                    "properties": {
+                        "delivery_tag": "ttl-refresh-1",
+                        "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    },
+                },
+            )
+
+            # Refresh every 0.5s for 3 seconds (longer than TTL)
+            for _ in range(6):
+                channel._refresh_queue_expires()
+                time.sleep(0.5)
+
+            # Keys should still exist
+            assert client.exists(f"{QUEUE_KEY_PREFIX}celery")
+            assert client.exists(f"{MESSAGES_INDEX_PREFIX}celery")
+
+    def test_message_ttl_expires_messages(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that message hashes expire after the configured message TTL."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            # Clear existing data
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            # Declare queue with short message TTL (2 seconds)
+            channel._new_queue("celery", arguments={"x-message-ttl": 2000})
+
+            # Publish a message
+            delivery_tag = "msg-ttl-test-1"
+            channel._put(
+                "celery",
+                {
+                    "body": "test",
+                    "properties": {
+                        "delivery_tag": delivery_tag,
+                        "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    },
+                },
+            )
+
+            # Verify message hash exists with short TTL
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            assert client.exists(message_key)
+            ttl = client.ttl(message_key)
+            assert 0 < ttl <= 2
+
+            # Wait for message TTL to expire
+            time.sleep(2.5)
+
+            # Message hash should be gone
+            assert not client.exists(message_key)
+
+            # Queue sorted set still has the delivery tag (cleaned up on consume)
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None
+
+    def test_no_ttl_queues_unaffected(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that queues without TTL arguments are not affected by refresh."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            # Clear existing data
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            # Declare queue without TTL
+            channel._new_queue("celery")
+
+            # Publish a message
+            channel._put(
+                "celery",
+                {
+                    "body": "test",
+                    "properties": {
+                        "delivery_tag": "no-ttl-test-1",
+                        "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    },
+                },
+            )
+
+            # Refresh should be a no-op
+            channel._refresh_queue_expires()
+
+            # Queue key should have no TTL (-1 = no expiry)
+            assert client.ttl(f"{QUEUE_KEY_PREFIX}celery") == -1
+
+    def test_queue_expires_with_global_keyprefix(
+        self,
+        redis_container: tuple[str, int, str],
+    ) -> None:
+        """Test that PEXPIRE uses correct prefixed keys with global_keyprefix."""
+        from celery import Celery as CeleryApp
+
+        host, port, _image = redis_container
+
+        app = CeleryApp("test_ttl_prefix")
+        app.conf.update(
+            broker_url=f"redis://{host}:{port}/0",
+            broker_transport="celery_redis_plus.transport:Transport",
+            broker_transport_options={"global_keyprefix": "myapp:"},
+            result_backend=f"redis://{host}:{port}/1",
+            task_always_eager=False,
+        )
+
+        import redis as redis_module
+
+        raw_client = redis_module.Redis(host=host, port=port, db=0)
+
+        try:
+            with app.connection() as conn:
+                channel = cast("Channel", conn.default_channel)
+
+                # Set _expires directly to use a short TTL for fast test
+                channel._expires["celery"] = 5000
+
+                # Publish a message (creates the prefixed keys)
+                channel._put(
+                    "celery",
+                    {
+                        "body": "test",
+                        "properties": {
+                            "delivery_tag": "prefix-ttl-test",
+                            "delivery_info": {"exchange": "", "routing_key": "celery"},
+                        },
+                    },
+                )
+
+                # Refresh queue expires
+                channel._refresh_queue_expires()
+
+                # Verify prefixed keys have TTL
+                queue_ttl = int(raw_client.pttl(f"myapp:{QUEUE_KEY_PREFIX}celery"))  # type: ignore[arg-type]
+                assert 0 < queue_ttl <= 5000
+                index_ttl = int(raw_client.pttl(f"myapp:{MESSAGES_INDEX_PREFIX}celery"))  # type: ignore[arg-type]
+                assert 0 < index_ttl <= 5000
+        finally:
+            raw_client.flushdb()
+            raw_client.close()
+            app.close()
+
+    def test_delete_removes_ttl_state(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """Test that _delete removes queue from TTL tracking dicts."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            # Declare queue with both TTL types
+            channel._new_queue("celery", arguments={"x-expires": 60000, "x-message-ttl": 30000})
+
+            assert "celery" in channel._expires
+            assert "celery" in channel._message_ttls
+
+            # Delete queue
+            channel._delete("celery")
+
+            assert "celery" not in channel._expires
+            assert "celery" not in channel._message_ttls
 
 
 @pytest.mark.integration
