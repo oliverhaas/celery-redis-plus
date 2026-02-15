@@ -899,6 +899,157 @@ class TestChannel:
 
         assert params["connection_class"] is client_lib.SSLConnection
 
+    def test_connparams_with_credential_provider_instance(self) -> None:
+        """Test _connparams passes credential_provider and removes username/password."""
+        CredentialProvider = client_lib.credentials.CredentialProvider
+
+        class DummyProvider(CredentialProvider):
+            def get_credentials(self):
+                return ("user", "token123")
+
+        provider = DummyProvider()
+
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.max_connections = 10
+        channel.socket_timeout = None
+        channel.socket_connect_timeout = None
+        channel.socket_keepalive = None
+        channel.socket_keepalive_options = None
+        channel.health_check_interval = 25
+        channel.retry_on_timeout = False
+        channel.client_name = None
+        channel.connection_class = client_lib.Connection
+        channel.connection_class_ssl = client_lib.SSLConnection
+        channel.credential_provider = provider
+
+        mock_conninfo = MagicMock()
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 6379
+        mock_conninfo.virtual_host = "0"
+        mock_conninfo.userid = "old_user"
+        mock_conninfo.password = "old_pass"  # noqa: S105
+        mock_conninfo.ssl = None
+        mock_conninfo.transport_options = {}
+
+        mock_connection = MagicMock()
+        mock_connection.client = mock_conninfo
+        mock_connection.default_port = 6379
+        channel.connection = mock_connection
+
+        params = channel._connparams()
+
+        assert params["credential_provider"] is provider
+        assert "username" not in params
+        assert "password" not in params
+
+    def test_connparams_with_credential_provider_string(self) -> None:
+        """Test _connparams resolves dotted path string to a CredentialProvider."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.max_connections = 10
+        channel.socket_timeout = None
+        channel.socket_connect_timeout = None
+        channel.socket_keepalive = None
+        channel.socket_keepalive_options = None
+        channel.health_check_interval = 25
+        channel.retry_on_timeout = False
+        channel.client_name = None
+        channel.connection_class = client_lib.Connection
+        channel.connection_class_ssl = client_lib.SSLConnection
+        provider_path = f"{client_lib.__name__}.credentials.UsernamePasswordCredentialProvider"
+        channel.credential_provider = provider_path
+
+        mock_conninfo = MagicMock()
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 6379
+        mock_conninfo.virtual_host = "0"
+        mock_conninfo.userid = None
+        mock_conninfo.password = None
+        mock_conninfo.ssl = None
+        mock_conninfo.transport_options = {}
+
+        mock_connection = MagicMock()
+        mock_connection.client = mock_conninfo
+        mock_connection.default_port = 6379
+        channel.connection = mock_connection
+
+        params = channel._connparams()
+
+        assert isinstance(
+            params["credential_provider"],
+            client_lib.credentials.UsernamePasswordCredentialProvider,
+        )
+
+    def test_connparams_with_invalid_credential_provider(self) -> None:
+        """Test _connparams raises ValueError for non-CredentialProvider object."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.max_connections = 10
+        channel.socket_timeout = None
+        channel.socket_connect_timeout = None
+        channel.socket_keepalive = None
+        channel.socket_keepalive_options = None
+        channel.health_check_interval = 25
+        channel.retry_on_timeout = False
+        channel.client_name = None
+        channel.connection_class = client_lib.Connection
+        channel.connection_class_ssl = client_lib.SSLConnection
+        channel.credential_provider = object()  # Not a CredentialProvider
+
+        mock_conninfo = MagicMock()
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 6379
+        mock_conninfo.virtual_host = "0"
+        mock_conninfo.userid = None
+        mock_conninfo.password = None
+        mock_conninfo.ssl = None
+        mock_conninfo.transport_options = {}
+
+        mock_connection = MagicMock()
+        mock_connection.client = mock_conninfo
+        mock_connection.default_port = 6379
+        channel.connection = mock_connection
+
+        with pytest.raises(ValueError, match="credential_provider must be an instance"):
+            channel._connparams()
+
+    def test_connparams_without_credential_provider(self) -> None:
+        """Test _connparams preserves username/password when no credential_provider."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.max_connections = 10
+        channel.socket_timeout = None
+        channel.socket_connect_timeout = None
+        channel.socket_keepalive = None
+        channel.socket_keepalive_options = None
+        channel.health_check_interval = 25
+        channel.retry_on_timeout = False
+        channel.client_name = None
+        channel.connection_class = client_lib.Connection
+        channel.connection_class_ssl = client_lib.SSLConnection
+        channel.credential_provider = None
+
+        mock_conninfo = MagicMock()
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 6379
+        mock_conninfo.virtual_host = "0"
+        mock_conninfo.userid = "myuser"
+        mock_conninfo.password = "mypass"  # noqa: S105
+        mock_conninfo.ssl = None
+        mock_conninfo.transport_options = {}
+
+        mock_connection = MagicMock()
+        mock_connection.client = mock_conninfo
+        mock_connection.default_port = 6379
+        channel.connection = mock_connection
+
+        params = channel._connparams()
+
+        assert "credential_provider" not in params
+        assert params["username"] == "myuser"
+        assert params["password"] == "mypass"  # noqa: S105
+
     def test_prepare_queue_arguments(self) -> None:
         """Test that prepare_queue_arguments converts expires/message_ttl to ms."""
         channel = object.__new__(Channel)
