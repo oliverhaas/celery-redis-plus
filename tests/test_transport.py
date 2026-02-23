@@ -981,6 +981,72 @@ class TestChannel:
             client_lib.credentials.UsernamePasswordCredentialProvider,
         )
 
+    def test_connparams_with_nonexistent_credential_provider_string(self) -> None:
+        """Test _connparams raises ImportError for nonexistent dotted path."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.max_connections = 10
+        channel.socket_timeout = None
+        channel.socket_connect_timeout = None
+        channel.socket_keepalive = None
+        channel.socket_keepalive_options = None
+        channel.health_check_interval = 25
+        channel.retry_on_timeout = False
+        channel.client_name = None
+        channel.connection_class = client_lib.Connection
+        channel.connection_class_ssl = client_lib.SSLConnection
+        channel.credential_provider = "nonexistent_module.CredentialProvider"
+
+        mock_conninfo = MagicMock()
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 6379
+        mock_conninfo.virtual_host = "0"
+        mock_conninfo.userid = None
+        mock_conninfo.password = None
+        mock_conninfo.ssl = None
+        mock_conninfo.transport_options = {}
+
+        mock_connection = MagicMock()
+        mock_connection.client = mock_conninfo
+        mock_connection.default_port = 6379
+        channel.connection = mock_connection
+
+        with pytest.raises(ImportError):
+            channel._connparams()
+
+    def test_connparams_with_non_credential_provider_class_string(self) -> None:
+        """Test _connparams raises ValueError when string resolves to non-CredentialProvider."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.max_connections = 10
+        channel.socket_timeout = None
+        channel.socket_connect_timeout = None
+        channel.socket_keepalive = None
+        channel.socket_keepalive_options = None
+        channel.health_check_interval = 25
+        channel.retry_on_timeout = False
+        channel.client_name = None
+        channel.connection_class = client_lib.Connection
+        channel.connection_class_ssl = client_lib.SSLConnection
+        channel.credential_provider = "abc.ABC"
+
+        mock_conninfo = MagicMock()
+        mock_conninfo.hostname = "localhost"
+        mock_conninfo.port = 6379
+        mock_conninfo.virtual_host = "0"
+        mock_conninfo.userid = None
+        mock_conninfo.password = None
+        mock_conninfo.ssl = None
+        mock_conninfo.transport_options = {}
+
+        mock_connection = MagicMock()
+        mock_connection.client = mock_conninfo
+        mock_connection.default_port = 6379
+        channel.connection = mock_connection
+
+        with pytest.raises(ValueError, match="credential_provider must be an instance"):
+            channel._connparams()
+
     def test_connparams_with_invalid_credential_provider(self) -> None:
         """Test _connparams raises ValueError for non-CredentialProvider object."""
         channel = object.__new__(Channel)

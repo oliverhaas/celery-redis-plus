@@ -56,6 +56,7 @@ from kombu.utils.compat import register_after_fork
 from kombu.utils.encoding import bytes_to_str
 from kombu.utils.eventio import ERR, READ, poll
 from kombu.utils.functional import accepts_argument
+from kombu.utils.imports import symbol_by_name
 from kombu.utils.json import dumps, loads
 from kombu.utils.objects import cached_property
 from kombu.utils.url import _parse_url
@@ -1340,14 +1341,12 @@ class Channel(virtual.Channel):
         if credential_provider is None:
             return
         if isinstance(credential_provider, str):
-            module_path, _, class_name = credential_provider.rpartition(".")
-            import importlib
-
-            module = importlib.import_module(module_path)
-            credential_provider = getattr(module, class_name)()
+            credential_provider_cls = symbol_by_name(credential_provider)
+            credential_provider = credential_provider_cls()
         if CredentialProvider is not None and not isinstance(credential_provider, CredentialProvider):
             raise ValueError(
-                "credential_provider must be an instance of redis.credentials.CredentialProvider (or a subclass)",
+                "credential_provider must be an instance of "
+                f"{CredentialProvider.__module__}.CredentialProvider (or a subclass)",
             )
         connparams["credential_provider"] = credential_provider
         connparams.pop("username", None)
