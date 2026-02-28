@@ -636,7 +636,7 @@ class Channel(virtual.Channel):
 
     Uses:
     - BZMPOP + sorted sets for regular queues (priority support, reliability)
-    - Redis Streams + consumer groups for fanout (reliable, not lossy)
+    - Redis Streams for fanout (true broadcast via XREAD)
     - Native delayed delivery via score calculation
     """
 
@@ -929,7 +929,7 @@ class Channel(virtual.Channel):
         finally:
             self._in_poll = None
 
-    # --- XREADGROUP (Streams) methods for fanout ---
+    # --- XREAD (Streams) methods for fanout ---
 
     def _fanout_stream_key(self, exchange: str) -> str:
         """Get stream key for fanout exchange.
@@ -1151,11 +1151,13 @@ class Channel(virtual.Channel):
             return bool(result)
 
     def _put(self, queue: str, message: dict[str, Any], **kwargs: Any) -> None:
-        """Deliver message to queue using sorted set.
+        """Deliver message to queue or messages_index (native delayed delivery).
 
-        All messages go directly to the queue with a score encoding priority and
-        scheduled time. The messages_index tracks when to attempt (re)queue if the
-        message is not acknowledged (queue_at = visible_at + visibility_timeout).
+        Immediate messages go to the queue sorted set with a score encoding priority
+        and timestamp. Native delayed messages (delay > requeue check interval) go
+        only to messages_index and are moved to the queue when due.
+        The messages_index tracks when to attempt (re)queue if the message is not
+        acknowledged (queue_at = visible_at + visibility_timeout).
 
         Args:
             queue: Target queue name.
@@ -1561,7 +1563,7 @@ class Transport(virtual.Transport):
 
     Uses:
     - BZMPOP + sorted sets for regular queues (priority support, reliability)
-    - Redis Streams + consumer groups for fanout (reliable, not lossy)
+    - Redis Streams for fanout (true broadcast via XREAD)
     - Integrated delayed delivery via score calculation
 
     Requires Redis 7.0+ for BZMPOP support.
