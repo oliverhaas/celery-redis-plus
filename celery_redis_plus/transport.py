@@ -27,6 +27,9 @@ Transport Options
 * ``health_check_interval``: Interval for health checks (default: 25)
 * ``ssl``: Enable SSL/TLS connection. Set to ``True`` for default SSL settings,
   or a dict with SSL options (e.g., ``{'ssl_cert_reqs': ssl.CERT_REQUIRED}``)
+* ``credential_provider``: A ``redis.credentials.CredentialProvider`` instance (or dotted
+  import path string) for dynamic auth (e.g., AWS ElastiCache IAM, Azure Redis).
+  Mutually exclusive with username/password in the broker URL.
 """
 
 from __future__ import annotations
@@ -53,6 +56,7 @@ from kombu.utils.compat import register_after_fork
 from kombu.utils.encoding import bytes_to_str
 from kombu.utils.eventio import ERR, READ, poll
 from kombu.utils.functional import accepts_argument
+from kombu.utils.imports import symbol_by_name
 from kombu.utils.json import dumps, loads
 from kombu.utils.objects import cached_property
 from kombu.utils.url import _parse_url
@@ -96,6 +100,13 @@ except ImportError:  # pragma: no cover
             "celery-redis-plus requires either redis-py or valkey-py to be installed. "
             "Install with: pip install celery-redis-plus[redis] or pip install celery-redis-plus[valkey]",
         ) from None
+
+# Import CredentialProvider from whichever client library is installed
+CredentialProvider: type | None = getattr(
+    getattr(client_lib, "credentials", None),
+    "CredentialProvider",
+    None,
+)
 
 # Exception classes (compatible between redis-py and valkey-py)
 _client_exceptions = client_lib.exceptions
@@ -646,6 +657,9 @@ class Channel(virtual.Channel):
     # Global key prefix
     global_keyprefix = ""
 
+    # Credential provider for dynamic auth (e.g. AWS ElastiCache IAM, Azure Redis)
+    credential_provider = None
+
     # Fanout settings
     fanout_prefix: bool | str = True
     fanout_patterns = True
@@ -670,6 +684,7 @@ class Channel(virtual.Channel):
         "retry_on_timeout",
         "client_name",
         "stream_maxlen",
+        "credential_provider",
     )
 
     connection_class = client_lib.Connection if client_lib else None
@@ -1313,6 +1328,30 @@ class Channel(virtual.Channel):
                 raise ValueError(f"Database is int between 0 and limit - 1, not {vhost}") from None
         return int(vhost)
 
+    def _process_credential_provider(
+        self,
+        credential_provider: Any,
+        connparams: dict[str, Any],
+    ) -> None:
+        """Process credential_provider and update connparams in-place.
+
+        Accepts a CredentialProvider instance or a dotted import path string.
+        When set, static username/password are removed since they are mutually exclusive.
+        """
+        if credential_provider is None:
+            return
+        if isinstance(credential_provider, str):
+            credential_provider_cls = symbol_by_name(credential_provider)
+            credential_provider = credential_provider_cls()
+        if CredentialProvider is not None and not isinstance(credential_provider, CredentialProvider):
+            raise ValueError(
+                "credential_provider must be an instance of "
+                f"{CredentialProvider.__module__}.CredentialProvider (or a subclass)",
+            )
+        connparams["credential_provider"] = credential_provider
+        connparams.pop("username", None)
+        connparams.pop("password", None)
+
     def _connparams(self, asynchronous: bool = False) -> dict[str, Any]:  # noqa: PLR0912
         if self.connection.client is None:
             raise TypeError("Transport client must be set")
@@ -1387,6 +1426,8 @@ class Channel(virtual.Channel):
             connparams.pop("port", None)
 
         connparams["db"] = self._prepare_virtual_host(connparams.pop("virtual_host", None))
+
+        self._process_credential_provider(self.credential_provider, connparams)
 
         channel = self
         connection_cls = connparams.get("connection_class") or self.connection_class
