@@ -1235,7 +1235,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <h2 id="030-2026-02-14">[0.3.0] - 2026-02-14<a class="headerlink" href="#030-2026-02-14" title="Permanent link">&para;</a></h2>
 <h3 id="added">Added<a class="headerlink" href="#added" title="Permanent link">&para;</a></h3>
 <ul>
-<li>Queue TTL (<code>x-expires</code>): queues auto-expire when no worker refreshes them, via periodic PEXPIRE with dynamic interval (TTL/5)</li>
+<li>Queue TTL (<code>x-expires</code>): queues auto-expire when no worker refreshes them, via periodic PEXPIRE with dynamic interval (TTL/2)</li>
 <li>Message TTL (<code>x-message-ttl</code>): per-queue message expiry via shorter EXPIRE on message hashes</li>
 <li><code>prepare_queue_arguments</code> override using kombu's <code>to_rabbitmq_queue_arguments</code> for RabbitMQ-compatible queue argument handling</li>
 </ul>

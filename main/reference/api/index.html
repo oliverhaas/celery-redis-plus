@@ -1007,12 +1007,6 @@
 <td><code>-1</code></td>
 <td>TTL in seconds for message hashes (-1 = no TTL)</td>
 </tr>
-<tr>
-<td><code>messages_index_prefix</code></td>
-<td><code>str</code></td>
-<td><code>"messages_index:"</code></td>
-<td>Prefix for per-queue messages index sorted sets</td>
-</tr>
 </tbody>
 </table>
 <h4 id="connection-options">Connection Options<a class="headerlink" href="#connection-options" title="Permanent link">&para;</a></h4>
@@ -1073,6 +1067,12 @@
 <td><code>str</code></td>
 <td><code>None</code></td>
 <td>Redis client name for <code>CLIENT SETNAME</code></td>
+</tr>
+<tr>
+<td><code>credential_provider</code></td>
+<td><code>object</code></td>
+<td><code>None</code></td>
+<td>Redis credential provider for dynamic auth (e.g. token rotation)</td>
 </tr>
 <tr>
 <td><code>ssl</code></td>
