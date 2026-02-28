@@ -48,7 +48,6 @@ All options are passed via Celery's `broker_transport_options` configuration.
 |--------|------|---------|-------------|
 | `message_key_prefix` | `str` | `"message:"` | Prefix for per-message hash keys |
 | `message_ttl` | `int` | `-1` | TTL in seconds for message hashes (-1 = no TTL) |
-| `messages_index_prefix` | `str` | `"messages_index:"` | Prefix for per-queue messages index sorted sets |
 
 #### Connection Options
 
@@ -62,6 +61,7 @@ All options are passed via Celery's `broker_transport_options` configuration.
 | `health_check_interval` | `int` | `25` | Health check interval in seconds |
 | `retry_on_timeout` | `bool` | `None` | Retry on timeout |
 | `client_name` | `str` | `None` | Redis client name for `CLIENT SETNAME` |
+| `credential_provider` | `object` | `None` | Redis credential provider for dynamic auth (e.g. token rotation) |
 | `ssl` | `bool` or `dict` | `None` | SSL/TLS configuration |
 
 #### Fanout Options

@@ -18,8 +18,9 @@ local visibility_timeout = tonumber(ARGV[7])
 local messages_index_prefix = ARGV[8]
 
 -- Get priority and routing_key (queue) from hash
-local priority = redis.call('HGET', message_key, 'priority')
-local routing_key = redis.call('HGET', message_key, 'routing_key')
+local fields = redis.call('HMGET', message_key, 'priority', 'routing_key')
+local priority = fields[1]
+local routing_key = fields[2]
 if not priority or not routing_key then
     return 0
 end

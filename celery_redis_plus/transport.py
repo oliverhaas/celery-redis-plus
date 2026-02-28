@@ -196,12 +196,15 @@ class GlobalKeyPrefixMixin:
         "HGET",
         "HSET",
         "PEXPIRE",
+        "PTTL",
         "SADD",
         "SREM",
         "SMEMBERS",
+        "TTL",
         "ZADD",
         "ZCARD",
         "ZPOPMIN",
+        "ZRANGE",
         "ZRANGEBYSCORE",
         "ZREM",
         "ZREVRANGEBYSCORE",
@@ -702,8 +705,8 @@ class Channel(virtual.Channel):
         "credential_provider",
     )
 
-    connection_class = client_lib.Connection if client_lib else None
-    connection_class_ssl = client_lib.SSLConnection if client_lib else None
+    connection_class = client_lib.Connection
+    connection_class_ssl = client_lib.SSLConnection
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -1317,18 +1320,16 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             queue_key = self._queue_key(queue)
             size = int(client.zcard(queue_key))
-            if size:
-                # Collect delivery tags from both queue and index to clean up message hashes
-                tags = {bytes_to_str(t) for t in client.zrange(queue_key, 0, -1)}
-                index_key = self._messages_index_key(queue)
-                tags.update(bytes_to_str(t) for t in client.zrange(index_key, 0, -1))
-                with client.pipeline() as pipe:
-                    pipe.delete(queue_key, index_key)
-                    for tag in tags:
-                        pipe.delete(self._message_key(tag))
-                    pipe.execute()
-            else:
-                client.delete(queue_key, self._messages_index_key(queue))
+            # Collect delivery tags from both queue and index to clean up message hashes.
+            # Index may have tags not in queue (native delayed messages waiting for delivery).
+            index_key = self._messages_index_key(queue)
+            tags = {bytes_to_str(t) for t in client.zrange(queue_key, 0, -1)}
+            tags.update(bytes_to_str(t) for t in client.zrange(index_key, 0, -1))
+            with client.pipeline() as pipe:
+                pipe.delete(queue_key, index_key)
+                for tag in tags:
+                    pipe.delete(self._message_key(tag))
+                pipe.execute()
             return size
 
     def close(self) -> None:

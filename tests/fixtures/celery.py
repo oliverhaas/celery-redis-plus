@@ -8,23 +8,28 @@ import pytest
 
 
 @pytest.fixture
-def celery_config(redis_container: tuple[str, int, str]) -> dict[str, Any]:
+def celery_config(redis_container: tuple[str, int, str], global_keyprefix: str) -> dict[str, Any]:
     """Configure Celery to use our custom Redis transport.
 
     This fixture is used by celery.contrib.pytest's celery_app fixture.
+    Parametrized via global_keyprefix to test with and without key prefixing.
 
     Args:
         redis_container: Tuple of (host, port, image) from redis_container fixture.
+        global_keyprefix: Key prefix (empty or "testprefix:").
 
     Returns:
         Celery configuration dictionary.
     """
     host, port, _image = redis_container
-    return {
+    config: dict[str, Any] = {
         "broker_url": f"redis://{host}:{port}/0",
         "broker_transport": "celery_redis_plus.transport:Transport",
         "result_backend": f"redis://{host}:{port}/1",
     }
+    if global_keyprefix:
+        config["broker_transport_options"] = {"global_keyprefix": global_keyprefix}
+    return config
 
 
 @pytest.fixture

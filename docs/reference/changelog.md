@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-02-14
 
 ### Added
-- Queue TTL (`x-expires`): queues auto-expire when no worker refreshes them, via periodic PEXPIRE with dynamic interval (TTL/5)
+- Queue TTL (`x-expires`): queues auto-expire when no worker refreshes them, via periodic PEXPIRE with dynamic interval (TTL/2)
 - Message TTL (`x-message-ttl`): per-queue message expiry via shorter EXPIRE on message hashes
 - `prepare_queue_arguments` override using kombu's `to_rabbitmq_queue_arguments` for RabbitMQ-compatible queue argument handling
 

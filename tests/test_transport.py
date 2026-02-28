@@ -422,14 +422,14 @@ class TestGlobalKeyPrefixMixin:
 class TestChannel:
     """Tests for the custom Channel class."""
 
-    def test_put_stores_in_sorted_set(self) -> None:
+    def test_put_stores_in_sorted_set(self, global_keyprefix: str) -> None:
         """Test that _put stores messages in per-message hash with correct score."""
 
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.message_ttl = DEFAULT_MESSAGE_TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
         channel._message_ttls = {}
         channel._expires = {}
 
@@ -466,7 +466,7 @@ class TestChannel:
         assert mock_pipe.zadd.call_count == 2
         mock_pipe.execute.assert_called_once()
 
-    def test_put_with_long_delay_goes_to_messages_index(self) -> None:
+    def test_put_with_long_delay_goes_to_messages_index(self, global_keyprefix: str) -> None:
         """Test that native delayed messages go to messages_index:{queue}, not queue.
 
         Native delayed delivery stores the message only in messages_index:{queue} with
@@ -477,7 +477,7 @@ class TestChannel:
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.message_ttl = DEFAULT_MESSAGE_TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
         channel._message_ttls = {}
         channel._expires = {}
 
@@ -527,14 +527,14 @@ class TestChannel:
         assert mapping.get("native_delayed") == 1
         assert mapping.get("eta") == eta_timestamp
 
-    def test_put_with_short_delay_goes_to_main_queue(self) -> None:
+    def test_put_with_short_delay_goes_to_main_queue(self, global_keyprefix: str) -> None:
         """Test that messages with short delay go to main queue with future timestamp score."""
 
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.message_ttl = DEFAULT_MESSAGE_TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
         channel._message_ttls = {}
         channel._expires = {}
 
@@ -589,14 +589,14 @@ class TestChannel:
         assert mapping.get("native_delayed") == 0
         assert mapping.get("eta") == eta_timestamp
 
-    def test_put_with_no_eta(self) -> None:
+    def test_put_with_no_eta(self, global_keyprefix: str) -> None:
         """Test that no eta means immediate delivery (no delay)."""
 
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.message_ttl = DEFAULT_MESSAGE_TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
         channel._message_ttls = {}
         channel._expires = {}
 
@@ -641,14 +641,14 @@ class TestChannel:
         assert mapping.get("native_delayed") == 0
         assert mapping.get("eta") == 0
 
-    def test_put_with_eta_in_past_treated_as_immediate(self) -> None:
+    def test_put_with_eta_in_past_treated_as_immediate(self, global_keyprefix: str) -> None:
         """Test that eta in the past is treated as immediate delivery."""
 
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.message_ttl = DEFAULT_MESSAGE_TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
         channel._message_ttls = {}
         channel._expires = {}
 
@@ -1148,7 +1148,7 @@ class TestChannel:
         channel.connection.cycle._update_expires_timer.assert_called_once()
 
     def test_new_queue_clamps_short_expires(self) -> None:
-        """Test that _new_queue clamps x-expires below 30s to the minimum."""
+        """Test that _new_queue clamps x-expires below minimum."""
         channel = object.__new__(Channel)
         channel.auto_delete_queues = set()
         channel._expires = {}
@@ -1183,13 +1183,13 @@ class TestChannel:
         assert "my_queue" not in channel._expires
         assert "my_queue" not in channel._message_ttls
 
-    def test_put_uses_queue_message_ttl(self) -> None:
+    def test_put_uses_queue_message_ttl(self, global_keyprefix: str) -> None:
         """Test that _put uses per-queue message TTL when configured."""
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
-        channel.message_ttl = DEFAULT_MESSAGE_TTL  # 3 days
+        channel.message_ttl = DEFAULT_MESSAGE_TTL  # no TTL
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
         channel._message_ttls = {"my_queue": 60000}  # 60 seconds
         channel._expires = {}
 
@@ -1220,10 +1220,10 @@ class TestChannel:
         expire_args = mock_pipe.expire.call_args[0]
         assert expire_args[1] == 60  # 60000 // 1000
 
-    def test_refresh_queue_expires(self) -> None:
+    def test_refresh_queue_expires(self, global_keyprefix: str) -> None:
         """Test that _refresh_queue_expires PEXPIREs correct keys."""
         channel = object.__new__(Channel)
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
         channel._expires = {"celery": 60000, "priority": 120000}
 
         mock_client = MagicMock()
@@ -1259,11 +1259,11 @@ class TestChannel:
 
         channel.conn_or_acquire.assert_not_called()
 
-    def test_get_skips_expired_messages(self) -> None:
+    def test_get_skips_expired_messages(self, global_keyprefix: str) -> None:
         """Test that _get skips messages whose hash has expired and tries the next."""
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
 
         mock_client = MagicMock()
         mock_context = MagicMock()
@@ -1290,11 +1290,11 @@ class TestChannel:
             "expired_tag",
         )
 
-    def test_get_raises_empty_when_all_expired(self) -> None:
+    def test_get_raises_empty_when_all_expired(self, global_keyprefix: str) -> None:
         """Test that _get raises Empty when all messages have expired."""
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
 
         mock_client = MagicMock()
         mock_context = MagicMock()
@@ -1314,11 +1314,11 @@ class TestChannel:
 
         mock_client.zrem.assert_called_once()
 
-    def test_bzmpop_read_drains_expired_messages(self) -> None:
+    def test_bzmpop_read_drains_expired_messages(self, global_keyprefix: str) -> None:
         """Test that _bzmpop_read falls back to zpopmin after expired BZMPOP result."""
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
         channel._in_poll = True
 
         mock_client = MagicMock()
@@ -1346,10 +1346,10 @@ class TestChannel:
         # Should have cleaned up index for expired tag
         assert mock_client.zrem.call_count == 1
 
-    def test_cleanup_expired_message(self) -> None:
+    def test_cleanup_expired_message(self, global_keyprefix: str) -> None:
         """Test that _cleanup_expired_message removes the messages_index entry."""
         channel = object.__new__(Channel)
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
 
         mock_client = MagicMock()
         mock_context = MagicMock()
@@ -1364,10 +1364,10 @@ class TestChannel:
             "tag123",
         )
 
-    def test_cleanup_expired_message_with_client(self) -> None:
+    def test_cleanup_expired_message_with_client(self, global_keyprefix: str) -> None:
         """Test _cleanup_expired_message with explicit client."""
         channel = object.__new__(Channel)
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
 
         mock_client = MagicMock()
         channel._cleanup_expired_message("my_queue", "tag123", client=mock_client)
@@ -1377,13 +1377,13 @@ class TestChannel:
             "tag123",
         )
 
-    def test_delete_cleans_up_ttl_state(self) -> None:
+    def test_delete_cleans_up_ttl_state(self, global_keyprefix: str) -> None:
         """Test that _delete removes queue from _expires and _message_ttls."""
         channel = object.__new__(Channel)
         channel.auto_delete_queues = {"my_queue"}
         channel._expires = {"my_queue": 60000}
         channel._message_ttls = {"my_queue": 30000}
-        channel.global_keyprefix = ""
+        channel.global_keyprefix = global_keyprefix
         channel.keyprefix_queue = "_kombu.binding.%s"
         channel.sep = "\x06\x16"
 
@@ -2104,6 +2104,7 @@ class TestTransportFeatures:
         celery_app: Celery,
         celery_worker: Any,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that messages are cleaned up from Redis after successful processing."""
 
@@ -2120,7 +2121,7 @@ class TestTransportFeatures:
 
         # Check that message index is eventually cleaned up
         # The per-queue messages_index key tracks messages for this queue
-        index_count = redis_client.zcard(f"{MESSAGES_INDEX_PREFIX}celery")
+        index_count = redis_client.zcard(f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery")
         # Should be 0 or very small after successful processing
         assert index_count <= 1  # Allow some tolerance for timing
 
@@ -2297,6 +2298,7 @@ class TestMessagePublishing:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that publishing a task stores it in a Redis sorted set."""
 
@@ -2308,25 +2310,26 @@ class TestMessagePublishing:
         add.delay(1, 2)
 
         # Check that message is in the celery queue sorted set
-        queue_size = redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery")
+        queue_size = redis_client.zcard(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery")
         assert queue_size >= 1
 
         # Check that message is in the per-queue messages index
-        index_size = redis_client.zcard(f"{MESSAGES_INDEX_PREFIX}celery")
+        index_size = redis_client.zcard(f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery")
         assert index_size >= 1
 
         # Check that message payload is stored in a per-message hash
         # Get the delivery tag from the queue to verify the message hash exists
-        queue_members = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, 0)
+        queue_members = redis_client.zrange(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery", 0, 0)
         assert len(queue_members) >= 1
         delivery_tag = queue_members[0].decode() if isinstance(queue_members[0], bytes) else queue_members[0]
-        message_key = f"message:{delivery_tag}"
+        message_key = f"{global_keyprefix}message:{delivery_tag}"
         assert redis_client.exists(message_key) == 1
 
     def test_published_message_with_countdown_has_future_score(
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that a task with countdown uses native delayed delivery."""
 
@@ -2340,11 +2343,11 @@ class TestMessagePublishing:
         add.apply_async(args=(1, 2), countdown=10)
 
         # Native delayed message should NOT be in the queue sorted set yet
-        queue_messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1)
+        queue_messages = redis_client.zrange(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery", 0, -1)
         assert len(queue_messages) == 0
 
         # But should be in messages_index with queue_at = eta
-        index_messages = redis_client.zrange(f"{MESSAGES_INDEX_PREFIX}celery", 0, -1, withscores=True)
+        index_messages = redis_client.zrange(f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery", 0, -1, withscores=True)
         assert len(index_messages) >= 1
 
         _tag, queue_at = index_messages[-1]
@@ -2355,6 +2358,7 @@ class TestMessagePublishing:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that a task with ETA uses native delayed delivery."""
 
@@ -2368,11 +2372,11 @@ class TestMessagePublishing:
         add.apply_async(args=(1, 2), eta=eta)
 
         # Native delayed message should NOT be in the queue sorted set yet
-        queue_messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1)
+        queue_messages = redis_client.zrange(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery", 0, -1)
         assert len(queue_messages) == 0
 
         # But should be in messages_index with queue_at = eta
-        index_messages = redis_client.zrange(f"{MESSAGES_INDEX_PREFIX}celery", 0, -1, withscores=True)
+        index_messages = redis_client.zrange(f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery", 0, -1, withscores=True)
         assert len(index_messages) >= 1
 
         _tag, queue_at = index_messages[-1]
@@ -2382,6 +2386,7 @@ class TestMessagePublishing:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that higher priority messages have lower scores (processed first)."""
 
@@ -2390,7 +2395,11 @@ class TestMessagePublishing:
             return x + y
 
         # Clear any existing messages
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", f"{MESSAGES_INDEX_PREFIX}celery")
+        redis_client.delete(
+            f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+            f"{global_keyprefix}messages",
+            f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
+        )
 
         # Publish low priority first, then high priority
         add.apply_async(args=(1, 1), priority=0)  # Low priority
@@ -2398,7 +2407,7 @@ class TestMessagePublishing:
         add.apply_async(args=(2, 2), priority=9)  # High priority
 
         # Get messages ordered by score (ascending)
-        messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
+        messages = redis_client.zrange(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
         assert len(messages) == 2
 
         # High priority (9) should have lower score, so it comes first
@@ -2413,6 +2422,7 @@ class TestMessagePublishing:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that multiple messages are ordered correctly by score."""
 
@@ -2421,7 +2431,11 @@ class TestMessagePublishing:
             return x + y
 
         # Clear any existing messages
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", f"{MESSAGES_INDEX_PREFIX}celery")
+        redis_client.delete(
+            f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+            f"{global_keyprefix}messages",
+            f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
+        )
 
         # Publish 5 messages with same priority
         for i in range(5):
@@ -2429,11 +2443,11 @@ class TestMessagePublishing:
             time.sleep(0.01)  # Small delay between messages
 
         # Check all messages are in the queue
-        queue_size = redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery")
+        queue_size = redis_client.zcard(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery")
         assert queue_size == 5
 
         # Messages should be ordered by timestamp (FIFO within same priority)
-        messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
+        messages = redis_client.zrange(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
         scores = [score for _, score in messages]
 
         # Scores should be in ascending order (earlier messages have lower scores)
@@ -2443,6 +2457,7 @@ class TestMessagePublishing:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that the message payload contains correct task data."""
 
@@ -2451,17 +2466,20 @@ class TestMessagePublishing:
             return x + y
 
         # Clear any existing messages
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+        redis_client.delete(
+            f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+            f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
+        )
 
         add.delay(42, 58)
 
         # Get the delivery tag from the queue
-        messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1)
+        messages = redis_client.zrange(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery", 0, -1)
         assert len(messages) == 1
         delivery_tag = messages[0].decode() if isinstance(messages[0], bytes) else messages[0]
 
         # Get the payload from the per-message hash
-        message_key = f"message:{delivery_tag}"
+        message_key = f"{global_keyprefix}message:{delivery_tag}"
         payload = redis_client.hget(message_key, "payload")
         assert payload is not None
 
@@ -2482,6 +2500,7 @@ class TestMessagePublishing:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that purging a queue removes messages from Redis."""
 
@@ -2490,12 +2509,15 @@ class TestMessagePublishing:
             return x + y
 
         # Clear and publish
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+        redis_client.delete(
+            f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+            f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
+        )
         for _ in range(3):
             add.delay(1, 1)
 
         # Verify messages exist
-        assert redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery") == 3
+        assert redis_client.zcard(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery") == 3
 
         # Purge using the app's control interface
         with celery_app.connection() as conn:
@@ -2504,12 +2526,13 @@ class TestMessagePublishing:
             assert purged == 3
 
         # Verify queue is empty
-        assert redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery") == 0
+        assert redis_client.zcard(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery") == 0
 
     def test_queue_size_returns_correct_count(
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that queue size returns correct message count."""
 
@@ -2518,7 +2541,11 @@ class TestMessagePublishing:
             return x + y
 
         # Clear and publish
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages", f"{MESSAGES_INDEX_PREFIX}celery")
+        redis_client.delete(
+            f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+            f"{global_keyprefix}messages",
+            f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
+        )
         for _ in range(5):
             add.delay(1, 1)
 
@@ -2537,6 +2564,7 @@ class TestQueueOperations:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that deleting a queue removes it from Redis."""
 
@@ -2545,9 +2573,9 @@ class TestQueueOperations:
             return x + y
 
         # Publish messages
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}celery")
+        redis_client.delete(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery")
         add.delay(1, 1)
-        assert redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery") >= 1
+        assert redis_client.zcard(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery") >= 1
 
         # Delete the queue
         with celery_app.connection() as conn:
@@ -2555,12 +2583,13 @@ class TestQueueOperations:
             channel._delete("celery")
 
         # Queue should be gone
-        assert redis_client.zcard(f"{QUEUE_KEY_PREFIX}celery") == 0
+        assert redis_client.zcard(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery") == 0
 
     def test_queue_exists_check(
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that _has_queue correctly checks queue existence."""
 
@@ -2569,23 +2598,27 @@ class TestQueueOperations:
             return x + y
 
         # Clear and check non-existence
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}test_queue_exists")
+        redis_client.delete(f"{global_keyprefix}{QUEUE_KEY_PREFIX}test_queue_exists")
 
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
             assert channel._has_queue("test_queue_exists") is False
 
             # Create queue by adding a message directly
-            redis_client.zadd(f"{QUEUE_KEY_PREFIX}test_queue_exists", {"msg1": 1.0})
+            redis_client.zadd(
+                f"{global_keyprefix}{QUEUE_KEY_PREFIX}test_queue_exists",
+                {"msg1": 1.0},
+            )
             assert channel._has_queue("test_queue_exists") is True
 
         # Cleanup
-        redis_client.delete(f"{QUEUE_KEY_PREFIX}test_queue_exists")
+        redis_client.delete(f"{global_keyprefix}{QUEUE_KEY_PREFIX}test_queue_exists")
 
     def test_get_table_returns_bindings(
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that get_table returns queue bindings."""
         with celery_app.connection() as conn:
@@ -2608,7 +2641,7 @@ class TestQueueOperations:
             assert found
 
         # Cleanup
-        redis_client.delete("_kombu.binding.test_exchange")
+        redis_client.delete(f"{global_keyprefix}_kombu.binding.test_exchange")
 
 
 @pytest.mark.integration
@@ -2688,6 +2721,7 @@ class TestFanoutMessaging:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that fanout exchange can be declared."""
         with celery_app.connection() as conn:
@@ -2700,7 +2734,7 @@ class TestFanoutMessaging:
             fanout_queue.bind(channel).declare()  # type: ignore[attr-defined]
 
             # The binding should be stored
-            bindings_key = "_kombu.binding.test_fanout_decl"
+            bindings_key = f"{global_keyprefix}_kombu.binding.test_fanout_decl"
             bindings = redis_client.smembers(bindings_key)
             assert len(bindings) >= 1
 
@@ -2728,6 +2762,7 @@ class TestFanoutMessaging:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that a message published to a fanout exchange can be consumed.
 
@@ -2754,20 +2789,21 @@ class TestFanoutMessaging:
 
             # The message should be in a single stream (no routing key in key name)
             stream_key = channel._fanout_stream_key("test_fanout_e2e")
-            assert redis_client.xlen(stream_key) == 1
+            assert redis_client.xlen(f"{global_keyprefix}{stream_key}") == 1
 
             # There should NOT be a per-routing-key stream
-            per_route_key = f"{stream_key}/some.routing.key"
+            per_route_key = f"{global_keyprefix}{stream_key}/some.routing.key"
             assert not redis_client.exists(per_route_key)
 
             # Cleanup
-            redis_client.delete(stream_key)
-            redis_client.delete("_kombu.binding.test_fanout_e2e")
+            redis_client.delete(f"{global_keyprefix}{stream_key}")
+            redis_client.delete(f"{global_keyprefix}_kombu.binding.test_fanout_e2e")
 
     def test_fanout_with_wildcard_routing_key_binding(
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that a consumer bound with '#' wildcard receives fanout messages.
 
@@ -2794,12 +2830,13 @@ class TestFanoutMessaging:
             assert publish_stream == consume_stream
 
             # Cleanup
-            redis_client.delete("_kombu.binding.test_fanout_wildcard")
+            redis_client.delete(f"{global_keyprefix}_kombu.binding.test_fanout_wildcard")
 
     def test_fanout_end_to_end_via_xread(
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test end-to-end fanout: publish to stream, consume via XREAD.
 
@@ -2836,7 +2873,7 @@ class TestFanoutMessaging:
 
             # Verify the message is in the correct stream
             stream_key = channel._fanout_stream_key("test_e2e_xread")
-            assert redis_client.xlen(stream_key) >= 1
+            assert redis_client.xlen(f"{global_keyprefix}{stream_key}") >= 1
 
             # Read via XREAD from offset 0 (beginning of stream)
             # Initialize subclient connection (normally done by MultiChannelPoller)
@@ -2862,6 +2899,7 @@ class TestDelayedMessageStorage:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that native delayed messages go to messages_index:{queue}, not queue immediately.
 
@@ -2873,7 +2911,10 @@ class TestDelayedMessageStorage:
             channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
-            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+            redis_client.delete(
+                f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+                f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
+            )
 
             delay_seconds = 120  # 2 minutes in the future (> 60s threshold)
             before_time = time.time()
@@ -2894,18 +2935,28 @@ class TestDelayedMessageStorage:
             channel._put("celery", message)
 
             # Message should NOT be in the main queue yet (native delayed delivery)
-            main_messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
+            main_messages = redis_client.zrange(
+                f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+                0,
+                -1,
+                withscores=True,
+            )
             assert len(main_messages) == 0
 
             # Message should be in messages_index:{queue} with queue_at = eta
-            index_entries = redis_client.zrange(f"{MESSAGES_INDEX_PREFIX}celery", 0, -1, withscores=True)
+            index_entries = redis_client.zrange(
+                f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
+                0,
+                -1,
+                withscores=True,
+            )
             assert len(index_entries) == 1
             tag, queue_at = index_entries[0]
             assert tag.decode() if isinstance(tag, bytes) else tag == delivery_tag
             assert queue_at == pytest.approx(eta_timestamp, rel=1e-6)
 
             # Message data should be stored in per-message hash
-            message_key = f"message:{delivery_tag}"
+            message_key = f"{global_keyprefix}message:{delivery_tag}"
             priority = redis_client.hget(message_key, "priority")
             assert priority is not None
             assert int(priority) == 0  # Default priority
@@ -2919,13 +2970,17 @@ class TestDelayedMessageStorage:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that messages without eta have current time scores."""
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
-            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+            redis_client.delete(
+                f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+                f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
+            )
 
             before_time = time.time()
 
@@ -2944,7 +2999,12 @@ class TestDelayedMessageStorage:
             after_time = time.time()
 
             # Get the message score
-            messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
+            messages = redis_client.zrange(
+                f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+                0,
+                -1,
+                withscores=True,
+            )
             assert len(messages) == 1
             _tag, actual_score = messages[0]
 
@@ -2959,6 +3019,7 @@ class TestDelayedMessageStorage:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that short-delayed and immediate messages are ordered correctly in queue.
 
@@ -2969,7 +3030,10 @@ class TestDelayedMessageStorage:
             channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
-            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+            redis_client.delete(
+                f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+                f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
+            )
 
             now = time.time()
             # Use delay <= DEFAULT_REQUEUE_CHECK_INTERVAL so it's treated as immediate
@@ -2997,7 +3061,12 @@ class TestDelayedMessageStorage:
             channel._put("celery", short_delayed_msg)
 
             # Both messages should be in main queue (short delay is treated as immediate)
-            main_messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
+            main_messages = redis_client.zrange(
+                f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+                0,
+                -1,
+                withscores=True,
+            )
             assert len(main_messages) == 2
 
             # Both messages should have scores based on "now" (not the eta)
@@ -3013,13 +3082,17 @@ class TestDelayedMessageStorage:
         self,
         celery_app: Celery,
         redis_client: Any,
+        global_keyprefix: str,
     ) -> None:
         """Test that high priority messages are ordered before low priority."""
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
 
             # Clear existing messages
-            redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+            redis_client.delete(
+                f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+                f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
+            )
 
             # Create low priority message first
             low_priority_msg = {
@@ -3044,7 +3117,12 @@ class TestDelayedMessageStorage:
             channel._put("celery", high_priority_msg)
 
             # High priority should be first (lower score)
-            messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
+            messages = redis_client.zrange(
+                f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
+                0,
+                -1,
+                withscores=True,
+            )
             assert len(messages) == 2
 
             first_tag = messages[0][0].decode() if isinstance(messages[0][0], bytes) else messages[0][0]

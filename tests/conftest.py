@@ -24,6 +24,8 @@ def pytest_configure() -> None:
 
 # Re-export fixtures from fixtures package
 # ruff: noqa: E402  # Module level import not at top of file (intentional - pytest_configure must run first)
+import pytest
+
 from tests.fixtures import (
     celery_app,
     celery_config,
@@ -44,9 +46,17 @@ __all__ = [
     "cleanup_async_results",
     "clear_kombu_global_event_loop",
     "clear_redis",
+    "global_keyprefix",
     "redis_client",
     "redis_container",
 ]
+
+
+@pytest.fixture(params=["", "testprefix:"], ids=["no-prefix", "with-prefix"])
+def global_keyprefix(request: pytest.FixtureRequest) -> str:
+    """Parametrized global key prefix for testing with and without key prefixing."""
+    return request.param
+
 
 # Enable celery.contrib.pytest plugin for celery_app and celery_worker fixtures
 pytest_plugins = ("celery.contrib.pytest",)
