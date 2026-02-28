@@ -1004,8 +1004,8 @@
 <tr>
 <td><code>message_ttl</code></td>
 <td><code>int</code></td>
-<td><code>259200</code></td>
-<td>TTL in seconds for message hashes (default: 3 days)</td>
+<td><code>-1</code></td>
+<td>TTL in seconds for message hashes (-1 = no TTL)</td>
 </tr>
 <tr>
 <td><code>messages_index_prefix</code></td>
@@ -1133,7 +1133,7 @@
 </span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>        <span class="s1">&#39;global_keyprefix&#39;</span><span class="p">:</span> <span class="s1">&#39;myapp:&#39;</span><span class="p">,</span>
 </span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>        <span class="s1">&#39;visibility_timeout&#39;</span><span class="p">:</span> <span class="mi">600</span><span class="p">,</span>
 </span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>        <span class="s1">&#39;stream_maxlen&#39;</span><span class="p">:</span> <span class="mi">50000</span><span class="p">,</span>
-</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>        <span class="s1">&#39;message_ttl&#39;</span><span class="p">:</span> <span class="mi">86400</span><span class="p">,</span>  <span class="c1"># 1 day</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>        <span class="s1">&#39;message_ttl&#39;</span><span class="p">:</span> <span class="mi">259200</span><span class="p">,</span>  <span class="c1"># 3 days</span>
 </span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>        <span class="s1">&#39;max_connections&#39;</span><span class="p">:</span> <span class="mi">20</span><span class="p">,</span>
 </span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>        <span class="s1">&#39;health_check_interval&#39;</span><span class="p">:</span> <span class="mi">30</span><span class="p">,</span>
 </span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>    <span class="p">},</span>
@@ -1210,8 +1210,8 @@
 </tr>
 <tr>
 <td><code>DEFAULT_MESSAGE_TTL</code></td>
-<td><code>259200</code></td>
-<td>Default TTL for message hashes (3 days)</td>
+<td><code>-1</code></td>
+<td>Default TTL for message hashes (no TTL)</td>
 </tr>
 <tr>
 <td><code>PRIORITY_SCORE_MULTIPLIER</code></td>
