@@ -14,10 +14,9 @@ from __future__ import annotations
 
 from importlib.metadata import version
 
-from .bootstep import DelayedDeliveryBootstep
 from .transport import Transport
 
-__all__ = ["DelayedDeliveryBootstep", "Transport", "__version__"]
+__all__ = ["Transport", "__version__"]
 
 __version__ = version("celery-redis-plus")
 

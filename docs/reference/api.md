@@ -28,25 +28,6 @@ app.config_from_object({
 - Native delayed delivery using sorted set timestamps
 - Redis Streams for reliable fanout messaging
 
-## Bootstep
-
-### `celery_redis_plus.DelayedDeliveryBootstep`
-
-Worker bootstep that integrates with the Celery consumer lifecycle.
-
-**Usage:**
-
-```python
-from celery_redis_plus import DelayedDeliveryBootstep
-
-app.steps['consumer'].add(DelayedDeliveryBootstep)
-```
-
-**Responsibilities:**
-
-- Signals transport when consumer starts/stops
-- Enables native delayed delivery mode on the transport
-
 ## Configuration Options
 
 ### `broker_transport_options`

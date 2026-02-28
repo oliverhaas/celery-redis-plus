@@ -139,6 +139,9 @@ _ENQUEUE_DUE_MESSAGES_LUA = (_PACKAGE_DIR / "transport_enqueue_due_messages.lua"
 _REQUEUE_MESSAGE_LUA = (_PACKAGE_DIR / "transport_requeue_message.lua").read_text()
 
 
+_warned_priority_clamp = False
+
+
 def _queue_score(priority: int, timestamp: float | None = None) -> float:
     """Compute sorted set score for queue ordering.
 
@@ -154,16 +157,20 @@ def _queue_score(priority: int, timestamp: float | None = None) -> float:
     Returns:
         Float score for ZADD
     """
+    global _warned_priority_clamp  # noqa: PLW0603
     if timestamp is None:
         timestamp = time()
     # Clamp priority to valid range (0-255)
     if priority < MIN_PRIORITY or priority > MAX_PRIORITY:
-        logger.warning(
-            "Priority %d out of range (%d-%d), clamping to valid range",
-            priority,
-            MIN_PRIORITY,
-            MAX_PRIORITY,
-        )
+        if not _warned_priority_clamp:
+            logger.warning(
+                "Priority %d out of range (%d-%d), clamping to valid range."
+                " This warning is shown once; other messages may also be affected.",
+                priority,
+                MIN_PRIORITY,
+                MAX_PRIORITY,
+            )
+            _warned_priority_clamp = True
         priority = max(MIN_PRIORITY, min(MAX_PRIORITY, priority))
     # Invert priority so higher priority number = lower score = popped first
     # Multiply by large factor to leave room for millisecond timestamps
@@ -183,6 +190,7 @@ class GlobalKeyPrefixMixin:
     global_keyprefix: str = ""
 
     PREFIXED_SIMPLE_COMMANDS: ClassVar[list[str]] = [
+        "EXISTS",
         "EXPIRE",
         "HDEL",
         "HGET",
@@ -1104,7 +1112,8 @@ class Channel(virtual.Channel):
         Returns:
             True if message was requeued, False if not found.
         """
-        message_key = self._message_key(delivery_tag)
+        # Prefix key since EVALSHA doesn't auto-prefix KEYS
+        message_key = f"{self.global_keyprefix}{self._message_key(delivery_tag)}"
 
         with self.conn_or_acquire() as client:
             requeue_script = client.register_script(_REQUEUE_MESSAGE_LUA)
@@ -1116,6 +1125,7 @@ class Channel(virtual.Channel):
                     self.message_ttl,
                     self.global_keyprefix,
                     QUEUE_KEY_PREFIX,
+                    self.message_key_prefix,
                 ],
             )
             return bool(result)
@@ -1214,7 +1224,7 @@ class Channel(virtual.Channel):
             if x_expires < MIN_QUEUE_EXPIRES:
                 if not self._warned_expires_clamp:
                     logger.warning(
-                        "x-expires %dms is below minimum %dms (30s), clamping."
+                        "x-expires %dms is below minimum %dms, clamping."
                         " This warning is shown once; other queues may also be affected.",
                         x_expires,
                         MIN_QUEUE_EXPIRES,
@@ -1254,11 +1264,14 @@ class Channel(virtual.Channel):
         """Refresh PEXPIRE on queue and index keys for queues with x-expires."""
         if not self._expires:
             return
-        with self.conn_or_acquire() as client, client.pipeline() as pipe:
-            for queue, ttl_ms in self._expires.items():
-                pipe.pexpire(self._queue_key(queue), ttl_ms)
-                pipe.pexpire(self._messages_index_key(queue), ttl_ms)
-            pipe.execute()
+        try:
+            with self.conn_or_acquire() as client, client.pipeline() as pipe:
+                for queue, ttl_ms in self._expires.items():
+                    pipe.pexpire(self._queue_key(queue), ttl_ms)
+                    pipe.pexpire(self._messages_index_key(queue), ttl_ms)
+                pipe.execute()
+        except Exception:
+            logger.warning("Failed to refresh queue expires, will retry next cycle", exc_info=True)
 
     def _has_queue(self, queue: str, **kwargs: Any) -> bool:
         with self.conn_or_acquire() as client:
@@ -1284,7 +1297,7 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             queue_key = self._queue_key(queue)
             size = int(client.zcard(queue_key))
-            client.delete(queue_key)
+            client.delete(queue_key, self._messages_index_key(queue))
             return size
 
     def close(self) -> None:
@@ -1450,15 +1463,26 @@ class Channel(virtual.Channel):
             return self.Client(connection_pool=self.async_pool)
         return self.Client(connection_pool=self.pool)
 
+    _keyprefix_fanout_formatted = False
+
     def _get_pool(self, asynchronous: bool = False) -> Any:
         params = self._connparams(asynchronous=asynchronous)
-        self.keyprefix_fanout = self.keyprefix_fanout.format(db=params["db"])
+        if not self._keyprefix_fanout_formatted:
+            self.keyprefix_fanout = self.keyprefix_fanout.format(db=params["db"])
+            self._keyprefix_fanout_formatted = True
         return client_lib.ConnectionPool(**params)
 
+    _minimum_client_version: ClassVar[dict[str, tuple[int, ...]]] = {
+        "redis": (7, 1, 0),
+        "valkey": (6, 1, 0),
+    }
+
     def _get_client(self) -> Any:
-        if client_lib.VERSION < (3, 2, 0):
+        min_version = self._minimum_client_version.get(_client_lib_name, (7, 1, 0))
+        if min_version > client_lib.VERSION:
+            min_version_str = ".".join(map(str, min_version))
             raise VersionMismatch(
-                f"Transport requires client library version 3.2.0 or later. You have {_client_lib_name} {client_lib.__version__}",
+                f"Transport requires {_client_lib_name} {min_version_str} or later. You have {client_lib.__version__}",
             )
 
         if self.global_keyprefix:
@@ -1528,16 +1552,10 @@ class Transport(virtual.Transport):
         exchange_type=frozenset(["direct", "topic", "fanout"]),
     )
 
-    if client_lib:
-        connection_errors = _connection_errors
-        channel_errors = _channel_errors
+    connection_errors = _connection_errors
+    channel_errors = _channel_errors
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        if client_lib is None:
-            raise ImportError(
-                "celery-redis-plus requires either redis-py or valkey-py. "
-                "Install with: pip install celery-redis-plus[redis] or pip install celery-redis-plus[valkey]",
-            )
         super().__init__(*args, **kwargs)
 
         # Import signals module to register signal handlers when transport is used
@@ -1566,7 +1584,8 @@ class Transport(virtual.Transport):
 
         def on_poll_start() -> None:
             cycle_poll_start()
-            [add_reader(fd, on_readable, fd) for fd in cycle.fds]
+            for fd in cycle.fds:
+                add_reader(fd, on_readable, fd)
 
         loop.on_tick.add(on_poll_start)
 

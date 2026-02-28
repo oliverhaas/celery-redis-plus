@@ -8,10 +8,13 @@ Celery's eta (ISO datetime string in headers) to properties.eta
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
 from celery.signals import before_task_publish
+
+logger = logging.getLogger(__name__)
 
 
 @before_task_publish.connect
@@ -52,8 +55,7 @@ def _convert_eta_to_properties(
                 eta_dt = eta_dt.replace(tzinfo=UTC)
             properties["eta"] = eta_dt.timestamp()
         except (ValueError, TypeError):  # fmt: skip
-            # If parsing fails, skip - transport will handle as immediate
-            pass
+            logger.debug("Failed to parse ETA value %r, treating as immediate delivery", eta_value)
     elif isinstance(eta_value, datetime):
         # Already a datetime object
         if eta_value.tzinfo is None:

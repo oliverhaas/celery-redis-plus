@@ -1166,7 +1166,6 @@ class TestChannel:
         channel.auto_delete_queues = set()
         channel._expires = {}
         channel._message_ttls = {}
-        channel._expires = {}
 
         channel._new_queue("my_queue", arguments={"x-message-ttl": 30000})
 
@@ -1178,7 +1177,6 @@ class TestChannel:
         channel.auto_delete_queues = set()
         channel._expires = {}
         channel._message_ttls = {}
-        channel._expires = {}
 
         channel._new_queue("my_queue")
 

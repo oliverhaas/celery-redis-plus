@@ -13,9 +13,6 @@ PRIORITY_SCORE_MULTIPLIER = 10**13
 MIN_PRIORITY = 0
 MAX_PRIORITY = 255
 
-# Default priority value (lowest priority, matching RabbitMQ default)
-DEFAULT_PRIORITY = 0
-
 # Default visibility timeout in seconds (how long before unacked messages are restored)
 DEFAULT_VISIBILITY_TIMEOUT = 300  # 5 minutes
 

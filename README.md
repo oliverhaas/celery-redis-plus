@@ -10,13 +10,11 @@ Enhanced Redis/Valkey transport for Celery/Kombu with native delayed delivery, i
 ```python
 from celery import Celery
 import celery_redis_plus  # Register valkey:// transport
-from celery_redis_plus import DelayedDeliveryBootstep
 
 app = Celery('myapp')
 app.config_from_object({
     'broker_url': 'valkey://localhost:6379/0',
 })
-app.steps['consumer'].add(DelayedDeliveryBootstep)
 
 @app.task
 def my_task():

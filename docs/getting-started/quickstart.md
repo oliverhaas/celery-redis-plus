@@ -4,7 +4,7 @@
 
 ```python
 from celery import Celery
-from celery_redis_plus import DelayedDeliveryBootstep
+import celery_redis_plus  # noqa: F401 — registers valkey:// transport
 
 app = Celery('myapp')
 
@@ -19,8 +19,6 @@ app.config_from_object({
 #     'broker_url': 'redis://localhost:6379/0',
 #     'broker_transport': 'celery_redis_plus.transport:Transport',
 # })
-
-app.steps['consumer'].add(DelayedDeliveryBootstep)
 
 @app.task
 def my_task():

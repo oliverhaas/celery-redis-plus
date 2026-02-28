@@ -46,8 +46,6 @@ celery-redis-plus is a drop-in replacement Redis transport for Celery that uses:
 
 - **`Transport`** (extends `kombu.transport.virtual.Transport`): Custom transport with `supports_native_delayed_delivery` flag. Delayed delivery is handled via `register_with_event_loop` which sets up periodic callbacks for processing delayed messages and updating visibility timeouts.
 - **`Channel`** (extends `kombu.transport.virtual.Channel`): Uses BZMPOP for consuming from sorted sets, XREAD for fanout streams
-- **`DelayedDeliveryBootstep`**: Celery consumer bootstep that integrates with the worker lifecycle
-
 
 ### Configuration
 
