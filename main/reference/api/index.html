@@ -566,34 +566,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#bootstep" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Bootstep
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Bootstep">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#celery_redis_plusdelayeddeliverybootstep" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        celery_redis_plus.DelayedDeliveryBootstep
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#configuration-options" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -814,34 +786,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#bootstep" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Bootstep
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Bootstep">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#celery_redis_plusdelayeddeliverybootstep" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        celery_redis_plus.DelayedDeliveryBootstep
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#configuration-options" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1005,19 +949,6 @@
 <li>Full 256-level priority support (0-255, higher = more important)</li>
 <li>Native delayed delivery using sorted set timestamps</li>
 <li>Redis Streams for reliable fanout messaging</li>
-</ul>
-<h2 id="bootstep">Bootstep<a class="headerlink" href="#bootstep" title="Permanent link">&para;</a></h2>
-<h3 id="celery_redis_plusdelayeddeliverybootstep"><code>celery_redis_plus.DelayedDeliveryBootstep</code><a class="headerlink" href="#celery_redis_plusdelayeddeliverybootstep" title="Permanent link">&para;</a></h3>
-<p>Worker bootstep that integrates with the Celery consumer lifecycle.</p>
-<p><strong>Usage:</strong></p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">celery_redis_plus</span><span class="w"> </span><span class="kn">import</span> <span class="n">DelayedDeliveryBootstep</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="n">app</span><span class="o">.</span><span class="n">steps</span><span class="p">[</span><span class="s1">&#39;consumer&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">DelayedDeliveryBootstep</span><span class="p">)</span>
-</span></code></pre></div>
-<p><strong>Responsibilities:</strong></p>
-<ul>
-<li>Signals transport when consumer starts/stops</li>
-<li>Enables native delayed delivery mode on the transport</li>
 </ul>
 <h2 id="configuration-options">Configuration Options<a class="headerlink" href="#configuration-options" title="Permanent link">&para;</a></h2>
 <h3 id="broker_transport_options"><code>broker_transport_options</code><a class="headerlink" href="#broker_transport_options" title="Permanent link">&para;</a></h3>
@@ -1196,17 +1127,17 @@
 </tbody>
 </table>
 <h3 id="example-configuration">Example Configuration<a class="headerlink" href="#example-configuration" title="Permanent link">&para;</a></h3>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">app</span><span class="o">.</span><span class="n">config_from_object</span><span class="p">({</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    <span class="s1">&#39;broker_url&#39;</span><span class="p">:</span> <span class="s1">&#39;valkey://localhost:6379/0&#39;</span><span class="p">,</span>
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    <span class="s1">&#39;broker_transport_options&#39;</span><span class="p">:</span> <span class="p">{</span>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>        <span class="s1">&#39;global_keyprefix&#39;</span><span class="p">:</span> <span class="s1">&#39;myapp:&#39;</span><span class="p">,</span>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>        <span class="s1">&#39;visibility_timeout&#39;</span><span class="p">:</span> <span class="mi">600</span><span class="p">,</span>
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>        <span class="s1">&#39;stream_maxlen&#39;</span><span class="p">:</span> <span class="mi">50000</span><span class="p">,</span>
-</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>        <span class="s1">&#39;message_ttl&#39;</span><span class="p">:</span> <span class="mi">86400</span><span class="p">,</span>  <span class="c1"># 1 day</span>
-</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>        <span class="s1">&#39;max_connections&#39;</span><span class="p">:</span> <span class="mi">20</span><span class="p">,</span>
-</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>        <span class="s1">&#39;health_check_interval&#39;</span><span class="p">:</span> <span class="mi">30</span><span class="p">,</span>
-</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    <span class="p">},</span>
-</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="p">})</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">app</span><span class="o">.</span><span class="n">config_from_object</span><span class="p">({</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>    <span class="s1">&#39;broker_url&#39;</span><span class="p">:</span> <span class="s1">&#39;valkey://localhost:6379/0&#39;</span><span class="p">,</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>    <span class="s1">&#39;broker_transport_options&#39;</span><span class="p">:</span> <span class="p">{</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>        <span class="s1">&#39;global_keyprefix&#39;</span><span class="p">:</span> <span class="s1">&#39;myapp:&#39;</span><span class="p">,</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>        <span class="s1">&#39;visibility_timeout&#39;</span><span class="p">:</span> <span class="mi">600</span><span class="p">,</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>        <span class="s1">&#39;stream_maxlen&#39;</span><span class="p">:</span> <span class="mi">50000</span><span class="p">,</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>        <span class="s1">&#39;message_ttl&#39;</span><span class="p">:</span> <span class="mi">86400</span><span class="p">,</span>  <span class="c1"># 1 day</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>        <span class="s1">&#39;max_connections&#39;</span><span class="p">:</span> <span class="mi">20</span><span class="p">,</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>        <span class="s1">&#39;health_check_interval&#39;</span><span class="p">:</span> <span class="mi">30</span><span class="p">,</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>    <span class="p">},</span>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="p">})</span>
 </span></code></pre></div>
 <h2 id="redis-keys">Redis Keys<a class="headerlink" href="#redis-keys" title="Permanent link">&para;</a></h2>
 <p>The transport uses the following Redis key patterns:</p>
