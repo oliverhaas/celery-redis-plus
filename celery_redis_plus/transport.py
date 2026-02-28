@@ -350,7 +350,8 @@ class QoS(virtual.QoS):
         else:
             # Regular sorted set message
             if requeue:
-                self.requeue_by_tag(delivery_tag, leftmost=True)
+                queue = cast("dict", self._delivered)[delivery_tag].delivery_info["routing_key"]
+                self.requeue_by_tag(delivery_tag, queue=queue, leftmost=True)
             else:
                 self._remove_from_indices(delivery_tag).execute()
             super().ack(delivery_tag)
@@ -407,7 +408,13 @@ class QoS(virtual.QoS):
         """
         return self.channel.enqueue_due_messages()
 
-    def requeue_by_tag(self, tag: str, client: Any = None, leftmost: bool = False) -> None:
+    def requeue_by_tag(
+        self,
+        tag: str,
+        client: Any = None,
+        queue: str | None = None,
+        leftmost: bool = False,
+    ) -> None:
         """Requeue a rejected message by its delivery tag using Lua script.
 
         The Lua script atomically reads the routing_key (queue) from the message
@@ -416,9 +423,10 @@ class QoS(virtual.QoS):
         Args:
             tag: The message's delivery tag.
             client: Optional Redis client (unused, kept for API compatibility).
+            queue: Queue name for per-queue message TTL lookup.
             leftmost: If True, requeue to front of queue (score=0).
         """
-        self.channel._requeue_by_tag(tag, leftmost)
+        self.channel._requeue_by_tag(tag, queue=queue, leftmost=leftmost)
 
     @cached_property
     def visibility_timeout(self) -> float:
@@ -634,7 +642,6 @@ class Channel(virtual.Channel):
     connection: Transport  # Narrow type from base class for our custom Transport
 
     _client: Any = None
-    _closing = False
     supports_fanout = True
     keyprefix_queue = "_kombu.binding.%s"
     keyprefix_fanout = "/{db}."
@@ -837,7 +844,7 @@ class Channel(virtual.Channel):
 
         This method is called by Kombu's virtual.Channel for message recovery.
         """
-        self._requeue_by_tag(message.delivery_tag, leftmost)
+        self._requeue_by_tag(message.delivery_tag, leftmost=leftmost)
 
     def _restore_at_beginning(self, message: Any) -> None:
         return self._restore(message, leftmost=True)
@@ -1029,7 +1036,8 @@ class Channel(virtual.Channel):
             self._in_fanout_poll = None
 
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
-        return self.client.parse_response(self.client.connection, cmd_type)
+        client = self.subclient if cmd_type == "XREAD" else self.client
+        return client.parse_response(client.connection, cmd_type)
 
     def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:
         """Get single message from queue (synchronous)."""
@@ -1099,7 +1107,7 @@ class Channel(virtual.Channel):
 
         return total_enqueued
 
-    def _requeue_by_tag(self, delivery_tag: str, leftmost: bool = False) -> bool:
+    def _requeue_by_tag(self, delivery_tag: str, queue: str | None = None, leftmost: bool = False) -> bool:
         """Requeue a rejected message to its queue using Lua script.
 
         The Lua script atomically reads the routing_key (queue) from the message
@@ -1107,6 +1115,7 @@ class Channel(virtual.Channel):
 
         Args:
             delivery_tag: The message's delivery tag.
+            queue: Queue name for per-queue message TTL lookup.
             leftmost: If True, requeue to front of queue (score=0).
 
         Returns:
@@ -1115,6 +1124,12 @@ class Channel(virtual.Channel):
         # Prefix key since EVALSHA doesn't auto-prefix KEYS
         message_key = f"{self.global_keyprefix}{self._message_key(delivery_tag)}"
 
+        # Compute effective message TTL (respect per-queue x-message-ttl)
+        effective_ttl = self.message_ttl
+        if queue and queue in self._message_ttls:
+            queue_ttl_s = self._message_ttls[queue] // 1000
+            effective_ttl = queue_ttl_s if effective_ttl < 0 else min(effective_ttl, queue_ttl_s)
+
         with self.conn_or_acquire() as client:
             requeue_script = client.register_script(_REQUEUE_MESSAGE_LUA)
             result = requeue_script(
@@ -1122,10 +1137,12 @@ class Channel(virtual.Channel):
                 args=[
                     1 if leftmost else 0,
                     PRIORITY_SCORE_MULTIPLIER,
-                    self.message_ttl,
+                    effective_ttl,
                     self.global_keyprefix,
                     QUEUE_KEY_PREFIX,
                     self.message_key_prefix,
+                    self.visibility_timeout,
+                    MESSAGES_INDEX_PREFIX,
                 ],
             )
             return bool(result)
@@ -1251,6 +1268,7 @@ class Channel(virtual.Channel):
         routing_key: str = kwargs.get("routing_key", "")
         pattern: str = kwargs.get("pattern", "")
         self.auto_delete_queues.discard(queue)
+        had_expires = queue in self._expires
         self._expires.pop(queue, None)
         self._message_ttls.pop(queue, None)
         with self.conn_or_acquire(client=kwargs.get("client")) as client:
@@ -1259,6 +1277,8 @@ class Channel(virtual.Channel):
                 self.sep.join([routing_key or "", pattern or "", queue or ""]),
             )
             client.delete(self._queue_key(queue), self._messages_index_key(queue))
+        if had_expires:
+            self.connection.cycle._update_expires_timer()
 
     def _refresh_queue_expires(self) -> None:
         """Refresh PEXPIRE on queue and index keys for queues with x-expires."""
@@ -1297,11 +1317,21 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             queue_key = self._queue_key(queue)
             size = int(client.zcard(queue_key))
-            client.delete(queue_key, self._messages_index_key(queue))
+            if size:
+                # Collect delivery tags from both queue and index to clean up message hashes
+                tags = {bytes_to_str(t) for t in client.zrange(queue_key, 0, -1)}
+                index_key = self._messages_index_key(queue)
+                tags.update(bytes_to_str(t) for t in client.zrange(index_key, 0, -1))
+                with client.pipeline() as pipe:
+                    pipe.delete(queue_key, index_key)
+                    for tag in tags:
+                        pipe.delete(self._message_key(tag))
+                    pipe.execute()
+            else:
+                client.delete(queue_key, self._messages_index_key(queue))
             return size
 
     def close(self) -> None:
-        self._closing = True
         if self._in_poll:
             with suppress(Empty):
                 self._bzmpop_read()

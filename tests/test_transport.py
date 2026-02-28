@@ -467,7 +467,7 @@ class TestChannel:
         mock_pipe.execute.assert_called_once()
 
     def test_put_with_long_delay_goes_to_messages_index(self) -> None:
-        """Test that native delayed messages (delay > 60s) go to messages_index:{queue}, not queue.
+        """Test that native delayed messages go to messages_index:{queue}, not queue.
 
         Native delayed delivery stores the message only in messages_index:{queue} with
         queue_at = eta. The requeue mechanism will add it to the queue when eta arrives.
@@ -550,9 +550,9 @@ class TestChannel:
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
         channel._get_message_priority = MagicMock(return_value=0)
 
-        # Use short delay (30 seconds) - less than DEFAULT_REQUEUE_CHECK_INTERVAL (60s)
+        # Use short delay (1 second) - less than DEFAULT_REQUEUE_CHECK_INTERVAL
         # Short delays are treated as immediate, Celery's built-in eta logic handles them
-        delay_seconds = 30.0
+        delay_seconds = 1.0
         before = time.time()
         eta_timestamp = before + delay_seconds
         message = {
@@ -1393,11 +1393,16 @@ class TestChannel:
         mock_context.__exit__ = MagicMock(return_value=False)
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
 
+        mock_cycle = MagicMock()
+        channel.connection = MagicMock()
+        channel.connection.cycle = mock_cycle
+
         channel._delete("my_queue")
 
         assert "my_queue" not in channel._expires
         assert "my_queue" not in channel._message_ttls
         assert "my_queue" not in channel.auto_delete_queues
+        mock_cycle._update_expires_timer.assert_called_once()
 
 
 @pytest.mark.unit
@@ -1504,7 +1509,9 @@ class TestQoS:
         """Test reject with requeue for regular message."""
         qos = object.__new__(QoS)
         qos._fanout_tags = set()
-        qos._delivered = {"tag1": MagicMock()}
+        mock_message = MagicMock()
+        mock_message.delivery_info = {"routing_key": "my_queue"}
+        qos._delivered = {"tag1": mock_message}
         qos._dirty = set()
         qos._quick_ack = MagicMock()
 
@@ -1512,7 +1519,7 @@ class TestQoS:
 
         qos.reject("tag1", requeue=True)
 
-        qos.requeue_by_tag.assert_called_once_with("tag1", leftmost=True)
+        qos.requeue_by_tag.assert_called_once_with("tag1", queue="my_queue", leftmost=True)
 
     def test_reject_regular_message_without_requeue(self) -> None:
         """Test reject without requeue for regular message."""
@@ -2321,48 +2328,55 @@ class TestMessagePublishing:
         celery_app: Celery,
         redis_client: Any,
     ) -> None:
-        """Test that a task with countdown has a future score in the sorted set."""
+        """Test that a task with countdown uses native delayed delivery."""
 
         @celery_app.task
         def add(x: int, y: int) -> int:
             return x + y
 
-        # Publish with a 10 second countdown
+        # Publish with a 10 second countdown (> DEFAULT_REQUEUE_CHECK_INTERVAL=2s)
+        # This uses native delayed delivery: message goes to messages_index, not queue
         before_time = time.time()
         add.apply_async(args=(1, 2), countdown=10)
 
-        # Get the message from the queue
-        messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
-        assert len(messages) >= 1
+        # Native delayed message should NOT be in the queue sorted set yet
+        queue_messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1)
+        assert len(queue_messages) == 0
 
-        # The score should be in the future (approximately 10 seconds from now)
-        # Score format: priority bits + timestamp with delay
-        _tag, score = messages[-1]  # Get the last (most recent) message
+        # But should be in messages_index with queue_at = eta
+        index_messages = redis_client.zrange(f"{MESSAGES_INDEX_PREFIX}celery", 0, -1, withscores=True)
+        assert len(index_messages) >= 1
 
-        # The score encodes priority in high bits and timestamp in low bits
-        # With delay, the effective delivery time should be ~10 seconds in the future
-        # We can't easily decode the exact time, but we can verify it's higher than a no-delay score
-        no_delay_score = before_time
-        assert score > no_delay_score
+        _tag, queue_at = index_messages[-1]
+        # queue_at should be approximately 10 seconds in the future
+        assert queue_at > before_time + 5
 
     def test_published_message_with_eta_has_future_score(
         self,
         celery_app: Celery,
         redis_client: Any,
     ) -> None:
-        """Test that a task with ETA has a future score in the sorted set."""
+        """Test that a task with ETA uses native delayed delivery."""
 
         @celery_app.task
         def add(x: int, y: int) -> int:
             return x + y
 
-        # Publish with an ETA 10 seconds in the future
+        # Publish with an ETA 10 seconds in the future (> DEFAULT_REQUEUE_CHECK_INTERVAL=2s)
+        before_time = time.time()
         eta = datetime.now(UTC) + timedelta(seconds=10)
         add.apply_async(args=(1, 2), eta=eta)
 
-        # Get the message from the queue
-        messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1, withscores=True)
-        assert len(messages) >= 1
+        # Native delayed message should NOT be in the queue sorted set yet
+        queue_messages = redis_client.zrange(f"{QUEUE_KEY_PREFIX}celery", 0, -1)
+        assert len(queue_messages) == 0
+
+        # But should be in messages_index with queue_at = eta
+        index_messages = redis_client.zrange(f"{MESSAGES_INDEX_PREFIX}celery", 0, -1, withscores=True)
+        assert len(index_messages) >= 1
+
+        _tag, queue_at = index_messages[-1]
+        assert queue_at > before_time + 5
 
     def test_high_priority_message_has_lower_score(
         self,
@@ -2851,7 +2865,7 @@ class TestDelayedMessageStorage:
     ) -> None:
         """Test that native delayed messages go to messages_index:{queue}, not queue immediately.
 
-        Native delayed messages (delay > 60s) are stored in messages_index:{queue} with
+        Native delayed messages are stored in messages_index:{queue} with
         queue_at = eta. The requeue mechanism will add them to the queue when
         the eta time arrives. This prevents them from being consumed early.
         """
@@ -2948,8 +2962,8 @@ class TestDelayedMessageStorage:
     ) -> None:
         """Test that short-delayed and immediate messages are ordered correctly in queue.
 
-        Short delays (<= 60s) are treated as immediate delivery, so both messages
-        should be in the queue immediately.
+        Short delays (<= DEFAULT_REQUEUE_CHECK_INTERVAL) are treated as immediate
+        delivery, so both messages should be in the queue immediately.
         """
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
@@ -2958,8 +2972,8 @@ class TestDelayedMessageStorage:
             redis_client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             now = time.time()
-            # Use delay <= 60s so it's treated as immediate (Celery handles the delay)
-            eta_timestamp = now + 30  # 30 seconds in future (<= DEFAULT_REQUEUE_CHECK_INTERVAL)
+            # Use delay <= DEFAULT_REQUEUE_CHECK_INTERVAL so it's treated as immediate
+            eta_timestamp = now + 1  # 1 second in future
 
             # Create an immediate message (no eta)
             immediate_msg = {
@@ -2971,7 +2985,7 @@ class TestDelayedMessageStorage:
             }
             channel._put("celery", immediate_msg)
 
-            # Create a short-delayed message (delay <= 60s, treated as immediate)
+            # Create a short-delayed message (treated as immediate by the transport)
             short_delayed_msg = {
                 "body": '{"task": "test.add", "args": [3, 4]}',
                 "properties": {

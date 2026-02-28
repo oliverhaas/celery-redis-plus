@@ -47,7 +47,7 @@ All options are passed via Celery's `broker_transport_options` configuration.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `message_key_prefix` | `str` | `"message:"` | Prefix for per-message hash keys |
-| `message_ttl` | `int` | `259200` | TTL in seconds for message hashes (default: 3 days) |
+| `message_ttl` | `int` | `-1` | TTL in seconds for message hashes (-1 = no TTL) |
 | `messages_index_prefix` | `str` | `"messages_index:"` | Prefix for per-queue messages index sorted sets |
 
 #### Connection Options
@@ -86,7 +86,7 @@ app.config_from_object({
         'global_keyprefix': 'myapp:',
         'visibility_timeout': 600,
         'stream_maxlen': 50000,
-        'message_ttl': 86400,  # 1 day
+        'message_ttl': 259200,  # 3 days
         'max_connections': 20,
         'health_check_interval': 30,
     },
@@ -115,7 +115,7 @@ The following constants are used internally and define default behavior:
 | `DEFAULT_REQUEUE_CHECK_INTERVAL` | `60` | Interval for checking messages to requeue |
 | `DEFAULT_REQUEUE_BATCH_LIMIT` | `1000` | Max messages processed per requeue cycle |
 | `DEFAULT_STREAM_MAXLEN` | `10000` | Default max length for fanout streams |
-| `DEFAULT_MESSAGE_TTL` | `259200` | Default TTL for message hashes (3 days) |
+| `DEFAULT_MESSAGE_TTL` | `-1` | Default TTL for message hashes (no TTL) |
 | `PRIORITY_SCORE_MULTIPLIER` | `10^13` | Multiplier for priority in score calculation |
 | `QUEUE_KEY_PREFIX` | `"queue:"` | Prefix for queue sorted sets |
 | `MESSAGE_KEY_PREFIX` | `"message:"` | Prefix for message hashes |

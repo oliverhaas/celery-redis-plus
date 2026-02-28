@@ -32,13 +32,16 @@ for _, tag in ipairs(ready) do
     -- Build prefixed message key
     local message_key = global_keyprefix .. message_key_prefix .. tag
 
-    -- Get fields from per-message hash
-    local priority = redis.call('HGET', message_key, 'priority')
+    -- Get all needed fields in a single call
+    local fields = redis.call('HMGET', message_key, 'priority', 'routing_key', 'eta', 'native_delayed')
+    local priority = fields[1]
+
     if priority then
         priority = tonumber(priority)
-        local routing_key = redis.call('HGET', message_key, 'routing_key')
-        local eta = redis.call('HGET', message_key, 'eta')
+        local routing_key = fields[2]
+        local eta = fields[3]
         eta = eta and tonumber(eta) or 0
+        local native_delayed = fields[4]
 
         -- Calculate queue score using eta if it's in the future, else use now
         local score_time_ms
@@ -50,7 +53,6 @@ for _, tag in ipairs(ready) do
         local queue_score = (255 - priority) * priority_multiplier + score_time_ms
 
         -- Check if this is a native delayed message (first delivery) or a timed-out message (redelivery)
-        local native_delayed = redis.call('HGET', message_key, 'native_delayed')
         if native_delayed and tonumber(native_delayed) == 1 then
             -- Native delayed message: clear the flag (this is the first delivery)
             redis.call('HSET', message_key, 'native_delayed', '0')
