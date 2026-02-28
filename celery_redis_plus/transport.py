@@ -45,7 +45,7 @@ from time import time
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
 
 import logging
 
@@ -234,7 +234,7 @@ class GlobalKeyPrefixMixin:
             return args[: streams_idx + 1] + prefixed_keys + stream_ids
         return args
 
-    PREFIXED_COMPLEX_COMMANDS: ClassVar[dict[str, dict[str, int | None] | Any]] = {
+    PREFIXED_COMPLEX_COMMANDS: ClassVar[dict[str, dict[str, int | None] | Callable[..., list[Any]]]] = {
         "DEL": {"args_start": 0, "args_end": None},
         "WATCH": {"args_start": 0, "args_end": None},
         "BZMPOP": _prefix_bzmpop_args,
@@ -250,7 +250,7 @@ class GlobalKeyPrefixMixin:
         elif command in self.PREFIXED_COMPLEX_COMMANDS:
             spec = self.PREFIXED_COMPLEX_COMMANDS[command]
             if callable(spec):
-                args = spec(args, self.global_keyprefix)
+                args = cast("Callable[..., list[Any]]", spec)(args, self.global_keyprefix)
             else:
                 # It's a dict with args_start/args_end
                 args_start = spec["args_start"]
