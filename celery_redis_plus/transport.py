@@ -319,7 +319,8 @@ class QoS(virtual.QoS):
 
     Messages are stored in a hash at publish time with visibility tracking
     in a separate sorted set. This allows recovery of messages from crashed
-    workers based on their index scores.
+    workers based on their index scores. Unlike the base class, append() needs
+    no override — messages are already persisted in Redis at publish time.
     """
 
     channel: Channel  # Narrow type from base class for our custom Channel
@@ -329,11 +330,6 @@ class QoS(virtual.QoS):
         super().__init__(*args, **kwargs)
         # For streams fanout: track delivery tags that came from fanout (no ack needed)
         self._fanout_tags: set[str] = set()
-
-    def append(self, message: Any, delivery_tag: str) -> None:
-        # Message is already stored in messages hash at publish time.
-        # Just track it in _delivered for local state management.
-        super().append(message, delivery_tag)
 
     def ack(self, delivery_tag: str) -> None:
         # Fanout messages don't need Redis cleanup (no consumer groups)
@@ -397,7 +393,7 @@ class QoS(virtual.QoS):
             pipe.execute()
 
     def enqueue_due_messages(self) -> int:
-        """Enqueue messages whose queue_at time has passed.
+        """Enqueue messages due before the next requeue cycle.
 
         This unified method handles both:
         - Delayed messages that are now ready to be processed (first delivery)
@@ -521,7 +517,7 @@ class MultiChannelPoller:
         self.maybe_enqueue_due_messages()
 
     def maybe_enqueue_due_messages(self) -> int:
-        """Enqueue messages whose queue_at time has passed.
+        """Enqueue messages due before the next requeue cycle.
 
         This unified method handles both:
         - Delayed messages ready for first delivery
@@ -648,8 +644,8 @@ class Channel(virtual.Channel):
     keyprefix_queue = "_kombu.binding.%s"
     keyprefix_fanout = "/{db}."
     sep = "\x06\x16"
-    _in_poll = False
-    _in_fanout_poll = False
+    _in_poll = None
+    _in_fanout_poll = None
     _warned_expires_clamp = False
     max_priority = MAX_PRIORITY  # Override kombu's default of 9 to enable full 0-255 range
 
@@ -718,7 +714,6 @@ class Channel(virtual.Channel):
         self.active_fanout_queues: set[str] = set()
         self.auto_delete_queues: set[str] = set()
         self._fanout_queues: dict[str, tuple[str, str]] = {}
-        self._fanout_to_queue: dict[str, str] = {}
         self.handlers = {"BZMPOP": self._bzmpop_read, "XREAD": self._xread_read}
         # Track last-read stream ID per stream for fanout (start with $ = only new messages)
         self._stream_offsets: dict[str, str] = {}
@@ -854,9 +849,7 @@ class Channel(virtual.Channel):
 
     def basic_consume(self, queue: str, *args: Any, **kwargs: Any) -> str:
         if queue in self._fanout_queues:
-            exchange, _ = self._fanout_queues[queue]
             self.active_fanout_queues.add(queue)
-            self._fanout_to_queue[exchange] = queue
         ret = super().basic_consume(queue, *args, **kwargs)
         self._queue_cycle = list(self.active_queues)
         return ret
@@ -876,11 +869,6 @@ class Channel(virtual.Channel):
             return None
         with suppress(KeyError):
             self.active_fanout_queues.remove(queue)
-        try:
-            exchange, _ = self._fanout_queues[queue]
-            self._fanout_to_queue.pop(exchange)
-        except KeyError:
-            pass
         ret = super().basic_cancel(consumer_tag)
         self._queue_cycle = list(self.active_queues)
         return ret
@@ -896,7 +884,7 @@ class Channel(virtual.Channel):
         keys = [self._queue_key(q) for q in self._queue_cycle]
         self._in_poll = self.client.connection
 
-        command_args: list[Any] = ["BZMPOP", timeout or 0, len(keys), *keys, "MIN"]
+        command_args: list[Any] = ["BZMPOP", timeout, len(keys), *keys, "MIN"]
         if self.global_keyprefix:
             command_args = self.client._prefix_args(command_args)
 
@@ -969,7 +957,7 @@ class Channel(virtual.Channel):
             "COUNT",
             "1",
             "BLOCK",
-            str(int((timeout or 0) * 1000)),
+            str(int(timeout * 1000)),
             "STREAMS",
             *stream_keys,
             *stream_ids,
@@ -1008,8 +996,7 @@ class Channel(virtual.Channel):
                     # Find which queue this stream belongs to
                     queue_name = None
                     for queue, (exchange, _routing_key) in self._fanout_queues.items():
-                        fanout_stream = self._fanout_stream_key(exchange)
-                        if stream_str.endswith(fanout_stream):
+                        if offset_key == self._fanout_stream_key(exchange):
                             queue_name = queue
                             break
 
@@ -1063,7 +1050,7 @@ class Channel(virtual.Channel):
             return int(client.zcard(self._queue_key(queue)))
 
     def enqueue_due_messages(self) -> int:
-        """Enqueue messages whose queue_at time has passed.
+        """Enqueue messages due before the next requeue cycle.
 
         This unified method handles both:
         - Delayed messages that are now ready to be processed (first delivery)
@@ -1359,7 +1346,7 @@ class Channel(virtual.Channel):
                 client = self.__dict__[name]
                 connection, client.connection = client.connection, None
                 connection.disconnect()
-            except (KeyError, AttributeError, self.ResponseError) as exc:
+            except (KeyError, AttributeError, self.ResponseError, _client_exceptions.ConnectionError) as exc:
                 logger.debug("Error closing Redis %s (may be expected during shutdown): %s", name, exc)
 
     def _prepare_virtual_host(self, vhost: Any) -> int:

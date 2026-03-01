@@ -1409,16 +1409,6 @@ class TestChannel:
 class TestQoS:
     """Tests for the QoS class."""
 
-    def test_fanout_tags_tracked(self) -> None:
-        """Test that fanout tags are tracked."""
-        qos = object.__new__(QoS)
-        qos._fanout_tags = set()
-
-        # Simulate adding fanout tag
-        qos._fanout_tags.add("tag1")
-
-        assert "tag1" in qos._fanout_tags
-
     def test_can_consume_with_no_prefetch(self) -> None:
         """Test can_consume when prefetch_count is 0 (unlimited)."""
         qos = object.__new__(QoS)
@@ -1445,20 +1435,6 @@ class TestQoS:
         qos._dirty = set()
 
         assert qos.can_consume() is False
-
-    def test_delivered_tracking(self) -> None:
-        """Test that delivered messages are tracked."""
-        qos = object.__new__(QoS)
-        qos._delivered = {}
-        qos._fanout_tags = set()
-
-        # Simulate append (like in real QoS)
-        qos._delivered["tag1"] = True
-        qos._delivered["tag2"] = True
-
-        assert len(qos._delivered) == 2
-        assert "tag1" in qos._delivered
-        assert "tag2" in qos._delivered
 
     def test_ack_fanout_message(self) -> None:
         """Test ack for fanout message (no Redis cleanup needed)."""
@@ -2395,7 +2371,6 @@ class TestMessagePublishing:
         # Clear any existing messages
         redis_client.delete(
             f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
-            f"{global_keyprefix}messages",
             f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
         )
 
@@ -2431,7 +2406,6 @@ class TestMessagePublishing:
         # Clear any existing messages
         redis_client.delete(
             f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
-            f"{global_keyprefix}messages",
             f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
         )
 
@@ -2541,7 +2515,6 @@ class TestMessagePublishing:
         # Clear and publish
         redis_client.delete(
             f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery",
-            f"{global_keyprefix}messages",
             f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery",
         )
         for _ in range(5):
@@ -3759,7 +3732,7 @@ class TestGlobalKeyPrefix:
         # The key point is that our prefixed queue has the message
 
         # Clean up
-        client.delete(f"myapp:{QUEUE_KEY_PREFIX}celery", "myapp:messages", f"myapp:{MESSAGES_INDEX_PREFIX}celery")
+        client.delete(f"myapp:{QUEUE_KEY_PREFIX}celery", f"myapp:{MESSAGES_INDEX_PREFIX}celery")
         client.close()
         app.close()
 
@@ -3969,7 +3942,7 @@ class TestSynchronousGet:
             client = channel.client
 
             # Clear and set up
-            client.delete(f"{QUEUE_KEY_PREFIX}celery", "messages")
+            client.delete(f"{QUEUE_KEY_PREFIX}celery")
 
             # Add delivery tag to queue but NOT to messages hash
             delivery_tag = "orphan-tag"
@@ -3999,40 +3972,8 @@ class TestBzmpopEdgeCases:
             # Should return without error (early return when no queues)
             channel._bzmpop_start(timeout=1)
 
-            # _in_poll should still be False (not a connection object)
-            assert channel._in_poll is False
-
-    def test_bzmpop_start_with_global_keyprefix(
-        self,
-        redis_container: tuple[str, int, str],
-    ) -> None:
-        """Test _bzmpop_start uses prefixed keys when global_keyprefix is set."""
-        from celery import Celery
-
-        host, port, _image = redis_container
-
-        app = Celery("test_bzmpop_prefix")
-        app.conf.update(
-            broker_url=f"redis://{host}:{port}/0",
-            broker_transport="celery_redis_plus.transport:Transport",
-            broker_transport_options={"global_keyprefix": "prefix:"},
-            result_backend=f"redis://{host}:{port}/1",
-            task_always_eager=False,
-        )
-
-        with app.connection() as conn:
-            channel = cast("Channel", conn.default_channel)
-
-            # Verify global_keyprefix is set
-            assert channel.global_keyprefix == "prefix:"
-
-            # The _queue_cycle is now a simple list
-            channel._queue_cycle = list(channel.active_queues)
-
-            # We can verify the channel has global_keyprefix set
-            # The actual BZMPOP call would use prefixed keys
-
-        app.close()
+            # _in_poll should still be None (not a connection object)
+            assert channel._in_poll is None
 
 
 @pytest.mark.unit
