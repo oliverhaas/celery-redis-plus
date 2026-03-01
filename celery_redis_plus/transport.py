@@ -2,7 +2,7 @@
 
 This transport provides three key improvements over the standard Redis transport:
 1. BZMPOP + sorted sets for regular queues - enables full 0-255 priority support and better reliability
-2. Redis Streams for fanout exchanges - reliable consumer groups instead of lossy PUB/SUB
+2. Redis Streams for fanout exchanges - reliable broadcast via XREAD instead of lossy PUB/SUB
 3. Native delayed delivery - delay integrated into sorted set score calculation
 
 Requires Redis 7.0+ or Valkey 7.0+ for BZMPOP support.
@@ -651,6 +651,7 @@ class Channel(virtual.Channel):
     _in_poll = False
     _in_fanout_poll = False
     _warned_expires_clamp = False
+    max_priority = MAX_PRIORITY  # Override kombu's default of 9 to enable full 0-255 range
 
     # Message storage keys
     # Per-message hash keys use format: {message_key_prefix}{delivery_tag}
@@ -1570,7 +1571,7 @@ class Transport(virtual.Transport):
 
     Channel = Channel
 
-    polling_interval = 10  # Timeout for blocking BZMPOP/XREADGROUP calls in seconds
+    polling_interval = 10  # Timeout for blocking BZMPOP/XREAD calls in seconds
     default_port = DEFAULT_PORT
     driver_type = _client_lib_name or "redis"
     driver_name = _client_lib_name or "redis"
