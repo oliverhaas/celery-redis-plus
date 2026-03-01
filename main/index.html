@@ -856,7 +856,7 @@
 <h3 id="message-persistence">Message Persistence<a class="headerlink" href="#message-persistence" title="Permanent link">&para;</a></h3>
 <p>Messages are stored in per-message hashes before being added to the queue. When consumed, the hash persists until explicitly acknowledged. Combined with visibility timeout tracking, this ensures messages are never lost - even if a worker crashes in the instant after the message is pop'ed from the queue, the message can be recovered and requeued.</p>
 <h3 id="delayed-delivery">Delayed Delivery<a class="headerlink" href="#delayed-delivery" title="Permanent link">&para;</a></h3>
-<p>Delayed messages are stored in a sorted set with timestamps as scores. A background thread periodically checks for messages whose timestamp has passed and moves them to the normal queue.</p>
+<p>Delayed messages are stored in a sorted set with timestamps as scores. A periodic event loop callback checks for messages whose timestamp has passed and moves them to the normal queue.</p>
 <h3 id="stream-based-fanout">Stream-based Fanout<a class="headerlink" href="#stream-based-fanout" title="Permanent link">&para;</a></h3>
 <p>Fanout exchanges use Redis Streams. Messages are added with <code>XADD</code>, and each consumer uses <code>XREAD</code> tracking their own position. Old messages are trimmed based on <code>stream_maxlen</code>.</p>
 <h2 id="contributing">Contributing<a class="headerlink" href="#contributing" title="Permanent link">&para;</a></h2>

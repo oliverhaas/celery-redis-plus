@@ -1250,7 +1250,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <ul>
 <li><code>EXPIRE</code> and <code>PEXPIRE</code> commands now correctly prefixed when <code>global_keyprefix</code> is set</li>
 <li><code>_bzmpop_read</code> and <code>_get</code> now skip expired message hashes and try the next message instead of raising <code>Empty</code></li>
-<li><code>x-expires</code> below 30s now clamped with warning instead of raising <code>ValueError</code></li>
+<li><code>x-expires</code> below minimum (10s) now clamped with warning instead of raising <code>ValueError</code></li>
 <li>Removed redundant redis-specific getter functions (<code>get_redis_error_classes</code>, <code>get_redis_ConnectionError</code>, <code>_get_response_error</code>)</li>
 </ul>
 <h2 id="025-2026-02-14">[0.2.5] - 2026-02-14<a class="headerlink" href="#025-2026-02-14" title="Permanent link">&para;</a></h2>
