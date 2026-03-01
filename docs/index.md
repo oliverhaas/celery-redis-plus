@@ -31,7 +31,7 @@ Messages are stored in per-message hashes before being added to the queue. When 
 
 ### Delayed Delivery
 
-Delayed messages are stored in a sorted set with timestamps as scores. A background thread periodically checks for messages whose timestamp has passed and moves them to the normal queue.
+Delayed messages are stored in a sorted set with timestamps as scores. A periodic event loop callback checks for messages whose timestamp has passed and moves them to the normal queue.
 
 ### Stream-based Fanout
 

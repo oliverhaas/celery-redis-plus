@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `EXPIRE` and `PEXPIRE` commands now correctly prefixed when `global_keyprefix` is set
 - `_bzmpop_read` and `_get` now skip expired message hashes and try the next message instead of raising `Empty`
-- `x-expires` below 30s now clamped with warning instead of raising `ValueError`
+- `x-expires` below minimum (10s) now clamped with warning instead of raising `ValueError`
 - Removed redundant redis-specific getter functions (`get_redis_error_classes`, `get_redis_ConnectionError`, `_get_response_error`)
 
 ## [0.2.5] - 2026-02-14

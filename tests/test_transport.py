@@ -1156,7 +1156,7 @@ class TestChannel:
         channel.connection = MagicMock()
         Channel._warned_expires_clamp = False
 
-        channel._new_queue("my_queue", arguments={"x-expires": 10000})
+        channel._new_queue("my_queue", arguments={"x-expires": 5000})
 
         assert channel._expires["my_queue"] == MIN_QUEUE_EXPIRES
 
@@ -1483,7 +1483,6 @@ class TestQoS:
 
         mock_pipe = MagicMock()
         mock_pipe.zrem.return_value = mock_pipe
-        mock_pipe.hdel.return_value = mock_pipe
         qos._remove_from_indices = MagicMock(return_value=mock_pipe)
 
         qos.ack("tag1")
@@ -1531,7 +1530,6 @@ class TestQoS:
 
         mock_pipe = MagicMock()
         mock_pipe.zrem.return_value = mock_pipe
-        mock_pipe.hdel.return_value = mock_pipe
         qos._remove_from_indices = MagicMock(return_value=mock_pipe)
 
         qos.reject("tag1", requeue=False)
@@ -2892,7 +2890,7 @@ class TestDelayedMessageStorage:
 
     Note: These tests verify the _put method's eta handling directly,
     since the signal handler that adds eta headers is only active during
-    worker task publish. All messages (with or without eta) go to the main queue.
+    worker task publish.
     """
 
     def test_message_with_eta_goes_to_messages_index(
@@ -3500,7 +3498,7 @@ class TestQueueTTL:
             client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
 
             # Set _expires directly to use a short TTL for fast test
-            # (validation in _new_queue enforces >= 30s, but PEXPIRE itself works with any value)
+            # (validation in _new_queue enforces >= 10s, but PEXPIRE itself works with any value)
             channel._expires["celery"] = 2000
 
             # Publish a message to create the keys

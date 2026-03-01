@@ -37,7 +37,6 @@ from __future__ import annotations
 import functools
 import numbers
 import socket as socket_module
-import uuid
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from queue import Empty
@@ -1009,7 +1008,7 @@ class Channel(virtual.Channel):
                     queue_name = None
                     for queue, (exchange, _routing_key) in self._fanout_queues.items():
                         fanout_stream = self._fanout_stream_key(exchange)
-                        if stream_str.endswith(fanout_stream) or stream_str == fanout_stream:
+                        if stream_str.endswith(fanout_stream):
                             queue_name = queue
                             break
 
@@ -1100,13 +1099,14 @@ class Channel(virtual.Channel):
                         QUEUE_KEY_PREFIX,
                     ],
                 )
-                total_enqueued += count or 0
-
-        if total_enqueued >= DEFAULT_REQUEUE_BATCH_LIMIT:
-            logger.warning(
-                "Enqueue hit batch limit of %d. There may be more messages waiting.",
-                DEFAULT_REQUEUE_BATCH_LIMIT,
-            )
+                count = count or 0
+                if count >= DEFAULT_REQUEUE_BATCH_LIMIT:
+                    logger.warning(
+                        "Queue %s hit enqueue batch limit of %d. There may be more messages waiting.",
+                        queue,
+                        DEFAULT_REQUEUE_BATCH_LIMIT,
+                    )
+                total_enqueued += count
 
         return total_enqueued
 
@@ -1222,12 +1222,11 @@ class Channel(virtual.Channel):
     def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
         """Deliver fanout message using Redis Streams."""
         stream_key = self._fanout_stream_key(exchange)
-        message_uuid = str(uuid.uuid4())
 
         with self.conn_or_acquire() as client:
             client.xadd(
                 name=stream_key,
-                fields={"uuid": message_uuid, "payload": dumps(message)},
+                fields={"payload": dumps(message)},
                 id="*",
                 maxlen=self.stream_maxlen,
                 approximate=True,
