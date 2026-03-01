@@ -6,7 +6,7 @@ This package provides an enhanced Redis/Valkey transport for Celery with:
 - Full 0-255 priority support (RabbitMQ semantics)
 - Redis Streams for reliable fanout (replaces PUB/SUB)
 
-Requires Redis 7.0+ or Valkey 7.0+ (for BZMPOP) and Python 3.13+.
+Requires Redis 7.0+ (or Valkey) for BZMPOP and Python 3.13+.
 Supports both redis-py and valkey-py client libraries.
 """
 

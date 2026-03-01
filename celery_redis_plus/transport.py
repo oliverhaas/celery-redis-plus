@@ -5,7 +5,7 @@ This transport provides three key improvements over the standard Redis transport
 2. Redis Streams for fanout exchanges - reliable broadcast via XREAD instead of lossy PUB/SUB
 3. Native delayed delivery - delay integrated into sorted set score calculation
 
-Requires Redis 7.0+ or Valkey 7.0+ for BZMPOP support.
+Requires Redis 7.0+ (or Valkey) for BZMPOP support.
 Supports both redis-py and valkey-py client libraries.
 
 Connection String
