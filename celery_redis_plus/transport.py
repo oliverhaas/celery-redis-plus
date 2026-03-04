@@ -383,16 +383,19 @@ class QoS(virtual.QoS):
         """
         if not self._delivered:
             return
-        queue_at = time() + self.visibility_timeout
-        with self.channel.conn_or_acquire() as client, client.pipeline() as pipe:
-            for tag, message in self._delivered.items():
-                # Skip fanout messages (they don't use the index)
-                if tag not in self._fanout_tags:
-                    queue = message.delivery_info["routing_key"]
-                    index_key = self.channel._messages_index_key(queue)
-                    # XX = only update if member already exists (prevents re-adding acked messages)
-                    pipe.zadd(index_key, {tag: queue_at}, xx=True)
-            pipe.execute()
+        try:
+            queue_at = time() + self.visibility_timeout
+            with self.channel.conn_or_acquire() as client, client.pipeline() as pipe:
+                for tag, message in self._delivered.items():
+                    # Skip fanout messages (they don't use the index)
+                    if tag not in self._fanout_tags:
+                        queue = message.delivery_info["routing_key"]
+                        index_key = self.channel._messages_index_key(queue)
+                        # XX = only update if member already exists (prevents re-adding acked messages)
+                        pipe.zadd(index_key, {tag: queue_at}, xx=True)
+                pipe.execute()
+        except Exception:
+            logger.warning("Failed to update messages index, will retry next cycle", exc_info=True)
 
     def enqueue_due_messages(self) -> int:
         """Enqueue messages due before the next requeue cycle.
@@ -854,7 +857,8 @@ class Channel(virtual.Channel):
 
         This method is called by Kombu's virtual.Channel for message recovery.
         """
-        self._requeue_by_tag(message.delivery_tag, leftmost=leftmost)
+        queue = message.delivery_info.get("routing_key")
+        self._requeue_by_tag(message.delivery_tag, queue=queue, leftmost=leftmost)
 
     def _restore_at_beginning(self, message: Any) -> None:
         return self._restore(message, leftmost=True)
@@ -1087,38 +1091,41 @@ class Channel(virtual.Channel):
             enqueue_script = client.register_script(_ENQUEUE_DUE_MESSAGES_LUA)
 
             for queue in self._queue_cycle:
-                # Pass prefixed key since EVALSHA doesn't auto-prefix KEYS
-                index_key = f"{self.global_keyprefix}{self._messages_index_key(queue)}"
-                result = enqueue_script(
-                    keys=[index_key],
-                    args=[
-                        threshold,
-                        DEFAULT_REQUEUE_BATCH_LIMIT,
-                        self.visibility_timeout,
-                        PRIORITY_SCORE_MULTIPLIER,
-                        self.message_key_prefix,
-                        self.global_keyprefix,
-                        QUEUE_KEY_PREFIX,
-                        max_restore,
-                    ],
-                )
-                # Lua returns [enqueued_count, dropped_count]
-                enqueued = result[0] if result else 0
-                dropped = result[1] if result and len(result) > 1 else 0
-                if dropped:
-                    logger.error(
-                        "Queue %s: %d message(s) dropped after exceeding max restore count of %d.",
-                        queue,
-                        dropped,
-                        self.max_restore_count,
+                try:
+                    # Pass prefixed key since EVALSHA doesn't auto-prefix KEYS
+                    index_key = f"{self.global_keyprefix}{self._messages_index_key(queue)}"
+                    result = enqueue_script(
+                        keys=[index_key],
+                        args=[
+                            threshold,
+                            DEFAULT_REQUEUE_BATCH_LIMIT,
+                            self.visibility_timeout,
+                            PRIORITY_SCORE_MULTIPLIER,
+                            self.message_key_prefix,
+                            self.global_keyprefix,
+                            QUEUE_KEY_PREFIX,
+                            max_restore,
+                        ],
                     )
-                if enqueued >= DEFAULT_REQUEUE_BATCH_LIMIT:
-                    logger.warning(
-                        "Queue %s hit enqueue batch limit of %d. There may be more messages waiting.",
-                        queue,
-                        DEFAULT_REQUEUE_BATCH_LIMIT,
-                    )
-                total_enqueued += enqueued
+                    # Lua returns [enqueued_count, dropped_count]
+                    enqueued = result[0] if result else 0
+                    dropped = result[1] if result and len(result) > 1 else 0
+                    if dropped:
+                        logger.error(
+                            "Queue %s: %d message(s) dropped after exceeding max restore count of %d.",
+                            queue,
+                            dropped,
+                            self.max_restore_count,
+                        )
+                    if enqueued >= DEFAULT_REQUEUE_BATCH_LIMIT:
+                        logger.warning(
+                            "Queue %s hit enqueue batch limit of %d. There may be more messages waiting.",
+                            queue,
+                            DEFAULT_REQUEUE_BATCH_LIMIT,
+                        )
+                    total_enqueued += enqueued
+                except Exception:
+                    logger.warning("Failed to enqueue due messages for queue %s, will retry next cycle", queue, exc_info=True)
 
         return total_enqueued
 
@@ -1142,7 +1149,7 @@ class Channel(virtual.Channel):
         # Compute effective message TTL (respect per-queue x-message-ttl)
         effective_ttl = self.message_ttl
         if queue and queue in self._message_ttls:
-            queue_ttl_s = self._message_ttls[queue] // 1000
+            queue_ttl_s = max(1, -(-self._message_ttls[queue] // 1000))
             effective_ttl = queue_ttl_s if effective_ttl < 0 else min(effective_ttl, queue_ttl_s)
 
         with self.conn_or_acquire() as client:
@@ -1163,13 +1170,12 @@ class Channel(virtual.Channel):
             return bool(result)
 
     def _put(self, queue: str, message: dict[str, Any], **kwargs: Any) -> None:
-        """Deliver message to queue or messages_index (native delayed delivery).
+        """Store message hash and add to queue and messages_index.
 
-        Immediate messages go to the queue sorted set with a score encoding priority
-        and timestamp. Native delayed messages (delay > requeue check interval) go
-        only to messages_index and are moved to the queue when due.
-        The messages_index tracks when to attempt (re)queue if the message is not
-        acknowledged (queue_at = visible_at + visibility_timeout).
+        All messages are added to messages_index (for visibility timeout tracking).
+        Immediate messages also go to the queue sorted set with a score encoding
+        priority and timestamp. Native delayed messages (delay > requeue check
+        interval) go only to messages_index and are moved to the queue when due.
 
         Args:
             queue: Target queue name.
@@ -1216,13 +1222,13 @@ class Channel(virtual.Channel):
             )
             effective_message_ttl = self.message_ttl
             if queue in self._message_ttls:
-                queue_ttl_s = self._message_ttls[queue] // 1000
+                queue_ttl_s = max(1, -(-self._message_ttls[queue] // 1000))
                 if effective_message_ttl < 0:
                     effective_message_ttl = queue_ttl_s
                 else:
                     effective_message_ttl = min(effective_message_ttl, queue_ttl_s)
             if effective_message_ttl >= 0:
-                pipe.expire(message_key, effective_message_ttl)
+                pipe.expire(message_key, max(1, effective_message_ttl))
             pipe.zadd(self._messages_index_key(queue), {delivery_tag: queue_at})
             if not is_native_delayed:
                 pipe.zadd(self._queue_key(queue), {delivery_tag: queue_score})
@@ -1293,7 +1299,16 @@ class Channel(virtual.Channel):
                 self.keyprefix_queue % (exchange,),
                 self.sep.join([routing_key or "", pattern or "", queue or ""]),
             )
-            client.delete(self._queue_key(queue), self._messages_index_key(queue))
+            # Collect delivery tags from queue and index to clean up message hashes
+            queue_key = self._queue_key(queue)
+            index_key = self._messages_index_key(queue)
+            tags = {bytes_to_str(t) for t in client.zrange(queue_key, 0, -1)}
+            tags.update(bytes_to_str(t) for t in client.zrange(index_key, 0, -1))
+            with client.pipeline() as pipe:
+                pipe.delete(queue_key, index_key)
+                for tag in tags:
+                    pipe.delete(self._message_key(tag))
+                pipe.execute()
         if had_expires:
             self.connection.cycle._update_expires_timer()
 
@@ -1348,10 +1363,10 @@ class Channel(virtual.Channel):
 
     def close(self) -> None:
         if self._in_poll:
-            with suppress(Empty):
+            with suppress(Empty, *_connection_errors):
                 self._bzmpop_read()
         if self._in_fanout_poll:
-            with suppress(Empty):
+            with suppress(Empty, *_connection_errors):
                 self._xread_read()
         if not self.closed:
             self.connection.cycle.discard(self)

@@ -3135,6 +3135,9 @@ class TestMessageRequeue:
                     "exchange": "",
                     "routing_key": "celery",
                     "priority": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                    "eta": "0",
                 },
             )
 
@@ -3183,6 +3186,9 @@ class TestMessageRequeue:
                     "exchange": "",
                     "routing_key": "celery",
                     "priority": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                    "eta": "0",
                 },
             )
 
@@ -3263,6 +3269,9 @@ class TestMessageRequeue:
                     "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                    "eta": "0",
                 },
             )
 
@@ -3307,6 +3316,9 @@ class TestMessageRequeue:
                     "routing_key": "celery",
                     "priority": "0",
                     "redelivered": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                    "eta": "0",
                 },
             )
 
@@ -3352,6 +3364,9 @@ class TestMessageRequeue:
                     "routing_key": "celery",
                     "priority": "0",
                     "redelivered": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                    "eta": "0",
                 },
             )
 
@@ -3394,12 +3409,16 @@ class TestMessageRequeue:
                     "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                    "eta": "0",
                 },
             )
 
             # Create a mock message object
             message = MagicMock()
             message.delivery_tag = delivery_tag
+            message.delivery_info = {"routing_key": "celery"}
 
             # Restore the message
             channel._restore(message)
@@ -3438,12 +3457,16 @@ class TestMessageRequeue:
                     "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                    "eta": "0",
                 },
             )
 
             # Create a mock message object
             message = MagicMock()
             message.delivery_tag = delivery_tag
+            message.delivery_info = {"routing_key": "celery"}
 
             # Restore at beginning
             channel._restore_at_beginning(message)

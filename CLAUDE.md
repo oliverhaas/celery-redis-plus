@@ -69,12 +69,20 @@ broker_transport = "celery_redis_plus.transport:Transport"
 - `DEFAULT_VISIBILITY_TIMEOUT`: `300` - seconds before unacked messages are requeued
 - `DEFAULT_REQUEUE_CHECK_INTERVAL`: `60` - interval for checking messages to requeue
 - `DEFAULT_REQUEUE_BATCH_LIMIT`: `1000` - max messages processed per requeue cycle
+- `DEFAULT_MAX_RESTORE_COUNT`: `None` - max times a message can be restored via visibility timeout before being dropped (None = no limit)
 
 ### Redis Keys
 
 - `queue:{name}`: Sorted set storing delivery_tags with priority+timestamp scores (uses `queue:` prefix to avoid collision with list-based queues)
-- `message:{delivery_tag}`: Hash storing message payload, routing_key, priority, and flags
+- `message:{delivery_tag}`: Hash storing message payload, routing_key, priority, flags, and `restore_count`
 - `messages_index:{name}`: Per-queue sorted set storing `{delivery_tag: queue_at}` for visibility timeout and delayed delivery
+
+### Restore Count
+
+Messages track how many times they've been involuntarily restored (visibility timeout expiry). The `restore_count` field in the message hash is incremented by the `enqueue_due_messages` Lua script on each timeout restore. It is NOT incremented for voluntary requeues (reject+requeue, worker shutdown).
+
+- `max_restore_count` transport option: when set, messages exceeding this count are dropped
+- `x-restore-count` header: injected into consumed messages when `restore_count > 0`
 - `/{db}.{exchange}`: Redis Stream for fanout messages
 - `_kombu.binding.{exchange}`: Set storing queue-exchange bindings
 
