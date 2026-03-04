@@ -779,8 +779,8 @@ class TestChannel:
         mock_client = MagicMock()
         # zpopmin returns [(delivery_tag, score)]
         mock_client.zpopmin.return_value = [(b"tag123", 100.0)]
-        # Per-message hash: hget returns just the payload
-        mock_client.hget.return_value = b'{"body": "test"}'
+        # Per-message hash: hmget returns [payload, restore_count]
+        mock_client.hmget.return_value = [b'{"body": "test"}', b"0"]
 
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
@@ -789,8 +789,8 @@ class TestChannel:
 
         result = channel._get("myqueue")
         assert result == {"body": "test"}
-        # Verify hget was called with the message key and payload field
-        mock_client.hget.assert_called_once_with("message:tag123", "payload")
+        # Verify hmget was called with the message key and fields
+        mock_client.hmget.assert_called_once_with("message:tag123", "payload", "restore_count")
 
     def test_get_synchronous_empty(self) -> None:
         """Test _get raises Empty when queue is empty."""
@@ -1276,9 +1276,9 @@ class TestChannel:
             [(b"expired_tag", 1.0)],
             [(b"valid_tag", 2.0)],
         ]
-        mock_client.hget.side_effect = [
-            None,  # expired_tag hash gone
-            b'{"body": "test"}',  # valid_tag
+        mock_client.hmget.side_effect = [
+            [None, None],  # expired_tag hash gone
+            [b'{"body": "test"}', b"0"],  # valid_tag
         ]
 
         result = channel._get("my_queue")
@@ -1307,7 +1307,7 @@ class TestChannel:
             [(b"expired_tag", 1.0)],
             [],
         ]
-        mock_client.hget.return_value = None
+        mock_client.hmget.return_value = [None, None]
 
         with pytest.raises(Empty):
             channel._get("my_queue")
@@ -1334,9 +1334,9 @@ class TestChannel:
         )
         # zpopmin returns valid message
         mock_client.zpopmin.return_value = [(b"valid_tag", 2.0)]
-        mock_client.hget.side_effect = [
-            None,  # expired_tag
-            b'{"body": "test"}',  # valid_tag
+        mock_client.hmget.side_effect = [
+            [None, None],  # expired_tag
+            [b'{"body": "test"}', b"0"],  # valid_tag
         ]
 
         result = channel._bzmpop_read()
@@ -4102,3 +4102,372 @@ class TestTransportDelivery:
         # Verify timing for delayed tasks
         if countdown:
             assert elapsed >= countdown - 0.5, f"Completed too fast: {elapsed:.2f}s"
+
+
+@pytest.mark.integration
+class TestRestoreCount:
+    """Tests for restore count tracking and max restore count enforcement."""
+
+    def test_restore_count_initialized_to_zero(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that _put stores restore_count=0 in the message hash."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "restore-init-test"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            channel._put(
+                "celery",
+                {
+                    "body": "test",
+                    "properties": {
+                        "delivery_tag": delivery_tag,
+                        "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    },
+                },
+            )
+
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            restore_count = client.hget(message_key, "restore_count")
+            assert restore_count == b"0"
+
+    def test_restore_count_incremented_on_redelivery(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that restore_count increments each time a timed-out message is redelivered."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "restore-incr-test"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+
+            # Simulate an unacked message with restore_count=0
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "redelivered": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                },
+            )
+
+            # Set index score to past (ready for requeue)
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() - 100})
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            # First redelivery
+            channel.enqueue_due_messages()
+            assert client.hget(message_key, "restore_count") == b"1"
+
+            # Pop from queue and set index to past again for second redelivery
+            client.zrem(f"{QUEUE_KEY_PREFIX}celery", delivery_tag)
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() - 100})
+
+            # Second redelivery
+            channel.enqueue_due_messages()
+            assert client.hget(message_key, "restore_count") == b"2"
+
+    def test_restore_count_not_incremented_for_native_delayed(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that restore_count is NOT incremented for native delayed first delivery."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "restore-delayed-test"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+
+            # Simulate a native delayed message (native_delayed=1)
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "redelivered": "0",
+                    "native_delayed": "1",
+                    "restore_count": "0",
+                    "eta": "0",
+                },
+            )
+
+            # Set index score to past (ready for delivery)
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() - 100})
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            # Enqueue due messages (first delivery of delayed message)
+            channel.enqueue_due_messages()
+
+            # restore_count should still be 0 (not incremented for first delivery)
+            assert client.hget(message_key, "restore_count") == b"0"
+            # native_delayed should be cleared
+            assert client.hget(message_key, "native_delayed") == b"0"
+
+    def test_restore_count_header_injected(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that x-restore-count header is injected when restore_count > 0."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "restore-header-test"
+            payload = {
+                "body": "test",
+                "headers": {},
+                "properties": {
+                    "delivery_tag": delivery_tag,
+                    "headers": {},
+                },
+            }
+
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "restore_count": "3",
+                },
+            )
+
+            message = channel._get_message_from_hash(message_key, client)
+            assert message is not None
+            assert message["properties"]["headers"]["x-restore-count"] == 3
+
+    def test_restore_count_header_absent_when_zero(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that x-restore-count header is NOT injected when restore_count is 0."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "restore-no-header-test"
+            payload = {
+                "body": "test",
+                "headers": {},
+                "properties": {
+                    "delivery_tag": delivery_tag,
+                    "headers": {},
+                },
+            }
+
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "restore_count": "0",
+                },
+            )
+
+            message = channel._get_message_from_hash(message_key, client)
+            assert message is not None
+            assert "x-restore-count" not in message["properties"].get("headers", {})
+
+    def test_message_dropped_when_max_exceeded(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that message is dropped when restore_count exceeds max_restore_count."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.max_restore_count = 2
+            client = channel.client
+
+            delivery_tag = "restore-drop-test"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+
+            # Simulate a message already restored 2 times (at the limit)
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "redelivered": "1",
+                    "native_delayed": "0",
+                    "restore_count": "2",
+                },
+            )
+
+            # Set index score to past (ready for requeue)
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() - 100})
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            # This should drop the message (restore_count would become 3, exceeding max of 2)
+            enqueued = channel.enqueue_due_messages()
+            assert enqueued == 0
+
+            # Message hash and index entry should be gone
+            assert not client.exists(message_key)
+            assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is None
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None
+
+    def test_message_dropped_cleans_up_queue_entry(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that dropping a message also removes it from the queue sorted set.
+
+        A message might be in the queue (e.g., added by a previous enqueue cycle
+        but not yet consumed). When dropped, it should be removed from the queue
+        sorted set as well, not just the index and hash.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.max_restore_count = 0  # drop on first restore attempt
+            client = channel.client
+
+            delivery_tag = "restore-queue-cleanup-test"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "redelivered": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                },
+            )
+
+            # Message is in BOTH the index and the queue sorted set
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() - 100})
+            client.zadd(f"{QUEUE_KEY_PREFIX}celery", {delivery_tag: 100.0})
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            enqueued = channel.enqueue_due_messages()
+            assert enqueued == 0
+
+            # All traces of the message should be gone
+            assert not client.exists(message_key)
+            assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is None
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None
+
+    def test_no_limit_when_max_is_none(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that messages are not dropped when max_restore_count is None (default)."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            assert channel.max_restore_count is None  # default
+            client = channel.client
+
+            delivery_tag = "restore-no-limit-test"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+
+            # Simulate a message with very high restore_count
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "redelivered": "1",
+                    "native_delayed": "0",
+                    "restore_count": "999",
+                },
+            )
+
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() - 100})
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            # Should still enqueue (no limit)
+            enqueued = channel.enqueue_due_messages()
+            assert enqueued == 1
+
+            # Message should exist and restore_count incremented
+            assert client.exists(message_key)
+            assert client.hget(message_key, "restore_count") == b"1000"
+
+    def test_requeue_by_tag_does_not_increment_restore_count(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that _requeue_by_tag does NOT increment restore_count.
+
+        Only visibility timeout restores (enqueue_due_messages) should increment
+        restore_count. Explicit requeues (reject with requeue=True, worker shutdown
+        restore) are voluntary and should not count toward the limit.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.max_restore_count = 1
+            client = channel.client
+
+            delivery_tag = "requeue-no-incr-test"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "restore_count": "5",
+                },
+            )
+
+            # Even though restore_count (5) exceeds max_restore_count (1),
+            # _requeue_by_tag should succeed because it doesn't enforce the limit
+            result = channel._requeue_by_tag(delivery_tag, queue="celery")
+            assert result is True
+
+            # restore_count should be unchanged
+            assert client.hget(message_key, "restore_count") == b"5"
+            # Message should be in queue
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None

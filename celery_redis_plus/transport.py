@@ -63,6 +63,7 @@ from vine import promise
 
 from .constants import (
     DEFAULT_HEALTH_CHECK_INTERVAL,
+    DEFAULT_MAX_RESTORE_COUNT,
     DEFAULT_MESSAGE_TTL,
     DEFAULT_REQUEUE_BATCH_LIMIT,
     DEFAULT_REQUEUE_CHECK_INTERVAL,
@@ -193,6 +194,7 @@ class GlobalKeyPrefixMixin:
         "EXPIRE",
         "HDEL",
         "HGET",
+        "HMGET",
         "HSET",
         "PEXPIRE",
         "PTTL",
@@ -674,6 +676,9 @@ class Channel(virtual.Channel):
     # Credential provider for dynamic auth (e.g. AWS ElastiCache IAM, Azure Redis)
     credential_provider = None
 
+    # Max restore count (None = no limit)
+    max_restore_count: int | None = DEFAULT_MAX_RESTORE_COUNT
+
     # Fanout settings
     fanout_prefix: bool | str = True
     fanout_patterns = True
@@ -699,6 +704,7 @@ class Channel(virtual.Channel):
         "client_name",
         "stream_maxlen",
         "credential_provider",
+        "max_restore_count",
     )
 
     connection_class = client_lib.Connection
@@ -800,10 +806,16 @@ class Channel(virtual.Channel):
         Returns:
             The message dict, or None if not found.
         """
-        payload_json = client.hget(message_key, "payload")
+        fields = client.hmget(message_key, "payload", "restore_count")
+        payload_json = fields[0]
         if not payload_json:
             return None
         result: dict[str, Any] | None = loads(bytes_to_str(payload_json))
+        if result is not None:
+            restore_count = int(fields[1] or 0)
+            if restore_count > 0:
+                headers = result.setdefault("properties", {}).setdefault("headers", {})
+                headers["x-restore-count"] = restore_count
         return result
 
     def _cleanup_expired_message(self, queue: str, delivery_tag: str, client: Any | None = None) -> None:
@@ -1069,13 +1081,15 @@ class Channel(virtual.Channel):
         threshold = now + DEFAULT_REQUEUE_CHECK_INTERVAL
         total_enqueued = 0
 
+        max_restore = -1 if self.max_restore_count is None else self.max_restore_count
+
         with self.conn_or_acquire() as client:
             enqueue_script = client.register_script(_ENQUEUE_DUE_MESSAGES_LUA)
 
             for queue in self._queue_cycle:
                 # Pass prefixed key since EVALSHA doesn't auto-prefix KEYS
                 index_key = f"{self.global_keyprefix}{self._messages_index_key(queue)}"
-                count = enqueue_script(
+                result = enqueue_script(
                     keys=[index_key],
                     args=[
                         threshold,
@@ -1085,16 +1099,26 @@ class Channel(virtual.Channel):
                         self.message_key_prefix,
                         self.global_keyprefix,
                         QUEUE_KEY_PREFIX,
+                        max_restore,
                     ],
                 )
-                count = count or 0
-                if count >= DEFAULT_REQUEUE_BATCH_LIMIT:
+                # Lua returns [enqueued_count, dropped_count]
+                enqueued = result[0] if result else 0
+                dropped = result[1] if result and len(result) > 1 else 0
+                if dropped:
+                    logger.error(
+                        "Queue %s: %d message(s) dropped after exceeding max restore count of %d.",
+                        queue,
+                        dropped,
+                        self.max_restore_count,
+                    )
+                if enqueued >= DEFAULT_REQUEUE_BATCH_LIMIT:
                     logger.warning(
                         "Queue %s hit enqueue batch limit of %d. There may be more messages waiting.",
                         queue,
                         DEFAULT_REQUEUE_BATCH_LIMIT,
                     )
-                total_enqueued += count
+                total_enqueued += enqueued
 
         return total_enqueued
 
@@ -1187,6 +1211,7 @@ class Channel(virtual.Channel):
                     "redelivered": 0,
                     "native_delayed": 1 if is_native_delayed else 0,
                     "eta": eta_timestamp or 0,
+                    "restore_count": 0,
                 },
             )
             effective_message_ttl = self.message_ttl

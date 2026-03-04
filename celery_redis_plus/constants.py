@@ -39,6 +39,10 @@ MESSAGE_KEY_PREFIX = "message:"
 # Prefix for queue sorted set keys (avoids collision with list-based queues)
 QUEUE_KEY_PREFIX = "queue:"
 
+# Default max restore count (None = no limit, backwards compatible)
+# When set to an integer, messages restored more than this many times are dropped
+DEFAULT_MAX_RESTORE_COUNT: int | None = None
+
 # Minimum allowed x-expires value in milliseconds (10 seconds)
 # Celery's control/reply queues use 10s by default
 MIN_QUEUE_EXPIRES = 10_000
