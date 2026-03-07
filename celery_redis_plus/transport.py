@@ -490,7 +490,7 @@ class MultiChannelPoller:
 
     def _client_registered(self, channel: Channel, client: Any, cmd: str) -> bool:
         if getattr(client, "connection", None) is None:
-            client.connection = client.connection_pool.get_connection("_")
+            client.connection = client.connection_pool.get_connection()
         return client.connection._sock is not None and (channel, client, cmd) in self._chan_to_sock
 
     def _register_BZMPOP(self, channel: Channel) -> None:
