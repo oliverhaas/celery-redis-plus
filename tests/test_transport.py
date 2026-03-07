@@ -771,16 +771,18 @@ class TestChannel:
         assert "payload" in call_kwargs["fields"]
 
     def test_get_synchronous(self) -> None:
-        """Test _get retrieves message synchronously."""
+        """Test _get retrieves message synchronously via Lua script."""
 
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = ""
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
 
         mock_client = MagicMock()
-        # zpopmin returns [(delivery_tag, score)]
-        mock_client.zpopmin.return_value = [(b"tag123", 100.0)]
-        # Per-message hash: hmget returns [payload, restore_count]
-        mock_client.hmget.return_value = [b'{"body": "test"}', b"0"]
+        mock_script = MagicMock()
+        # Lua script returns [queue_name, tag, payload, restore_count]
+        mock_script.return_value = [b"myqueue", b"tag123", b'{"body": "test"}', b"0"]
+        mock_client.register_script.return_value = mock_script
 
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
@@ -789,17 +791,21 @@ class TestChannel:
 
         result = channel._get("myqueue")
         assert result == {"body": "test"}
-        # Verify hmget was called with the message key and fields
-        mock_client.hmget.assert_called_once_with("message:tag123", "payload", "restore_count")
+        mock_client.register_script.assert_called_once()
+        mock_script.assert_called_once()
 
     def test_get_synchronous_empty(self) -> None:
         """Test _get raises Empty when queue is empty."""
 
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = ""
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
 
         mock_client = MagicMock()
-        mock_client.zpopmin.return_value = []
+        mock_script = MagicMock()
+        mock_script.return_value = None
+        mock_client.register_script.return_value = mock_script
 
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
@@ -1260,10 +1266,11 @@ class TestChannel:
         channel.conn_or_acquire.assert_not_called()
 
     def test_get_skips_expired_messages(self, global_keyprefix: str) -> None:
-        """Test that _get skips messages whose hash has expired and tries the next."""
+        """Test that _get skips expired messages (handled by Lua script internally)."""
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
 
         mock_client = MagicMock()
         mock_context = MagicMock()
@@ -1271,30 +1278,21 @@ class TestChannel:
         mock_context.__exit__ = MagicMock(return_value=False)
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
 
-        # First zpopmin returns expired message, second returns valid message
-        mock_client.zpopmin.side_effect = [
-            [(b"expired_tag", 1.0)],
-            [(b"valid_tag", 2.0)],
-        ]
-        mock_client.hmget.side_effect = [
-            [None, None],  # expired_tag hash gone
-            [b'{"body": "test"}', b"0"],  # valid_tag
-        ]
+        # Lua script internally skips expired messages and returns the valid one
+        mock_script = MagicMock()
+        mock_script.return_value = [b"my_queue", b"valid_tag", b'{"body": "test"}', b"0"]
+        mock_client.register_script.return_value = mock_script
 
         result = channel._get("my_queue")
 
         assert result == {"body": "test"}
-        # Should have cleaned up index for expired tag
-        mock_client.zrem.assert_called_once_with(
-            f"{MESSAGES_INDEX_PREFIX}my_queue",
-            "expired_tag",
-        )
 
     def test_get_raises_empty_when_all_expired(self, global_keyprefix: str) -> None:
         """Test that _get raises Empty when all messages have expired."""
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
 
         mock_client = MagicMock()
         mock_context = MagicMock()
@@ -1302,24 +1300,22 @@ class TestChannel:
         mock_context.__exit__ = MagicMock(return_value=False)
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
 
-        # First returns expired, second returns empty (queue drained)
-        mock_client.zpopmin.side_effect = [
-            [(b"expired_tag", 1.0)],
-            [],
-        ]
-        mock_client.hmget.return_value = [None, None]
+        # Lua script returns nil when all messages have expired hashes
+        mock_script = MagicMock()
+        mock_script.return_value = None
+        mock_client.register_script.return_value = mock_script
 
         with pytest.raises(Empty):
             channel._get("my_queue")
 
-        mock_client.zrem.assert_called_once()
-
     def test_bzmpop_read_drains_expired_messages(self, global_keyprefix: str) -> None:
-        """Test that _bzmpop_read falls back to zpopmin after expired BZMPOP result."""
+        """Test that _slow_consume_read falls back to zpopmin after expired BZMPOP result."""
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.global_keyprefix = global_keyprefix
         channel._in_poll = True
+        channel._consume_fast_mode = False  # SLOW mode (BZMPOP path)
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
 
         mock_client = MagicMock()
         channel.client = mock_client
@@ -1332,19 +1328,20 @@ class TestChannel:
             b"queue:my_queue",
             [(b"expired_tag", 1.0)],
         )
-        # zpopmin returns valid message
+        # Pipeline ZADD + HMGET: ZADD returns 0 (no index entry), HMGET returns None
+        mock_pipe = MagicMock()
+        mock_pipe.execute.return_value = [0, [None, None]]
+        mock_client.pipeline.return_value.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_client.pipeline.return_value.__exit__ = MagicMock(return_value=False)
+
+        # zpopmin in _drain_expired_and_deliver returns valid message
         mock_client.zpopmin.return_value = [(b"valid_tag", 2.0)]
-        mock_client.hmget.side_effect = [
-            [None, None],  # expired_tag
-            [b'{"body": "test"}', b"0"],  # valid_tag
-        ]
+        mock_client.hmget.return_value = [b'{"body": "test"}', b"0"]
 
         result = channel._bzmpop_read()
 
         assert result is True
         mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
-        # Should have cleaned up index for expired tag
-        assert mock_client.zrem.call_count == 1
 
     def test_cleanup_expired_message(self, global_keyprefix: str) -> None:
         """Test that _cleanup_expired_message removes the messages_index entry."""
@@ -1858,6 +1855,287 @@ class TestMultiChannelPoller:
 
         channel._poll_error.assert_called_once_with("BZMPOP")
         assert result is None
+
+
+@pytest.mark.unit
+class TestFastSlowConsumeMode:
+    """Tests for FAST/SLOW atomic message consumption."""
+
+    def test_fast_consume_read_delivers_message(self, global_keyprefix: str) -> None:
+        """Test FAST mode delivers message from Lua EVALSHA response."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = True
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        # EVALSHA returns [queue_name, tag, payload, restore_count]
+        mock_client.parse_response.return_value = [
+            b"my_queue",
+            b"tag123",
+            b'{"body": "test"}',
+            b"0",
+        ]
+
+        result = channel._bzmpop_read()
+
+        assert result is True
+        assert channel._consume_fast_mode is True  # stays in FAST mode
+        assert channel._in_poll is None
+        mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
+
+    def test_fast_consume_read_with_restore_count(self, global_keyprefix: str) -> None:
+        """Test FAST mode injects x-restore-count header when restore_count > 0."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = True
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        mock_client.parse_response.return_value = [
+            b"my_queue",
+            b"tag123",
+            b'{"body": "test", "properties": {"headers": {}}}',
+            b"3",
+        ]
+
+        result = channel._bzmpop_read()
+
+        assert result is True
+        delivered_msg = mock_connection._deliver.call_args[0][0]
+        assert delivered_msg["properties"]["headers"]["x-restore-count"] == 3
+
+    def test_fast_consume_read_switches_to_slow_on_empty(self, global_keyprefix: str) -> None:
+        """Test FAST mode switches to SLOW and sends BZMPOP when queue is empty."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = True
+        channel._consume_script_sha = "fakeSHA"
+        channel._queue_cycle = ["celery"]
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+
+        mock_client = MagicMock()
+        mock_conn = MagicMock()
+        mock_client.connection = mock_conn
+        mock_client.connection.polling_interval = 1
+        # _prefix_args must return a real list for send_command(*args)
+        mock_client._prefix_args.side_effect = lambda args: args
+        channel.client = mock_client
+        channel.connection = MagicMock()
+        channel.connection.polling_interval = 1
+
+        # EVALSHA returns nil (queue empty)
+        mock_client.parse_response.return_value = None
+
+        with pytest.raises(Empty):
+            channel._bzmpop_read()
+
+        assert channel._consume_fast_mode is False  # switched to SLOW
+        assert channel._in_poll is not None  # BZMPOP is pending
+        # Verify BZMPOP was sent via _bzmpop_start
+        mock_conn.send_command.assert_called()
+        sent_args = mock_conn.send_command.call_args[0]
+        assert sent_args[0] == "BZMPOP"
+
+    def test_fast_consume_read_noscript_error(self, global_keyprefix: str) -> None:
+        """Test FAST mode handles NOSCRIPT error by clearing SHA and raising Empty."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = True
+        channel._consume_script_sha = "stale_sha"
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.connection_errors = _connection_errors
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+        channel.connection = MagicMock()
+
+        # parse_response raises NOSCRIPT error
+        mock_client.parse_response.side_effect = _client_exceptions.ResponseError(
+            "NOSCRIPT No matching script",
+        )
+
+        with pytest.raises(Empty):
+            channel._bzmpop_read()
+
+        assert channel._consume_script_sha is None  # SHA cleared for reload
+        assert channel._in_poll is None
+        assert channel._consume_fast_mode is True  # stays FAST (retry next tick)
+
+    def test_fast_consume_read_connection_error(self, global_keyprefix: str) -> None:
+        """Test FAST mode handles connection errors."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = True
+        channel.connection_errors = (ConnectionError,)
+        channel.ResponseError = _client_exceptions.ResponseError
+
+        mock_client = MagicMock()
+        mock_conn = MagicMock()
+        mock_client.connection = mock_conn
+        channel.client = mock_client
+        channel.connection = MagicMock()
+
+        mock_client.parse_response.side_effect = ConnectionError("lost connection")
+
+        with pytest.raises(ConnectionError):
+            channel._bzmpop_read()
+
+        assert channel._in_poll is None
+        mock_conn.disconnect.assert_called_once()
+
+    def test_slow_consume_read_delivers_and_switches_to_fast(self, global_keyprefix: str) -> None:
+        """Test SLOW mode delivers message via pipeline ZADD+HMGET and switches to FAST."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = False
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        # BZMPOP returns a message
+        mock_client.parse_response.return_value = (
+            b"queue:my_queue",
+            [(b"tag123", 100.0)],
+        )
+
+        # Pipeline ZADD + HMGET
+        mock_pipe = MagicMock()
+        mock_pipe.execute.return_value = [1, [b'{"body": "test"}', b"0"]]
+        mock_client.pipeline.return_value.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_client.pipeline.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = channel._bzmpop_read()
+
+        assert result is True
+        assert channel._consume_fast_mode is True  # switched back to FAST
+        assert channel._in_poll is None
+        mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
+        # Verify pipeline was used (ZADD + HMGET)
+        mock_pipe.zadd.assert_called_once()
+        mock_pipe.hmget.assert_called_once()
+
+    def test_slow_consume_read_empty_raises(self, global_keyprefix: str) -> None:
+        """Test SLOW mode raises Empty when BZMPOP times out."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = False
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+        channel.connection = MagicMock()
+
+        # BZMPOP returns None (timeout)
+        mock_client.parse_response.return_value = None
+
+        with pytest.raises(Empty):
+            channel._bzmpop_read()
+
+        assert channel._in_poll is None
+
+    def test_bzmpop_start_fast_mode_sends_evalsha(self, global_keyprefix: str) -> None:
+        """Test _bzmpop_start sends EVALSHA in FAST mode."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._consume_fast_mode = True
+        channel._consume_script_sha = "test_sha_123"
+        channel._queue_cycle = ["celery"]
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+
+        mock_conn = MagicMock()
+        mock_client = MagicMock()
+        mock_client.connection = mock_conn
+        mock_client.script_load.return_value = "test_sha_123"
+        channel.client = mock_client
+        channel.connection = MagicMock()
+        channel.connection.polling_interval = 1
+
+        channel._bzmpop_start(timeout=1)
+
+        assert channel._in_poll is mock_conn
+        sent_args = mock_conn.send_command.call_args[0]
+        assert sent_args[0] == "EVALSHA"
+        assert sent_args[1] == "test_sha_123"
+
+    def test_bzmpop_start_slow_mode_sends_bzmpop(self, global_keyprefix: str) -> None:
+        """Test _bzmpop_start sends BZMPOP in SLOW mode."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._consume_fast_mode = False
+        channel._queue_cycle = ["celery"]
+
+        mock_conn = MagicMock()
+        mock_client = MagicMock()
+        mock_client.connection = mock_conn
+        # _prefix_args must return a real list for send_command(*args)
+        mock_client._prefix_args.side_effect = lambda args: args
+        channel.client = mock_client
+        channel.connection = MagicMock()
+        channel.connection.polling_interval = 1
+
+        channel._bzmpop_start(timeout=1)
+
+        assert channel._in_poll is mock_conn
+        sent_args = mock_conn.send_command.call_args[0]
+        assert sent_args[0] == "BZMPOP"
+
+    def test_poll_error_uses_evalsha_in_fast_mode(self) -> None:
+        """Test _poll_error parses EVALSHA response when in FAST mode."""
+        channel = object.__new__(Channel)
+        channel._consume_fast_mode = True
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+
+        channel._poll_error("BZMPOP")
+
+        mock_client.parse_response.assert_called_once_with(
+            mock_client.connection,
+            "EVALSHA",
+        )
+
+    def test_poll_error_uses_bzmpop_in_slow_mode(self) -> None:
+        """Test _poll_error parses BZMPOP response when in SLOW mode."""
+        channel = object.__new__(Channel)
+        channel._consume_fast_mode = False
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+
+        channel._poll_error("BZMPOP")
+
+        mock_client.parse_response.assert_called_once_with(
+            mock_client.connection,
+            "BZMPOP",
+        )
 
 
 @pytest.mark.integration
@@ -3974,6 +4252,93 @@ class TestSynchronousGet:
             # _get should raise Empty because payload is missing
             with pytest.raises(Empty):
                 channel._get("celery")
+
+    def test_get_atomically_updates_messages_index(
+        self,
+        celery_app: Celery,
+        global_keyprefix: str,
+    ) -> None:
+        """Test _get refreshes messages_index score when consuming a message."""
+
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            queue_name = "atomic_test"
+            queue_key = f"{QUEUE_KEY_PREFIX}{queue_name}"
+            index_key = f"{MESSAGES_INDEX_PREFIX}{queue_name}"
+            delivery_tag = "atomic-get-test"
+
+            # Clean up
+            client.delete(queue_key)
+            client.delete(index_key)
+
+            payload = {
+                "body": "atomic test",
+                "headers": {},
+                "properties": {"delivery_tag": delivery_tag},
+            }
+
+            # Simulate a published message (queue + index + hash)
+            message_key = f"message:{delivery_tag}"
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": queue_name,
+                    "priority": "0",
+                    "restore_count": "0",
+                },
+            )
+            old_queue_at = time.time() + 100.0
+            client.zadd(queue_key, {delivery_tag: 100.0})
+            client.zadd(index_key, {delivery_tag: old_queue_at})
+
+            # Consume via _get (uses Lua script)
+            message = channel._get(queue_name)
+
+            assert message["body"] == "atomic test"
+
+            # Message should be removed from queue
+            assert client.zscore(queue_key, delivery_tag) is None
+
+            # messages_index should be refreshed with new VT score
+            new_score = client.zscore(index_key, delivery_tag)
+            assert new_score is not None
+            # New score should be approximately now + visibility_timeout
+            expected_min = time.time() + channel.visibility_timeout - 5
+            assert new_score >= expected_min
+
+    def test_get_cleans_up_expired_message_index(
+        self,
+        celery_app: Celery,
+        global_keyprefix: str,
+    ) -> None:
+        """Test _get removes messages_index entry when message hash is expired."""
+
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            queue_name = "expired_cleanup_test"
+            queue_key = f"{QUEUE_KEY_PREFIX}{queue_name}"
+            index_key = f"{MESSAGES_INDEX_PREFIX}{queue_name}"
+            expired_tag = "expired-tag"
+
+            # Clean up
+            client.delete(queue_key)
+            client.delete(index_key)
+
+            # Add to queue and index but NO message hash (simulates TTL expiry)
+            client.zadd(queue_key, {expired_tag: 100.0})
+            client.zadd(index_key, {expired_tag: 999.0})
+
+            # _get should raise Empty (no valid messages)
+            with pytest.raises(Empty):
+                channel._get(queue_name)
+
+            # Expired tag should be cleaned up from index
+            assert client.zscore(index_key, expired_tag) is None
 
 
 @pytest.mark.integration

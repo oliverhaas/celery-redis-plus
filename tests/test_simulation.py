@@ -130,9 +130,9 @@ def _worker_process_main(
 
     with start_worker(
         app,
-        pool="solo",
-        concurrency=1,
-        shutdown_timeout=60.0,
+        pool="threads",
+        concurrency=4,
+        shutdown_timeout=10.0,
         perform_ping_check=False,
         hostname=f"sim-{worker_num}@localhost",
     ):

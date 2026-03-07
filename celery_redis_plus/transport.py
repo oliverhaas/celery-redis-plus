@@ -140,6 +140,7 @@ DEFAULT_DB = 0
 _PACKAGE_DIR = Path(__file__).parent
 _ENQUEUE_DUE_MESSAGES_LUA = (_PACKAGE_DIR / "transport_enqueue_due_messages.lua").read_text()
 _REQUEUE_MESSAGE_LUA = (_PACKAGE_DIR / "transport_requeue_message.lua").read_text()
+_CONSUME_MESSAGE_LUA = (_PACKAGE_DIR / "transport_consume_message.lua").read_text()
 
 
 _warned_priority_clamp = False
@@ -732,6 +733,9 @@ class Channel(virtual.Channel):
         # Per-queue TTL state from x-expires and x-message-ttl queue arguments
         self._expires: dict[str, int] = {}  # queue_name → TTL in ms
         self._message_ttls: dict[str, int] = {}  # queue_name → message TTL in ms
+        # FAST/SLOW consume mode: FAST uses atomic Lua ZPOPMIN, SLOW uses blocking BZMPOP
+        self._consume_fast_mode: bool = True
+        self._consume_script_sha: str | None = None
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -894,22 +898,112 @@ class Channel(virtual.Channel):
 
     # --- BZMPOP (sorted set) methods for regular queues ---
 
+    def _ensure_consume_script_sha(self) -> str:
+        """Load and cache the consume_message Lua script SHA."""
+        if self._consume_script_sha is None:
+            self._consume_script_sha = self.client.script_load(_CONSUME_MESSAGE_LUA)
+        return self._consume_script_sha
+
+    def _parse_consume_result(self, result: list[Any]) -> tuple[str, dict[str, Any]]:
+        """Parse the result from consume_message Lua script.
+
+        Returns:
+            Tuple of (queue_name, message_dict).
+        """
+        queue_name = bytes_to_str(result[0])
+        payload_json = result[2]
+        restore_count = int(result[3] or 0)
+        message: dict[str, Any] = loads(bytes_to_str(payload_json))
+        if restore_count > 0:
+            headers = message.setdefault("properties", {}).setdefault("headers", {})
+            headers["x-restore-count"] = restore_count
+        return queue_name, message
+
     def _bzmpop_start(self, timeout: float | None = None) -> None:
         if timeout is None:
             timeout = self.connection.polling_interval or 1
         if not self._queue_cycle:
             return
-        # Convert logical queue names to Redis keys with queue: prefix
-        keys = [self._queue_key(q) for q in self._queue_cycle]
+
+        if self._consume_fast_mode:
+            # FAST mode: send non-blocking EVALSHA (atomic ZPOPMIN + ZADD + HMGET)
+            sha = self._ensure_consume_script_sha()
+            keys = [f"{self.global_keyprefix}{self._queue_key(q)}" for q in self._queue_cycle]
+            new_queue_at = time() + self.visibility_timeout
+            args = [
+                self.global_keyprefix,
+                self.message_key_prefix,
+                str(new_queue_at),
+                MESSAGES_INDEX_PREFIX,
+                *self._queue_cycle,
+            ]
+            self.client.connection.send_command(
+                "EVALSHA",
+                sha,
+                len(keys),
+                *keys,
+                *args,
+            )
+        else:
+            # SLOW mode: send blocking BZMPOP
+            keys = [self._queue_key(q) for q in self._queue_cycle]
+            command_args: list[Any] = ["BZMPOP", timeout, len(keys), *keys, "MIN"]
+            if self.global_keyprefix:
+                command_args = self.client._prefix_args(command_args)
+            self.client.connection.send_command(*command_args)
+
         self._in_poll = self.client.connection
 
-        command_args: list[Any] = ["BZMPOP", timeout, len(keys), *keys, "MIN"]
-        if self.global_keyprefix:
-            command_args = self.client._prefix_args(command_args)
-
-        self.client.connection.send_command(*command_args)
-
     def _bzmpop_read(self, **options: Any) -> bool:
+        if self._consume_fast_mode:
+            return self._fast_consume_read(**options)
+        return self._slow_consume_read(**options)
+
+    def _fast_consume_read(self, **options: Any) -> bool:
+        """Parse EVALSHA response from atomic Lua consume script.
+
+        On success: delivers message, clears _in_poll, returns True.
+        On empty: switches to SLOW mode, sends BZMPOP, raises Empty
+        (keeps _in_poll set since BZMPOP is now pending).
+        """
+        try:
+            try:
+                result = self.client.parse_response(self.client.connection, "EVALSHA", **options)
+            except self.connection_errors:
+                self.client.connection.disconnect()
+                self._in_poll = None
+                raise
+            except self.ResponseError as exc:
+                if "NOSCRIPT" in str(exc):
+                    # Script evicted from cache, reload on next tick
+                    self._consume_script_sha = None
+                    self._in_poll = None
+                    raise Empty from None
+                self._in_poll = None
+                raise
+        except Empty:
+            raise
+        except Exception:
+            self._in_poll = None
+            raise
+
+        if result:
+            queue_name, message = self._parse_consume_result(result)
+            self._in_poll = None
+            self.connection._deliver(message, queue_name)
+            return True
+
+        # Queue empty: switch to SLOW mode and send BZMPOP
+        self._consume_fast_mode = False
+        self._bzmpop_start()  # sends BZMPOP, keeps _in_poll set
+        raise Empty
+
+    def _slow_consume_read(self, **options: Any) -> bool:
+        """Parse BZMPOP response with pipeline ZADD + HMGET.
+
+        Safe because queue was just confirmed empty by FAST mode — any message
+        BZMPOP returns was published after that, with queue_at far in the future.
+        """
         try:
             try:
                 result = self.client.parse_response(self.client.connection, "BZMPOP", **options)
@@ -923,9 +1017,24 @@ class Channel(virtual.Channel):
                 dest = self._queue_name(dest)
                 delivery_tag, _score = members[0]
                 delivery_tag = bytes_to_str(delivery_tag)
+
+                # Pipeline ZADD (refresh index) + HMGET (fetch message)
+                index_key = self._messages_index_key(dest)
                 message_key = self._message_key(delivery_tag)
-                message = self._get_message_from_hash(message_key, self.client)
-                if message:
+                new_queue_at = time() + self.visibility_timeout
+                with self.client.pipeline(transaction=False) as pipe:
+                    pipe.zadd(index_key, {delivery_tag: new_queue_at}, xx=True)
+                    pipe.hmget(message_key, "payload", "restore_count")
+                    results = pipe.execute()
+
+                payload_json = results[1][0]
+                if payload_json:
+                    message: dict[str, Any] = loads(bytes_to_str(payload_json))
+                    restore_count = int(results[1][1] or 0)
+                    if restore_count > 0:
+                        headers = message.setdefault("properties", {}).setdefault("headers", {})
+                        headers["x-restore-count"] = restore_count
+                    self._consume_fast_mode = True  # Switch back to FAST
                     self.connection._deliver(message, dest)
                     return True
                 # Message hash expired (x-message-ttl) — clean up index
@@ -1045,24 +1154,38 @@ class Channel(virtual.Channel):
             self._in_fanout_poll = None
 
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
-        client = self.subclient if cmd_type == "XREAD" else self.client
+        if cmd_type == "XREAD":
+            client = self.subclient
+        else:
+            client = self.client
+            # In FAST mode the pending command is EVALSHA, not BZMPOP
+            if self._consume_fast_mode:
+                cmd_type = "EVALSHA"
         return client.parse_response(client.connection, cmd_type)
 
     def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:
-        """Get single message from queue (synchronous)."""
+        """Get single message from queue (synchronous).
+
+        Uses the atomic consume Lua script (ZPOPMIN + ZADD index + HMGET).
+        """
         with self.conn_or_acquire() as client:
-            while True:
-                result = client.zpopmin(self._queue_key(queue), count=1)
-                if not result:
-                    raise Empty
-                delivery_tag, _score = result[0]
-                delivery_tag = bytes_to_str(delivery_tag)
-                message_key = self._message_key(delivery_tag)
-                message = self._get_message_from_hash(message_key, client)
-                if message:
-                    return message
-                # Message hash expired (x-message-ttl) — clean up and try next
-                self._cleanup_expired_message(queue, delivery_tag, client)
+            consume_script = client.register_script(_CONSUME_MESSAGE_LUA)
+            queue_key = f"{self.global_keyprefix}{self._queue_key(queue)}"
+            new_queue_at = time() + self.visibility_timeout
+            result = consume_script(
+                keys=[queue_key],
+                args=[
+                    self.global_keyprefix,
+                    self.message_key_prefix,
+                    str(new_queue_at),
+                    MESSAGES_INDEX_PREFIX,
+                    queue,
+                ],
+            )
+            if not result:
+                raise Empty
+            _, message = self._parse_consume_result(result)
+            return message
 
     def _size(self, queue: str) -> int:
         with self.conn_or_acquire() as client:
