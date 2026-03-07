@@ -1,21 +1,30 @@
 """Production simulation test for celery-redis-plus.
 
-Runs a sustained workload with periodic worker restarts (graceful and hard crash)
-and verifies every task executes exactly once via an external Redis ledger.
+Submits batches of tasks across multiple concurrent worker processes with
+periodic restarts (graceful and hard crash) and verifies every task executes
+exactly once via an external Redis ledger.
+
+Each worker runs in its own subprocess with an isolated Celery app and
+transport, matching real production deployments.
 
 Run with:
     uv run pytest -m manual tests/test_simulation.py -v -s -k redis
 
 Configure via environment variables:
-    SIM_DURATION_SECONDS=1800   Total simulation time (default 30 min)
-    SIM_TASKS_PER_SECOND=2      Submission rate
-    SIM_RESTART_INTERVAL=45     Avg seconds between worker restarts
+    SIM_NUM_WORKERS=4           Number of concurrent workers (default 4)
+    SIM_TASKS_PER_BATCH=10000   Tasks per batch (default 10000)
+    SIM_NUM_BATCHES=1           Number of batches (default 1)
+    SIM_RESTART_INTERVAL=60     Seconds between worker restarts (default 60)
     SIM_HARD_CRASH_RATIO=0.3    Fraction of restarts that simulate hard crash
     SIM_VISIBILITY_TIMEOUT=10   Visibility timeout in seconds
+
+Quick smoke test:
+    SIM_TASKS_PER_BATCH=100 uv run pytest -m manual tests/test_simulation.py -v -s -k redis
 """
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import random
 import threading
@@ -26,16 +35,16 @@ from typing import Any
 import pytest
 from celery import Celery
 from celery.contrib.testing.worker import start_worker
-from kombu.asynchronous import set_event_loop
 
 from celery_redis_plus.transport import Channel, client_lib
 
 # --- Configuration via environment variables ---
-SIM_DURATION_SECONDS = int(os.environ.get("SIM_DURATION_SECONDS", "1800"))
-SIM_TASKS_PER_SECOND = int(os.environ.get("SIM_TASKS_PER_SECOND", "2"))
-SIM_RESTART_INTERVAL = int(os.environ.get("SIM_RESTART_INTERVAL", "45"))
+SIM_NUM_WORKERS = int(os.environ.get("SIM_NUM_WORKERS", "4"))
+SIM_TASKS_PER_BATCH = int(os.environ.get("SIM_TASKS_PER_BATCH", "10000"))
+SIM_NUM_BATCHES = int(os.environ.get("SIM_NUM_BATCHES", "1"))
+SIM_RESTART_INTERVAL = int(os.environ.get("SIM_RESTART_INTERVAL", "60"))
 SIM_HARD_CRASH_RATIO = float(os.environ.get("SIM_HARD_CRASH_RATIO", "0.3"))
-SIM_VISIBILITY_TIMEOUT = int(os.environ.get("SIM_VISIBILITY_TIMEOUT", "10"))
+SIM_VISIBILITY_TIMEOUT = int(os.environ.get("SIM_VISIBILITY_TIMEOUT", "120"))
 
 LEDGER_DB = 2
 
@@ -96,131 +105,232 @@ def _register_tasks(app: Celery, host: str, port: int) -> dict[str, Any]:
     }
 
 
-class TaskSubmitter:
-    """Background thread that continuously submits tasks."""
-
-    def __init__(self, tasks: dict[str, Any], tasks_per_second: int) -> None:
-        self.tasks = tasks
-        self.tasks_per_second = tasks_per_second
-        self.submitted: list[tuple[str, str]] = []  # (uuid, type)
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._lock = threading.Lock()
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=10)
-
-    def _run(self) -> None:
-        interval = 1.0 / self.tasks_per_second
-        while not self._stop_event.is_set():
-            task_uuid = str(uuid.uuid4())
-            roll = random.random()
-            if roll < 0.5:
-                task_type = "normal"
-                self.tasks["normal"].delay(task_uuid)
-            elif roll < 0.7:
-                task_type = "delayed"
-                countdown = random.uniform(3.0, 10.0)
-                self.tasks["delayed"].apply_async(args=(task_uuid,), countdown=countdown)
-            else:
-                task_type = "slow"
-                self.tasks["slow"].delay(task_uuid)
-
-            with self._lock:
-                self.submitted.append((task_uuid, task_type))
-
-            self._stop_event.wait(interval)
-
-    @property
-    def submission_count(self) -> int:
-        with self._lock:
-            return len(self.submitted)
+# ---------------------------------------------------------------------------
+# Worker subprocess
+# ---------------------------------------------------------------------------
 
 
-def _run_worker_lifecycle(
-    app: Celery,
-    duration: float,
-    restart_interval: float,
-    hard_crash_ratio: float,
-) -> list[dict[str, Any]]:
-    """Cycle through worker instances with periodic restarts.
+def _worker_process_main(
+    host: str,
+    port: int,
+    worker_num: int,
+    started_event: multiprocessing.synchronize.Event,
+    stop_event: multiprocessing.synchronize.Event,
+    hard_crash_flag: multiprocessing.synchronize.Event,
+) -> None:
+    """Entry point for a worker subprocess.
 
-    Returns a log of worker lifecycle events.
+    Creates its own Celery app + transport (fully isolated from other workers).
+    Blocks on *stop_event* until told to shut down.  If *hard_crash_flag* is
+    set, ``Channel.do_restore`` is disabled so unacked messages remain in
+    ``messages_index`` for visibility-timeout recovery.
     """
-    events: list[dict[str, Any]] = []
-    sim_start = time.monotonic()
-    worker_num = 0
+    app = _make_sim_app(host, port)
+    _register_tasks(app, host, port)
 
-    while time.monotonic() - sim_start < duration:
-        worker_num += 1
-        remaining = duration - (time.monotonic() - sim_start)
-        if remaining <= 0:
-            break
-
-        run_time = min(
-            restart_interval + random.uniform(-10, 10),
-            remaining,
-        )
-        run_time = max(run_time, 10)  # At least 10 seconds
-
-        is_hard_crash = random.random() < hard_crash_ratio
-
-        event: dict[str, Any] = {
-            "worker_num": worker_num,
-            "start_time": time.monotonic() - sim_start,
-            "planned_run_time": run_time,
-            "crash_type": "hard" if is_hard_crash else "graceful",
-        }
-
-        app.loader.import_task_module("celery_redis_plus")
-
-        if is_hard_crash:
-            # Hard crash: disable restore before exiting context manager
+    with start_worker(
+        app,
+        pool="solo",
+        concurrency=1,
+        shutdown_timeout=60.0,
+        perform_ping_check=False,
+        hostname=f"sim-{worker_num}@localhost",
+    ):
+        started_event.set()
+        stop_event.wait()
+        # Set do_restore=False BEFORE leaving the context manager so
+        # QoS.restore_unacked_once() sees it during shutdown.
+        if hard_crash_flag.is_set():
             Channel.do_restore = False
 
-        try:
-            with start_worker(
-                app,
-                pool="solo",
-                shutdown_timeout=60.0,
-                perform_ping_check=False,
-            ):
-                time.sleep(run_time)
-        finally:
-            if is_hard_crash:
-                Channel.do_restore = True
+    app.close()
 
-        event["end_time"] = time.monotonic() - sim_start
-        events.append(event)
 
-        print(
-            f"  Worker {worker_num}: {event['crash_type']} restart at {event['end_time']:.0f}s",
+# ---------------------------------------------------------------------------
+# WorkerPool — manages concurrent worker subprocesses
+# ---------------------------------------------------------------------------
+
+
+class WorkerPool:
+    """Manages multiple concurrent Celery worker subprocesses.
+
+    Each worker runs in its own process with an isolated Celery app,
+    transport, and Redis connections — matching real deployments.
+    Workers can be individually restarted (graceful or hard crash)
+    without affecting other running workers.
+    """
+
+    def __init__(self, host: str, port: int, num_workers: int) -> None:
+        self.host = host
+        self.port = port
+        self.num_workers = num_workers
+        self._slots: list[
+            tuple[
+                multiprocessing.Process,
+                multiprocessing.synchronize.Event,
+                multiprocessing.synchronize.Event,
+                int,
+            ]
+        ] = []
+        self._counter = 0
+        self._lock = threading.Lock()
+        self.events: list[dict[str, Any]] = []
+
+    def start_all(self) -> None:
+        """Start all workers."""
+        for _ in range(self.num_workers):
+            self._start_new()
+
+    def _start_new(self) -> int:
+        """Start a new worker subprocess and return its number."""
+        self._counter += 1
+        num = self._counter
+        started = multiprocessing.Event()
+        stop = multiprocessing.Event()
+        hard_crash = multiprocessing.Event()
+        p = multiprocessing.Process(
+            target=_worker_process_main,
+            args=(self.host, self.port, num, started, stop, hard_crash),
+            daemon=True,
         )
+        p.start()
+        if not started.wait(timeout=60):
+            raise RuntimeError(f"Worker {num} failed to start within 60s")
+        with self._lock:
+            self._slots.append((p, stop, hard_crash, num))
+        return num
 
-        set_event_loop(None)
-        time.sleep(1)  # Brief gap between workers
+    def restart_random(self, hard: bool = False) -> dict[str, Any] | None:
+        """Stop a random worker and start a replacement.
 
-    return events
+        For hard crash: sets the ``hard_crash_flag`` so the subprocess
+        disables ``Channel.do_restore`` before shutting down — unacked
+        messages stay in ``messages_index`` for visibility-timeout recovery.
+        """
+        with self._lock:
+            if not self._slots:
+                return None
+            idx = random.randrange(len(self._slots))
+            proc, stop_event, hard_flag, old_num = self._slots.pop(idx)
+
+        if hard:
+            hard_flag.set()
+        stop_event.set()
+        proc.join(timeout=120)
+
+        new_num = self._start_new()
+
+        event = {
+            "old_worker": old_num,
+            "new_worker": new_num,
+            "crash_type": "hard" if hard else "graceful",
+        }
+        self.events.append(event)
+        print(f"  Worker {old_num} -> {new_num} ({event['crash_type']} restart)")
+        return event
+
+    def stop_all(self) -> None:
+        """Gracefully stop all workers."""
+        with self._lock:
+            slots = list(self._slots)
+            self._slots.clear()
+        for _, stop_event, _, _ in slots:
+            stop_event.set()
+        for proc, _, _, _ in slots:
+            proc.join(timeout=60)
+
+
+# ---------------------------------------------------------------------------
+# Batch submission & progress tracking
+# ---------------------------------------------------------------------------
+
+
+def _submit_batch(
+    tasks: dict[str, Any],
+    count: int,
+) -> list[tuple[str, str]]:
+    """Submit a batch of tasks. Returns list of (uuid, type) tuples.
+
+    Distribution: 70% normal, 25% delayed (countdown 3-10s), 5% slow.
+    """
+    submitted: list[tuple[str, str]] = []
+    for _ in range(count):
+        task_uuid = str(uuid.uuid4())
+        roll = random.random()
+        if roll < 0.70:
+            tasks["normal"].delay(task_uuid)
+            submitted.append((task_uuid, "normal"))
+        elif roll < 0.95:
+            countdown = random.uniform(3.0, 10.0)
+            tasks["delayed"].apply_async(args=(task_uuid,), countdown=countdown)
+            submitted.append((task_uuid, "delayed"))
+        else:
+            tasks["slow"].delay(task_uuid)
+            submitted.append((task_uuid, "slow"))
+    return submitted
+
+
+def _count_completed(ledger: Any, uuids: set[str]) -> int:
+    """Count how many task UUIDs have been recorded in the ledger."""
+    pipe = ledger.pipeline()
+    for u in uuids:
+        pipe.hget(f"ledger:{u}", "count")
+    results = pipe.execute()
+    return sum(1 for r in results if r is not None)
+
+
+def _wait_for_batch(
+    ledger: Any,
+    uuids: set[str],
+    pool: WorkerPool,
+    timeout: float,
+    restart_interval: float,
+    hard_crash_ratio: float,
+) -> int:
+    """Wait for batch completion, restarting workers periodically.
+
+    Returns the number of completed tasks.
+    """
+    start = time.monotonic()
+    last_restart = start
+    total = len(uuids)
+
+    while time.monotonic() - start < timeout:
+        completed = _count_completed(ledger, uuids)
+        elapsed = time.monotonic() - start
+        print(f"  Progress: {completed}/{total} ({elapsed:.0f}s)")
+
+        if completed >= total:
+            return completed
+
+        # Periodically restart a random worker
+        if time.monotonic() - last_restart >= restart_interval:
+            hard = random.random() < hard_crash_ratio
+            pool.restart_random(hard=hard)
+            last_restart = time.monotonic()
+
+        time.sleep(5)
+
+    return _count_completed(ledger, uuids)
+
+
+# ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
 
 
 def _verify_exactly_once(
     ledger: Any,
-    submitter: TaskSubmitter,
-    lifecycle_events: list[dict[str, Any]],
+    all_submitted: list[tuple[str, str]],
+    events: list[dict[str, Any]],
 ) -> None:
     """Verify every submitted task was executed exactly once and print report."""
-    total_submitted = len(submitter.submitted)
-    submitted_uuids = {s[0] for s in submitter.submitted}
+    submitted_uuids = {u for u, _ in all_submitted}
+    total_submitted = len(submitted_uuids)
 
     executed_exactly_once = 0
-    missing = []
-    duplicated = []
+    missing: list[str] = []
+    duplicated: list[tuple[str, int]] = []
 
     for task_uuid in submitted_uuids:
         count_raw = ledger.hget(f"ledger:{task_uuid}", "count")
@@ -240,19 +350,18 @@ def _verify_exactly_once(
 
     # Type breakdown
     type_counts: dict[str, int] = {}
-    for _, task_type in submitter.submitted:
+    for _, task_type in all_submitted:
         type_counts[task_type] = type_counts.get(task_type, 0) + 1
 
-    hard_crashes = sum(1 for e in lifecycle_events if e["crash_type"] == "hard")
-    graceful = sum(1 for e in lifecycle_events if e["crash_type"] == "graceful")
+    hard_crashes = sum(1 for e in events if e["crash_type"] == "hard")
+    graceful = sum(1 for e in events if e["crash_type"] == "graceful")
 
     print(f"\n{'=' * 60}")
     print("  SIMULATION RESULTS")
     print(f"{'=' * 60}")
-    print(f"  Duration: {SIM_DURATION_SECONDS}s")
-    print(f"  Workers started: {len(lifecycle_events)}")
-    print(f"    Graceful restarts: {graceful}")
-    print(f"    Hard crashes: {hard_crashes}")
+    print(f"  Workers: {SIM_NUM_WORKERS} concurrent")
+    print(f"  Batches: {SIM_NUM_BATCHES} x {SIM_TASKS_PER_BATCH} tasks")
+    print(f"  Restarts: {len(events)} ({graceful} graceful, {hard_crashes} hard)")
     print(f"  Tasks submitted: {total_submitted}")
     for ttype, tcount in sorted(type_counts.items()):
         print(f"    {ttype}: {tcount}")
@@ -272,12 +381,18 @@ def _verify_exactly_once(
     assert executed_exactly_once == total_submitted
 
 
+# ---------------------------------------------------------------------------
+# Test class
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.manual
 class TestProductionSimulation:
-    """Production workload simulation with worker restarts.
+    """Production workload simulation with multiple concurrent workers.
 
-    Verifies exactly-once task execution across graceful restarts
-    and simulated hard crashes (visibility timeout recovery).
+    Submits batches of tasks across multiple worker subprocesses with
+    periodic restarts (graceful and hard crash), then verifies exactly-once
+    task execution via an external Redis ledger.
     """
 
     def test_exactly_once_with_worker_restarts(
@@ -288,69 +403,62 @@ class TestProductionSimulation:
         host, port, _image = redis_container
         redis_client.flushall()
 
+        # Main-process app used only for submitting tasks
         app = _make_sim_app(host, port)
         tasks = _register_tasks(app, host, port)
 
-        # Ledger on DB 2
         ledger = client_lib.Redis(host=host, port=port, db=LEDGER_DB)
         ledger.flushdb()
 
+        # Estimate batch timeout:
+        # weighted avg task time * count / workers * 2x safety + VT recovery
+        avg_task_time = 0.70 * 1.25 + 0.25 * 1.25 + 0.05 * 20  # ~2.19s
+        batch_timeout = avg_task_time * SIM_TASKS_PER_BATCH / SIM_NUM_WORKERS * 2 + SIM_VISIBILITY_TIMEOUT * 5
+
         print(f"\n{'=' * 60}")
         print("  PRODUCTION SIMULATION")
-        print(f"  Duration: {SIM_DURATION_SECONDS}s")
-        print(f"  Tasks/sec: {SIM_TASKS_PER_SECOND}")
+        print(f"  Workers: {SIM_NUM_WORKERS}")
+        print(f"  Batches: {SIM_NUM_BATCHES} x {SIM_TASKS_PER_BATCH} tasks")
         print(f"  Restart interval: ~{SIM_RESTART_INTERVAL}s")
         print(f"  Hard crash ratio: {SIM_HARD_CRASH_RATIO}")
         print(f"  Visibility timeout: {SIM_VISIBILITY_TIMEOUT}s")
+        print(f"  Batch timeout: {batch_timeout:.0f}s")
         print(f"{'=' * 60}")
 
-        submitter = TaskSubmitter(tasks, SIM_TASKS_PER_SECOND)
-        submitter.start()
+        pool = WorkerPool(host, port, SIM_NUM_WORKERS)
+        pool.start_all()
+
+        all_submitted: list[tuple[str, str]] = []
 
         try:
-            lifecycle_events = _run_worker_lifecycle(
-                app,
-                duration=SIM_DURATION_SECONDS,
-                restart_interval=SIM_RESTART_INTERVAL,
-                hard_crash_ratio=SIM_HARD_CRASH_RATIO,
-            )
+            for batch_num in range(SIM_NUM_BATCHES):
+                print(f"\n  --- Batch {batch_num + 1}/{SIM_NUM_BATCHES} ---")
+                print(f"  Submitting {SIM_TASKS_PER_BATCH} tasks...")
+
+                batch = _submit_batch(tasks, SIM_TASKS_PER_BATCH)
+                all_submitted.extend(batch)
+                batch_uuids = {u for u, _ in batch}
+
+                print(
+                    f"  Submitted. Waiting for completion (timeout: {batch_timeout:.0f}s)...",
+                )
+
+                completed = _wait_for_batch(
+                    ledger,
+                    batch_uuids,
+                    pool,
+                    timeout=batch_timeout,
+                    restart_interval=SIM_RESTART_INTERVAL,
+                    hard_crash_ratio=SIM_HARD_CRASH_RATIO,
+                )
+                print(
+                    f"  Batch {batch_num + 1} done: {completed}/{len(batch_uuids)}",
+                )
         finally:
-            submitter.stop()
+            pool.stop_all()
 
-        # --- Drain phase ---
-        print(f"\n  Drain phase: {submitter.submission_count} tasks submitted, waiting for completion...")
+        _verify_exactly_once(ledger, all_submitted, pool.events)
 
-        app.loader.import_task_module("celery_redis_plus")
-        drain_timeout = SIM_VISIBILITY_TIMEOUT * 3 + 120
-
-        with submitter._lock:
-            submitted_uuids = {s[0] for s in submitter.submitted}
-
-        with start_worker(
-            app,
-            pool="solo",
-            shutdown_timeout=60.0,
-            perform_ping_check=False,
-        ):
-            drain_start = time.monotonic()
-            while time.monotonic() - drain_start < drain_timeout:
-                recorded = 0
-                for task_uuid in submitted_uuids:
-                    count = ledger.hget(f"ledger:{task_uuid}", "count")
-                    if count and int(count) >= 1:
-                        recorded += 1
-                if recorded >= len(submitted_uuids):
-                    print(f"  All {recorded} tasks completed after {time.monotonic() - drain_start:.0f}s drain")
-                    break
-                print(f"  Drain: {recorded}/{len(submitted_uuids)} tasks recorded...")
-                time.sleep(5)
-
-        set_event_loop(None)
-
-        # --- Verification ---
-        _verify_exactly_once(ledger, submitter, lifecycle_events)
-
-        # Cleanup
         ledger.flushdb()
         ledger.close()
         app.close()
