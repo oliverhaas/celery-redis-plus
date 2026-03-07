@@ -8,13 +8,16 @@ This transport provides three key improvements over the standard Redis transport
 Requires Redis 7.0+ (or Valkey) for BZMPOP support.
 Supports both redis-py and valkey-py client libraries.
 
-Connection String
-=================
-Connection string has the following format:
+Configuration
+=============
+For Valkey, use the ``valkey://`` URL scheme directly::
 
-.. code-block::
+    broker_url = "valkey://localhost:6379/0"
 
-    celery_redis_plus.transport:Transport://[USER:PASSWORD@]REDIS_ADDRESS[:PORT][/VIRTUALHOST]
+For Redis, set ``broker_transport`` with a standard ``redis://`` URL::
+
+    broker_url = "redis://localhost:6379/0"
+    broker_transport = "celery_redis_plus.transport:Transport"
 
 Transport Options
 =================
@@ -321,8 +324,8 @@ class QoS(virtual.QoS):
 
     Messages are stored in a hash at publish time with visibility tracking
     in a separate sorted set. This allows recovery of messages from crashed
-    workers based on their index scores. Unlike the base class, append() needs
-    no override — messages are already persisted in Redis at publish time.
+    workers based on their index scores. The base class append() is sufficient
+    since messages are already persisted in Redis at publish time.
     """
 
     channel: Channel  # Narrow type from base class for our custom Channel
@@ -1125,7 +1128,11 @@ class Channel(virtual.Channel):
                         )
                     total_enqueued += enqueued
                 except Exception:
-                    logger.warning("Failed to enqueue due messages for queue %s, will retry next cycle", queue, exc_info=True)
+                    logger.warning(
+                        "Failed to enqueue due messages for queue %s, will retry next cycle",
+                        queue,
+                        exc_info=True,
+                    )
 
         return total_enqueued
 
@@ -1172,10 +1179,11 @@ class Channel(virtual.Channel):
     def _put(self, queue: str, message: dict[str, Any], **kwargs: Any) -> None:
         """Store message hash and add to queue and messages_index.
 
-        All messages are added to messages_index (for visibility timeout tracking).
-        Immediate messages also go to the queue sorted set with a score encoding
-        priority and timestamp. Native delayed messages (delay > requeue check
-        interval) go only to messages_index and are moved to the queue when due.
+        Immediate messages go to the queue sorted set with a score encoding priority
+        and timestamp. Native delayed messages (delay > requeue check interval) go
+        only to messages_index and are moved to the queue when due.
+        The messages_index tracks when to attempt (re)queue if the message is not
+        acknowledged (queue_at = eta for delayed, now + visibility_timeout for immediate).
 
         Args:
             queue: Target queue name.
@@ -1287,9 +1295,10 @@ class Channel(virtual.Channel):
             )
 
     def _delete(self, queue: str, *args: Any, **kwargs: Any) -> None:
-        exchange: str = kwargs.get("exchange", "")
-        routing_key: str = kwargs.get("routing_key", "")
-        pattern: str = kwargs.get("pattern", "")
+        # kombu calls: _delete(queue, exchange, routing_key, pattern)
+        exchange = args[0] if args else ""
+        routing_key = args[1] if len(args) > 1 else ""
+        pattern = args[2] if len(args) > 2 else ""  # noqa: PLR2004
         self.auto_delete_queues.discard(queue)
         had_expires = queue in self._expires
         self._expires.pop(queue, None)
