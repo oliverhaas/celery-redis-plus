@@ -13,7 +13,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 from kombu import Exchange, Queue
 from kombu.exceptions import OperationalError
-from kombu.transport import virtual
 from kombu.utils.eventio import ERR
 from kombu.utils.json import dumps as json_dumps
 
@@ -1553,8 +1552,8 @@ class TestQoS:
         zadd_calls = [call[0][0] for call in mock_pipe.zadd.call_args_list]
         assert f"{MESSAGES_INDEX_PREFIX}celery" in zadd_calls
 
-    def test_drain_pending_acks_fires_callbacks(self) -> None:
-        """Test that _drain_pending_acks executes hub callbacks."""
+    def test_drain_hub_callbacks_fires_callbacks(self) -> None:
+        """Test that _drain_hub_callbacks executes hub callbacks."""
         qos = object.__new__(QoS)
 
         callback1 = MagicMock()
@@ -1573,13 +1572,13 @@ class TestQoS:
         mock_channel.connection = mock_connection
         qos.channel = mock_channel
 
-        qos._drain_pending_acks()
+        qos._drain_hub_callbacks()
 
         callback1.assert_called_once()
         callback2.assert_called_once()
 
-    def test_drain_pending_acks_no_hub(self) -> None:
-        """Test _drain_pending_acks is safe when hub is not available."""
+    def test_drain_hub_callbacks_no_hub(self) -> None:
+        """Test _drain_hub_callbacks is safe when hub is not available."""
         qos = object.__new__(QoS)
 
         mock_cycle = MagicMock()
@@ -1593,19 +1592,19 @@ class TestQoS:
         qos.channel = mock_channel
 
         # Should not raise
-        qos._drain_pending_acks()
+        qos._drain_hub_callbacks()
 
-    def test_drain_pending_acks_no_connection(self) -> None:
-        """Test _drain_pending_acks is safe when connection is gone."""
+    def test_drain_hub_callbacks_no_connection(self) -> None:
+        """Test _drain_hub_callbacks is safe when connection is gone."""
         qos = object.__new__(QoS)
 
         mock_channel = MagicMock(spec=[])  # Empty spec — no attributes
         qos.channel = mock_channel
 
         # Should not raise (AttributeError is caught)
-        qos._drain_pending_acks()
+        qos._drain_hub_callbacks()
 
-    def test_drain_pending_acks_callback_exception(self) -> None:
+    def test_drain_hub_callbacks_callback_exception(self) -> None:
         """Test that failing callbacks don't prevent other callbacks from running."""
         qos = object.__new__(QoS)
 
@@ -1625,14 +1624,47 @@ class TestQoS:
         mock_channel.connection = mock_connection
         qos.channel = mock_channel
 
-        qos._drain_pending_acks()
+        qos._drain_hub_callbacks()
 
         # Both should have been called despite first one raising
         callback_fail.assert_called_once()
         callback_ok.assert_called_once()
 
-    def test_restore_unacked_once_drains_before_restore(self) -> None:
-        """Test that restore_unacked_once drains hub callbacks before restoring."""
+    def test_restore_unacked_once_skips_restore_and_registers_atexit(self) -> None:
+        """Test that restore_unacked_once does NOT restore messages to queue.
+
+        Instead it registers an atexit handler so ack callbacks can fire
+        after the thread pool shuts down.
+        """
+        qos = object.__new__(QoS)
+        qos._fanout_tags = set()
+        qos._dirty = set()
+        qos._delivered = OrderedDict()
+        qos._delivered.restored = False  # type: ignore[attr-defined]
+        qos._delivered["tag1"] = MagicMock()  # Simulate an unacked message
+        qos.restore_at_shutdown = True
+        qos._on_collect = MagicMock()
+
+        mock_channel = MagicMock()
+        mock_channel.do_restore = True
+        qos.channel = mock_channel
+
+        qos._drain_hub_callbacks = MagicMock()
+
+        with patch("celery_redis_plus.transport.atexit") as mock_atexit:
+            qos.restore_unacked_once()
+
+        # Drain was called
+        qos._drain_hub_callbacks.assert_called_once()
+        # atexit handler registered
+        mock_atexit.register.assert_called_once_with(qos._post_pool_cleanup)
+        # _delivered was NOT cleared (threads still need it for acks)
+        assert "tag1" in qos._delivered
+        # restored flag is set (prevents re-entry)
+        assert qos._delivered.restored is True  # type: ignore[attr-defined]
+
+    def test_restore_unacked_once_no_atexit_when_empty(self) -> None:
+        """Test that atexit is not registered when _delivered is empty."""
         qos = object.__new__(QoS)
         qos._fanout_tags = set()
         qos._dirty = set()
@@ -1645,16 +1677,39 @@ class TestQoS:
         mock_channel.do_restore = True
         qos.channel = mock_channel
 
-        call_order: list[str] = []
-        qos._drain_pending_acks = MagicMock(side_effect=lambda: call_order.append("drain"))
+        qos._drain_hub_callbacks = MagicMock()
 
-        def mock_super_restore(self_inner, stderr=None):
-            call_order.append("restore")
-
-        with patch.object(virtual.QoS, "restore_unacked_once", mock_super_restore):
+        with patch("celery_redis_plus.transport.atexit") as mock_atexit:
             qos.restore_unacked_once()
 
-        assert call_order == ["drain", "restore"]
+        mock_atexit.register.assert_not_called()
+
+    def test_post_pool_cleanup_drains_and_clears(self) -> None:
+        """Test that _post_pool_cleanup fires callbacks and clears _delivered."""
+        qos = object.__new__(QoS)
+        qos._fanout_tags = set()
+        qos._dirty = set()
+        qos._delivered = OrderedDict()
+        qos._delivered["tag1"] = MagicMock()
+
+        ack_callback = MagicMock()
+        mock_hub = MagicMock()
+        mock_hub._pop_ready.side_effect = [[ack_callback], []]
+
+        mock_cycle = MagicMock()
+        mock_cycle._loop = mock_hub
+
+        mock_connection = MagicMock()
+        mock_connection.cycle = mock_cycle
+
+        mock_channel = MagicMock()
+        mock_channel.connection = mock_connection
+        qos.channel = mock_channel
+
+        qos._post_pool_cleanup()
+
+        ack_callback.assert_called_once()
+        assert len(qos._delivered) == 0
 
 
 @pytest.mark.unit
