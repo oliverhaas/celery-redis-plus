@@ -379,6 +379,36 @@ class QoS(virtual.QoS):
             ack_script = client.register_script(_ACK_MESSAGE_LUA)
             ack_script(keys=[index_key, message_key], args=[delivery_tag])
 
+    def restore_unacked_once(self, stderr: Any = None) -> None:
+        """Restore unacked messages, draining pending acks first.
+
+        With pool="threads", acks are deferred via hub.call_soon() and may
+        not have fired when shutdown triggers restore. Drain those callbacks
+        first so already-completed tasks aren't unnecessarily requeued.
+        """
+        self._drain_pending_acks()
+        super().restore_unacked_once(stderr)
+
+    def _drain_pending_acks(self) -> None:
+        """Execute pending hub callbacks to flush deferred acks.
+
+        The hub's _ready set holds callbacks scheduled via call_soon().
+        During graceful shutdown, worker threads may have completed tasks
+        and scheduled ack callbacks that haven't fired yet. Processing
+        them here ensures those delivery tags are marked dirty before
+        restore_unacked iterates _delivered.
+        """
+        try:
+            hub = self.channel.connection.cycle._loop
+        except AttributeError:
+            return
+        if hub is None:
+            return
+        ready = hub._pop_ready()
+        for cb in ready:
+            with suppress(Exception):
+                cb()
+
     def maybe_update_messages_index(self) -> None:
         """Update scores of delivered messages to now + visibility_timeout.
 
