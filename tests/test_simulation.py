@@ -279,13 +279,26 @@ def _submit_batch(
     return submitted
 
 
-def _count_completed(ledger: Any, uuids: set[str]) -> int:
-    """Count how many task UUIDs have been recorded in the ledger."""
+def _check_progress(ledger: Any, uuids: set[str]) -> tuple[int, int, list[tuple[str, int]]]:
+    """Check ledger for completed, missing, and duplicated tasks.
+
+    Returns (completed_count, duplicate_count, new_duplicates_list).
+    """
+    uuid_list = list(uuids)
     pipe = ledger.pipeline()
-    for u in uuids:
+    for u in uuid_list:
         pipe.hget(f"ledger:{u}", "count")
     results = pipe.execute()
-    return sum(1 for r in results if r is not None)
+
+    completed = 0
+    duplicates: list[tuple[str, int]] = []
+    for u, r in zip(uuid_list, results, strict=True):
+        if r is not None:
+            count = int(r)
+            completed += 1
+            if count > 1:
+                duplicates.append((u, count))
+    return completed, len(duplicates), duplicates
 
 
 def _wait_for_batch(
@@ -298,16 +311,31 @@ def _wait_for_batch(
 ) -> int:
     """Wait for batch completion, restarting workers periodically.
 
+    Logs warnings immediately when duplicates are detected.
     Returns the number of completed tasks.
     """
     start = time.monotonic()
     last_restart = start
     total = len(uuids)
+    prev_dupes = 0
 
     while time.monotonic() - start < timeout:
-        completed = _count_completed(ledger, uuids)
+        completed, num_dupes, dupe_details = _check_progress(ledger, uuids)
         elapsed = time.monotonic() - start
-        print(f"  Progress: {completed}/{total} ({elapsed:.0f}s)")
+
+        status = f"  Progress: {completed}/{total} ({elapsed:.0f}s)"
+        if num_dupes:
+            status += f" [WARNING: {num_dupes} duplicates!]"
+        print(status)
+
+        # Log new duplicates as soon as they appear
+        if num_dupes > prev_dupes:
+            new = dupe_details[prev_dupes:]
+            for task_uuid, count in new[:5]:
+                print(f"    DUPLICATE: {task_uuid} executed {count}x")
+            if len(new) > 5:
+                print(f"    ... and {len(new) - 5} more new duplicates")
+            prev_dupes = num_dupes
 
         if completed >= total:
             return completed
@@ -320,7 +348,8 @@ def _wait_for_batch(
 
         time.sleep(5)
 
-    return _count_completed(ledger, uuids)
+    completed, num_dupes, _ = _check_progress(ledger, uuids)
+    return completed
 
 
 # ---------------------------------------------------------------------------

@@ -1630,86 +1630,35 @@ class TestQoS:
         callback_fail.assert_called_once()
         callback_ok.assert_called_once()
 
-    def test_restore_unacked_once_skips_restore_and_registers_atexit(self) -> None:
-        """Test that restore_unacked_once does NOT restore messages to queue.
-
-        Instead it registers an atexit handler so ack callbacks can fire
-        after the thread pool shuts down.
-        """
+    def test_restore_unacked_once_drains_before_restore(self) -> None:
+        """Test that restore_unacked_once drains hub callbacks then delegates."""
         qos = object.__new__(QoS)
         qos._fanout_tags = set()
         qos._dirty = set()
         qos._delivered = OrderedDict()
         qos._delivered.restored = False  # type: ignore[attr-defined]
-        qos._delivered["tag1"] = MagicMock()  # Simulate an unacked message
-        qos.restore_at_shutdown = True
-        qos._on_collect = MagicMock()
-
-        mock_channel = MagicMock()
-        mock_channel.do_restore = True
-        qos.channel = mock_channel
-
-        qos._drain_hub_callbacks = MagicMock()
-
-        with patch("celery_redis_plus.transport.atexit") as mock_atexit:
-            qos.restore_unacked_once()
-
-        # Drain was called
-        qos._drain_hub_callbacks.assert_called_once()
-        # atexit handler registered
-        mock_atexit.register.assert_called_once_with(qos._post_pool_cleanup)
-        # _delivered was NOT cleared (threads still need it for acks)
-        assert "tag1" in qos._delivered
-        # restored flag is set (prevents re-entry)
-        assert qos._delivered.restored is True  # type: ignore[attr-defined]
-
-    def test_restore_unacked_once_no_atexit_when_empty(self) -> None:
-        """Test that atexit is not registered when _delivered is empty."""
-        qos = object.__new__(QoS)
-        qos._fanout_tags = set()
-        qos._dirty = set()
-        qos._delivered = OrderedDict()
-        qos._delivered.restored = False  # type: ignore[attr-defined]
-        qos.restore_at_shutdown = True
-        qos._on_collect = MagicMock()
-
-        mock_channel = MagicMock()
-        mock_channel.do_restore = True
-        qos.channel = mock_channel
-
-        qos._drain_hub_callbacks = MagicMock()
-
-        with patch("celery_redis_plus.transport.atexit") as mock_atexit:
-            qos.restore_unacked_once()
-
-        mock_atexit.register.assert_not_called()
-
-    def test_post_pool_cleanup_drains_and_clears(self) -> None:
-        """Test that _post_pool_cleanup fires callbacks and clears _delivered."""
-        qos = object.__new__(QoS)
-        qos._fanout_tags = set()
-        qos._dirty = set()
-        qos._delivered = OrderedDict()
         qos._delivered["tag1"] = MagicMock()
-
-        ack_callback = MagicMock()
-        mock_hub = MagicMock()
-        mock_hub._pop_ready.side_effect = [[ack_callback], []]
-
-        mock_cycle = MagicMock()
-        mock_cycle._loop = mock_hub
-
-        mock_connection = MagicMock()
-        mock_connection.cycle = mock_cycle
+        qos.restore_at_shutdown = True
+        qos._on_collect = MagicMock()
 
         mock_channel = MagicMock()
-        mock_channel.connection = mock_connection
+        mock_channel.do_restore = True
         qos.channel = mock_channel
 
-        qos._post_pool_cleanup()
+        qos._drain_hub_callbacks = MagicMock()
 
-        ack_callback.assert_called_once()
-        assert len(qos._delivered) == 0
+        # Track call order to verify drain happens before super().restore
+        call_order: list[str] = []
+        qos._drain_hub_callbacks.side_effect = lambda: call_order.append("drain")
+
+        with patch.object(
+            QoS.__bases__[0],
+            "restore_unacked_once",
+            side_effect=lambda _self, _stderr=None: call_order.append("super_restore"),
+        ):
+            qos.restore_unacked_once()
+
+        assert call_order == ["drain", "super_restore"]
 
 
 @pytest.mark.unit

@@ -37,11 +37,9 @@ Transport Options
 
 from __future__ import annotations
 
-import atexit
 import functools
 import numbers
 import socket as socket_module
-import sys
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from queue import Empty
@@ -382,63 +380,14 @@ class QoS(virtual.QoS):
             ack_script(keys=[index_key, message_key], args=[delivery_tag])
 
     def restore_unacked_once(self, stderr: Any = None) -> None:
-        """Skip restoring messages; let threads finish and clean up via atexit.
+        """Restore unacked messages, draining pending acks first.
 
-        Celery stops bootsteps in reverse order: Consumer closes (triggering
-        this method) BEFORE the thread pool shuts down.  If we restore now,
-        messages get requeued to Redis while threads are still executing
-        them — causing duplicates.
-
-        Instead we:
-        1. Drain any hub callbacks that have already been scheduled (in-flight
-           task acks with acks_late=False).
-        2. Leave remaining messages in _delivered so that thread acks fired
-           later can still look them up and do Redis cleanup.
-        3. Register an atexit handler that drains hub._ready AFTER the pool
-           shuts down (executor.shutdown blocks until all threads finish).
-           At that point every ack callback is in _ready, and firing them
-           removes the index entry + message hash from Redis.
+        With pool="threads", acks are deferred via hub.call_soon() and may
+        not have fired when shutdown triggers restore. Drain those callbacks
+        first so already-completed tasks aren't unnecessarily requeued.
         """
         self._drain_hub_callbacks()
-        self._on_collect.cancel()  # type: ignore[attr-defined]  # from base QoS
-        self._flush()  # type: ignore[attr-defined]  # from base QoS
-        stderr = sys.stderr if stderr is None else stderr
-        state = self._delivered
-
-        if not self.restore_at_shutdown or not self.channel.do_restore:
-            return
-        if getattr(state, "restored", None):
-            return
-        try:
-            if state:
-                atexit.register(self._post_pool_cleanup)
-        finally:
-            state.restored = True  # type: ignore[union-attr]  # OrderedDict with dynamic attr
-
-    def _post_pool_cleanup(self) -> None:
-        """Drain ack callbacks after the thread pool has shut down.
-
-        By the time atexit fires, the Pool bootstep has called
-        executor.shutdown() — all threads are done and their ack callbacks
-        sit in hub._ready.  Firing them calls qos.ack() which finds the
-        delivery tag still in _delivered and runs _remove_from_indices
-        (atomic ZREM index + DEL hash).  The Redis client auto-reconnects
-        if the channel's connections were closed earlier.
-        """
-        try:
-            hub = self.channel.connection.cycle._loop
-        except AttributeError:
-            hub = None
-        if hub is not None:
-            for _ in range(10):
-                ready = hub._pop_ready()
-                if not ready:
-                    break
-                for cb in ready:
-                    with suppress(Exception):
-                        cb()
-        if self._delivered:
-            self._delivered.clear()
+        super().restore_unacked_once(stderr)
 
     def _drain_hub_callbacks(self) -> None:
         """Execute pending hub callbacks to flush deferred acks.
