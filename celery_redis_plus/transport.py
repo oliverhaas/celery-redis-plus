@@ -141,6 +141,7 @@ _PACKAGE_DIR = Path(__file__).parent
 _ENQUEUE_DUE_MESSAGES_LUA = (_PACKAGE_DIR / "transport_enqueue_due_messages.lua").read_text()
 _REQUEUE_MESSAGE_LUA = (_PACKAGE_DIR / "transport_requeue_message.lua").read_text()
 _CONSUME_MESSAGE_LUA = (_PACKAGE_DIR / "transport_consume_message.lua").read_text()
+_ACK_MESSAGE_LUA = (_PACKAGE_DIR / "transport_ack_message.lua").read_text()
 
 
 _warned_priority_clamp = False
@@ -341,9 +342,9 @@ class QoS(virtual.QoS):
         # Fanout messages don't need Redis cleanup (no consumer groups)
         if delivery_tag in self._fanout_tags:
             self._fanout_tags.discard(delivery_tag)
-        else:
-            # Regular sorted set message
-            self._remove_from_indices(delivery_tag).execute()
+        elif self._delivered is not None and delivery_tag in self._delivered:
+            # Regular sorted set message — atomic Lua removes index entry + hash
+            self._remove_from_indices(delivery_tag)
         super().ack(delivery_tag)
 
     def reject(self, delivery_tag: str, requeue: bool = False) -> None:
@@ -351,29 +352,32 @@ class QoS(virtual.QoS):
         if delivery_tag in self._fanout_tags:
             self._fanout_tags.discard(delivery_tag)
             super().ack(delivery_tag)
+        elif self._delivered is None or delivery_tag not in self._delivered:
+            # Already restored/flushed (e.g., during shutdown cleanup)
+            super().ack(delivery_tag)
         else:
             # Regular sorted set message
             if requeue:
-                queue = cast("dict", self._delivered)[delivery_tag].delivery_info["routing_key"]
+                queue = self._delivered[delivery_tag].delivery_info["routing_key"]
                 self.requeue_by_tag(delivery_tag, queue=queue, leftmost=True)
             else:
-                self._remove_from_indices(delivery_tag).execute()
+                self._remove_from_indices(delivery_tag)
             super().ack(delivery_tag)
 
-    @contextmanager
-    def pipe_or_acquire(self, pipe: Any = None, client: Any = None) -> Generator[Any]:
-        if pipe:
-            yield pipe
-        else:
-            with self.channel.conn_or_acquire(client) as client:
-                yield client.pipeline()
+    def _remove_from_indices(self, delivery_tag: str) -> None:
+        """Atomically remove message from index and delete its hash.
 
-    def _remove_from_indices(self, delivery_tag: str, pipe: Any = None) -> Any:
-        message_key = self.channel._message_key(delivery_tag)
+        Uses a Lua script so that a connection drop cannot leave an orphaned
+        message hash (ZREM succeeds but DEL doesn't) or an orphaned index
+        entry (DEL succeeds but ZREM doesn't).
+        """
         queue = cast("dict", self._delivered)[delivery_tag].delivery_info["routing_key"]
-        index_key = self.channel._messages_index_key(queue)
-        with self.pipe_or_acquire(pipe) as pipe:
-            return pipe.zrem(index_key, delivery_tag).delete(message_key)
+        # Prefix keys since EVALSHA doesn't auto-prefix
+        index_key = f"{self.channel.global_keyprefix}{self.channel._messages_index_key(queue)}"
+        message_key = f"{self.channel.global_keyprefix}{self.channel._message_key(delivery_tag)}"
+        with self.channel.conn_or_acquire() as client:
+            ack_script = client.register_script(_ACK_MESSAGE_LUA)
+            ack_script(keys=[index_key, message_key], args=[delivery_tag])
 
     def maybe_update_messages_index(self) -> None:
         """Update scores of delivered messages to now + visibility_timeout.
@@ -837,7 +841,12 @@ class Channel(virtual.Channel):
             client.zrem(self._messages_index_key(queue), delivery_tag)
 
     def _drain_expired_and_deliver(self, queue: str) -> bool:
-        """Pop messages from queue until one with a valid hash is found.
+        """Atomically pop, refresh index, and deliver from a single queue.
+
+        Uses the consume Lua script which handles expired message hashes
+        internally (cleans up index, tries next message, up to 100 attempts).
+        This ensures the messages_index score is refreshed for visibility
+        timeout tracking on the delivered message.
 
         Used after BZMPOP returns an expired message to avoid going back to
         blocking when there are still deliverable messages in the queue.
@@ -845,19 +854,24 @@ class Channel(virtual.Channel):
         Returns:
             True if a message was delivered, raises Empty otherwise.
         """
-        queue_key = self._queue_key(queue)
-        while True:
-            result = self.client.zpopmin(queue_key, count=1)
-            if not result:
-                raise Empty
-            delivery_tag, _score = result[0]
-            delivery_tag = bytes_to_str(delivery_tag)
-            message_key = self._message_key(delivery_tag)
-            message = self._get_message_from_hash(message_key, self.client)
-            if message:
-                self.connection._deliver(message, queue)
-                return True
-            self._cleanup_expired_message(queue, delivery_tag, self.client)
+        consume_script = self.client.register_script(_CONSUME_MESSAGE_LUA)
+        queue_key = f"{self.global_keyprefix}{self._queue_key(queue)}"
+        new_queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
+        result = consume_script(
+            keys=[queue_key],
+            args=[
+                self.global_keyprefix,
+                self.message_key_prefix,
+                str(new_queue_at),
+                MESSAGES_INDEX_PREFIX,
+                queue,
+            ],
+        )
+        if not result:
+            raise Empty
+        _, message = self._parse_consume_result(result)
+        self.connection._deliver(message, queue)
+        return True
 
     def _restore(self, message: Any, leftmost: bool = False) -> None:
         """Restore a message to its queue.
@@ -1039,8 +1053,10 @@ class Channel(virtual.Channel):
                     return True
                 # Message hash expired (x-message-ttl) — clean up index
                 self._cleanup_expired_message(dest, delivery_tag, self.client)
-                # Try remaining messages synchronously via zpopmin
-                return self._drain_expired_and_deliver(dest)
+                # Try remaining messages atomically via consume Lua script
+                self._drain_expired_and_deliver(dest)
+                self._consume_fast_mode = True  # Switch back to FAST
+                return True
             raise Empty
         finally:
             self._in_poll = None

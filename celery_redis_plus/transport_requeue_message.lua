@@ -46,10 +46,12 @@ else
 end
 
 -- Add to queue (routing_key with global prefix and queue: prefix)
+-- NX: only add if not already in queue. If enqueue_due_messages already
+-- re-enqueued after VT expiry, leave the existing entry undisturbed.
 local queue_key = global_keyprefix .. queue_key_prefix .. routing_key
 -- Extract delivery tag by stripping the known prefix (global_keyprefix + message_key_prefix)
 local tag = string.sub(message_key, #global_keyprefix + #message_key_prefix + 1)
-redis.call('ZADD', queue_key, score, tag)
+redis.call('ZADD', queue_key, 'NX', score, tag)
 
 -- Update messages_index with new queue_at (now + visibility_timeout)
 local index_key = global_keyprefix .. messages_index_prefix .. routing_key

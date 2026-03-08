@@ -1309,7 +1309,7 @@ class TestChannel:
             channel._get("my_queue")
 
     def test_bzmpop_read_drains_expired_messages(self, global_keyprefix: str) -> None:
-        """Test that _slow_consume_read falls back to zpopmin after expired BZMPOP result."""
+        """Test that _slow_consume_read falls back to consume Lua after expired BZMPOP result."""
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.global_keyprefix = global_keyprefix
@@ -1334,14 +1334,17 @@ class TestChannel:
         mock_client.pipeline.return_value.__enter__ = MagicMock(return_value=mock_pipe)
         mock_client.pipeline.return_value.__exit__ = MagicMock(return_value=False)
 
-        # zpopmin in _drain_expired_and_deliver returns valid message
-        mock_client.zpopmin.return_value = [(b"valid_tag", 2.0)]
-        mock_client.hmget.return_value = [b'{"body": "test"}', b"0"]
+        # _drain_expired_and_deliver uses consume Lua script via register_script
+        mock_script = MagicMock()
+        mock_script.return_value = [b"my_queue", b"valid_tag", b'{"body": "test"}', b"0"]
+        mock_client.register_script.return_value = mock_script
 
         result = channel._bzmpop_read()
 
         assert result is True
         mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
+        # After draining, should switch back to FAST mode
+        assert channel._consume_fast_mode is True
 
     def test_cleanup_expired_message(self, global_keyprefix: str) -> None:
         """Test that _cleanup_expired_message removes the messages_index entry."""
@@ -1454,14 +1457,11 @@ class TestQoS:
         qos._dirty = set()
         qos._quick_ack = MagicMock()
 
-        mock_pipe = MagicMock()
-        mock_pipe.zrem.return_value = mock_pipe
-        qos._remove_from_indices = MagicMock(return_value=mock_pipe)
+        qos._remove_from_indices = MagicMock()
 
         qos.ack("tag1")
 
         qos._remove_from_indices.assert_called_once_with("tag1")
-        mock_pipe.execute.assert_called_once()
 
     def test_reject_fanout_message(self) -> None:
         """Test reject for fanout message (requeue not supported)."""
@@ -1501,14 +1501,11 @@ class TestQoS:
         qos._dirty = set()
         qos._quick_ack = MagicMock()
 
-        mock_pipe = MagicMock()
-        mock_pipe.zrem.return_value = mock_pipe
-        qos._remove_from_indices = MagicMock(return_value=mock_pipe)
+        qos._remove_from_indices = MagicMock()
 
         qos.reject("tag1", requeue=False)
 
         qos._remove_from_indices.assert_called_once_with("tag1")
-        mock_pipe.execute.assert_called_once()
 
     def test_maybe_update_messages_index_empty_delivered(self) -> None:
         """Test maybe_update_messages_index returns early when no delivered messages."""
@@ -1553,34 +1550,6 @@ class TestQoS:
         assert mock_pipe.zadd.call_count == 2
         zadd_calls = [call[0][0] for call in mock_pipe.zadd.call_args_list]
         assert f"{MESSAGES_INDEX_PREFIX}celery" in zadd_calls
-
-    def test_pipe_or_acquire_with_existing_pipe(self) -> None:
-        """Test pipe_or_acquire returns existing pipe when provided."""
-        qos = object.__new__(QoS)
-
-        mock_pipe = MagicMock()
-
-        with qos.pipe_or_acquire(pipe=mock_pipe) as pipe:
-            assert pipe is mock_pipe
-
-    def test_pipe_or_acquire_creates_new_pipe(self) -> None:
-        """Test pipe_or_acquire creates new pipe when none provided."""
-        qos = object.__new__(QoS)
-
-        mock_pipe = MagicMock()
-        mock_client = MagicMock()
-        mock_client.pipeline.return_value = mock_pipe
-
-        mock_conn_context = MagicMock()
-        mock_conn_context.__enter__ = MagicMock(return_value=mock_client)
-        mock_conn_context.__exit__ = MagicMock(return_value=False)
-
-        mock_channel = MagicMock()
-        mock_channel.conn_or_acquire.return_value = mock_conn_context
-        qos.channel = mock_channel
-
-        with qos.pipe_or_acquire() as pipe:
-            assert pipe is mock_pipe
 
 
 @pytest.mark.unit
