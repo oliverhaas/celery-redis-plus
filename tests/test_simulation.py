@@ -14,9 +14,10 @@ Configure via environment variables:
     SIM_NUM_WORKERS=4           Number of concurrent workers (default 4)
     SIM_TASKS_PER_BATCH=10000   Tasks per batch (default 10000)
     SIM_NUM_BATCHES=1           Number of batches (default 1)
-    SIM_RESTART_INTERVAL=60     Seconds between worker restarts (default 60)
+    SIM_RESTART_INTERVAL=10     Seconds between worker restarts (default 10)
     SIM_HARD_CRASH_RATIO=0.3    Fraction of restarts that simulate hard crash
-    SIM_VISIBILITY_TIMEOUT=10   Visibility timeout in seconds
+    SIM_VISIBILITY_TIMEOUT=30   Visibility timeout in seconds (production: 300)
+    SIM_REQUEUE_CHECK_INTERVAL=6 Requeue check interval in seconds (production: 60)
 
 Quick smoke test:
     SIM_TASKS_PER_BATCH=100 uv run pytest -m manual tests/test_simulation.py -v -s -k redis
@@ -36,15 +37,19 @@ import pytest
 from celery import Celery
 from celery.contrib.testing.worker import start_worker
 
+import celery_redis_plus.constants
+import celery_redis_plus.transport
 from celery_redis_plus.transport import Channel, client_lib
 
 # --- Configuration via environment variables ---
+# Defaults are ~10x compressed from production (VT=300, RCI=60)
 SIM_NUM_WORKERS = int(os.environ.get("SIM_NUM_WORKERS", "4"))
 SIM_TASKS_PER_BATCH = int(os.environ.get("SIM_TASKS_PER_BATCH", "10000"))
 SIM_NUM_BATCHES = int(os.environ.get("SIM_NUM_BATCHES", "1"))
-SIM_RESTART_INTERVAL = int(os.environ.get("SIM_RESTART_INTERVAL", "60"))
+SIM_RESTART_INTERVAL = int(os.environ.get("SIM_RESTART_INTERVAL", "10"))
 SIM_HARD_CRASH_RATIO = float(os.environ.get("SIM_HARD_CRASH_RATIO", "0.3"))
-SIM_VISIBILITY_TIMEOUT = int(os.environ.get("SIM_VISIBILITY_TIMEOUT", "120"))
+SIM_VISIBILITY_TIMEOUT = int(os.environ.get("SIM_VISIBILITY_TIMEOUT", "30"))
+SIM_REQUEUE_CHECK_INTERVAL = int(os.environ.get("SIM_REQUEUE_CHECK_INTERVAL", "6"))
 
 LEDGER_DB = 2
 
@@ -82,19 +87,19 @@ def _register_tasks(app: Celery, host: str, port: int) -> dict[str, Any]:
 
     @app.task(name="sim.normal")
     def normal_task(task_uuid: str) -> str:
-        time.sleep(random.uniform(0.5, 2.0))
+        time.sleep(random.uniform(0.01, 0.2))
         _record_execution(host, port, task_uuid)
         return task_uuid
 
     @app.task(name="sim.delayed")
     def delayed_task(task_uuid: str) -> str:
-        time.sleep(random.uniform(0.5, 2.0))
+        time.sleep(random.uniform(0.01, 0.2))
         _record_execution(host, port, task_uuid)
         return task_uuid
 
     @app.task(name="sim.slow")
     def slow_task(task_uuid: str) -> str:
-        time.sleep(random.uniform(10.0, 30.0))
+        time.sleep(random.uniform(1.0, 5.0))
         _record_execution(host, port, task_uuid)
         return task_uuid
 
@@ -125,6 +130,10 @@ def _worker_process_main(
     set, ``Channel.do_restore`` is disabled so unacked messages remain in
     ``messages_index`` for visibility-timeout recovery.
     """
+    # Patch RCI for this worker process (overrides conftest's patch of 2s)
+    celery_redis_plus.constants.DEFAULT_REQUEUE_CHECK_INTERVAL = SIM_REQUEUE_CHECK_INTERVAL  # type: ignore[misc]
+    celery_redis_plus.transport.DEFAULT_REQUEUE_CHECK_INTERVAL = SIM_REQUEUE_CHECK_INTERVAL  # type: ignore[misc]
+
     app = _make_sim_app(host, port)
     _register_tasks(app, host, port)
 
@@ -251,7 +260,7 @@ def _submit_batch(
 ) -> list[tuple[str, str]]:
     """Submit a batch of tasks. Returns list of (uuid, type) tuples.
 
-    Distribution: 70% normal, 25% delayed (countdown 3-10s), 5% slow.
+    Distribution: 70% normal, 25% delayed (countdown 7-15s), 5% slow.
     """
     submitted: list[tuple[str, str]] = []
     for _ in range(count):
@@ -261,7 +270,7 @@ def _submit_batch(
             tasks["normal"].delay(task_uuid)
             submitted.append((task_uuid, "normal"))
         elif roll < 0.95:
-            countdown = random.uniform(3.0, 10.0)
+            countdown = random.uniform(7.0, 15.0)
             tasks["delayed"].apply_async(args=(task_uuid,), countdown=countdown)
             submitted.append((task_uuid, "delayed"))
         else:
@@ -403,6 +412,10 @@ class TestProductionSimulation:
         host, port, _image = redis_container
         redis_client.flushall()
 
+        # Patch RCI in main process (overrides conftest's patch of 2s)
+        celery_redis_plus.constants.DEFAULT_REQUEUE_CHECK_INTERVAL = SIM_REQUEUE_CHECK_INTERVAL  # type: ignore[misc]
+        celery_redis_plus.transport.DEFAULT_REQUEUE_CHECK_INTERVAL = SIM_REQUEUE_CHECK_INTERVAL  # type: ignore[misc]
+
         # Main-process app used only for submitting tasks
         app = _make_sim_app(host, port)
         tasks = _register_tasks(app, host, port)
@@ -411,9 +424,9 @@ class TestProductionSimulation:
         ledger.flushdb()
 
         # Estimate batch timeout:
-        # weighted avg task time * count / workers * 2x safety + VT recovery
-        avg_task_time = 0.70 * 1.25 + 0.25 * 1.25 + 0.05 * 20  # ~2.19s
-        batch_timeout = avg_task_time * SIM_TASKS_PER_BATCH / SIM_NUM_WORKERS * 2 + SIM_VISIBILITY_TIMEOUT * 5
+        # weighted avg task time * count / workers * 2x safety + VT + delayed countdown
+        avg_task_time = 0.70 * 0.1 + 0.25 * 0.1 + 0.05 * 3  # ~0.25s
+        batch_timeout = avg_task_time * SIM_TASKS_PER_BATCH / SIM_NUM_WORKERS * 2 + SIM_VISIBILITY_TIMEOUT * 3 + 15
 
         print(f"\n{'=' * 60}")
         print("  PRODUCTION SIMULATION")
@@ -422,6 +435,7 @@ class TestProductionSimulation:
         print(f"  Restart interval: ~{SIM_RESTART_INTERVAL}s")
         print(f"  Hard crash ratio: {SIM_HARD_CRASH_RATIO}")
         print(f"  Visibility timeout: {SIM_VISIBILITY_TIMEOUT}s")
+        print(f"  Requeue check interval: {SIM_REQUEUE_CHECK_INTERVAL}s")
         print(f"  Batch timeout: {batch_timeout:.0f}s")
         print(f"{'=' * 60}")
 
