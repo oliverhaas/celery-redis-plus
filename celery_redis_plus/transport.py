@@ -388,7 +388,7 @@ class QoS(virtual.QoS):
         if not self._delivered:
             return
         try:
-            queue_at = time() + self.visibility_timeout
+            queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
             with self.channel.conn_or_acquire() as client, client.pipeline() as pipe:
                 for tag, message in self._delivered.items():
                     # Skip fanout messages (they don't use the index)
@@ -929,7 +929,7 @@ class Channel(virtual.Channel):
             # FAST mode: send non-blocking EVALSHA (atomic ZPOPMIN + ZADD + HMGET)
             sha = self._ensure_consume_script_sha()
             keys = [f"{self.global_keyprefix}{self._queue_key(q)}" for q in self._queue_cycle]
-            new_queue_at = time() + self.visibility_timeout
+            new_queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
             args = [
                 self.global_keyprefix,
                 self.message_key_prefix,
@@ -1021,7 +1021,7 @@ class Channel(virtual.Channel):
                 # Pipeline ZADD (refresh index) + HMGET (fetch message)
                 index_key = self._messages_index_key(dest)
                 message_key = self._message_key(delivery_tag)
-                new_queue_at = time() + self.visibility_timeout
+                new_queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
                 with self.client.pipeline(transaction=False) as pipe:
                     pipe.zadd(index_key, {delivery_tag: new_queue_at}, xx=True)
                     pipe.hmget(message_key, "payload", "restore_count")
@@ -1171,7 +1171,7 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             consume_script = client.register_script(_CONSUME_MESSAGE_LUA)
             queue_key = f"{self.global_keyprefix}{self._queue_key(queue)}"
-            new_queue_at = time() + self.visibility_timeout
+            new_queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
             result = consume_script(
                 keys=[queue_key],
                 args=[
@@ -1225,7 +1225,7 @@ class Channel(virtual.Channel):
                         args=[
                             threshold,
                             DEFAULT_REQUEUE_BATCH_LIMIT,
-                            self.visibility_timeout,
+                            self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL,
                             PRIORITY_SCORE_MULTIPLIER,
                             self.message_key_prefix,
                             self.global_keyprefix,
@@ -1293,7 +1293,7 @@ class Channel(virtual.Channel):
                     self.global_keyprefix,
                     QUEUE_KEY_PREFIX,
                     self.message_key_prefix,
-                    self.visibility_timeout,
+                    self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL,
                     MESSAGES_INDEX_PREFIX,
                 ],
             )
@@ -1306,7 +1306,7 @@ class Channel(virtual.Channel):
         and timestamp. Native delayed messages (delay > requeue check interval) go
         only to messages_index and are moved to the queue when due.
         The messages_index tracks when to attempt (re)queue if the message is not
-        acknowledged (queue_at = eta for delayed, now + visibility_timeout for immediate).
+        acknowledged (queue_at = eta for delayed, now + VT + RCI for immediate).
 
         Args:
             queue: Target queue name.
@@ -1331,8 +1331,11 @@ class Channel(virtual.Channel):
 
         # queue_at: when to check if this message needs (re)queuing
         # For native delayed messages: queue_at = eta (requeue mechanism delivers at eta)
-        # For immediate messages: queue_at = now + visibility_timeout (requeue if not acked)
-        queue_at = eta_timestamp if is_native_delayed else now + self.visibility_timeout
+        # For immediate messages: queue_at = now + VT + RCI (requeue if not acked;
+        #   +RCI compensates for the look-ahead threshold in enqueue_due_messages)
+        queue_at = (
+            eta_timestamp if is_native_delayed else now + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
+        )
 
         message_key = self._message_key(delivery_tag)
 
