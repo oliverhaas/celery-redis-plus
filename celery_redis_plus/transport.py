@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 
 import logging
 
+from celery.signals import worker_ready, worker_shutdown
 from kombu.exceptions import InconsistencyError, VersionMismatch
 from kombu.transport import virtual
 from kombu.transport.base import to_rabbitmq_queue_arguments  # type: ignore[attr-defined]
@@ -145,6 +146,38 @@ _ACK_MESSAGE_LUA = (_PACKAGE_DIR / "transport_ack_message.lua").read_text()
 
 
 _warned_priority_clamp = False
+
+# Reference to the worker's thread pool, captured via signal so that
+# restore_unacked_once can wait for threads to finish before restoring.
+_worker_pool: Any = None
+
+
+def _set_worker_pool(pool: Any) -> None:
+    global _worker_pool  # noqa: PLW0603
+    _worker_pool = pool
+
+
+@worker_ready.connect
+def _on_worker_ready(sender: Any, **kwargs: Any) -> None:
+    _set_worker_pool(sender.pool)
+
+
+@worker_shutdown.connect
+def _on_worker_shutdown(sender: Any, **kwargs: Any) -> None:
+    _set_worker_pool(None)
+
+
+# Celery's start_worker test helper uses TestWorkController which fires
+# test_worker_started instead of worker_ready.  Handle both so the
+# executor-wait logic works in integration tests too.
+try:
+    from celery.contrib.testing.worker import test_worker_started
+
+    @test_worker_started.connect
+    def _on_test_worker_started(sender: Any, worker: Any, **kwargs: Any) -> None:
+        _set_worker_pool(worker.pool)
+except ImportError:  # pragma: no cover
+    pass
 
 
 def _queue_score(priority: int, timestamp: float | None = None) -> float:
@@ -380,13 +413,26 @@ class QoS(virtual.QoS):
             ack_script(keys=[index_key, message_key], args=[delivery_tag])
 
     def restore_unacked_once(self, stderr: Any = None) -> None:
-        """Restore unacked messages, draining pending acks first.
+        """Restore unacked messages, waiting for threads and draining acks.
 
-        With pool="threads", acks are deferred via hub.call_soon() and may
-        not have fired when shutdown triggers restore. Drain those callbacks
-        first so already-completed tasks aren't unnecessarily requeued.
+        Celery's shutdown order fires restore_unacked_once (during Consumer
+        close) BEFORE Pool.on_stop() waits for threads.  By calling
+        executor.shutdown(wait=True) here first, all threads complete and
+        their ack callbacks land in hub._ready.  The second drain catches
+        them, so only truly unfinished messages get restored.
+        executor.shutdown() is idempotent — Pool.on_stop()'s later call
+        is a no-op.
         """
         self._drain_hub_callbacks()
+
+        if (
+            (pool := _worker_pool) is not None
+            and (executor := getattr(pool, "executor", None)) is not None
+            and hasattr(executor, "shutdown")
+        ):
+            executor.shutdown(wait=True)
+            self._drain_hub_callbacks()
+
         super().restore_unacked_once(stderr)
 
     def _drain_hub_callbacks(self) -> None:

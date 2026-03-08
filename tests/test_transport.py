@@ -1630,8 +1630,10 @@ class TestQoS:
         callback_fail.assert_called_once()
         callback_ok.assert_called_once()
 
-    def test_restore_unacked_once_drains_before_restore(self) -> None:
-        """Test that restore_unacked_once drains hub callbacks then delegates."""
+    def test_restore_unacked_once_waits_for_pool(self) -> None:
+        """Test that restore drains, waits for executor, drains again, then restores."""
+        import celery_redis_plus.transport as transport_mod
+
         qos = object.__new__(QoS)
         qos._fanout_tags = set()
         qos._dirty = set()
@@ -1647,17 +1649,69 @@ class TestQoS:
 
         qos._drain_hub_callbacks = MagicMock()
 
-        # Track call order to verify drain happens before super().restore
         call_order: list[str] = []
         qos._drain_hub_callbacks.side_effect = lambda: call_order.append("drain")
 
-        with patch.object(
-            QoS.__bases__[0],
-            "restore_unacked_once",
-            side_effect=lambda _self, _stderr=None: call_order.append("super_restore"),
-        ):
-            qos.restore_unacked_once()
+        mock_executor = MagicMock()
+        mock_executor.shutdown.side_effect = lambda **_kw: call_order.append("shutdown")
 
+        mock_pool = MagicMock(spec=["executor"])
+        mock_pool.executor = mock_executor
+
+        old_pool = transport_mod._worker_pool
+        transport_mod._worker_pool = mock_pool
+        try:
+            with patch.object(
+                QoS.__bases__[0],
+                "restore_unacked_once",
+                side_effect=lambda _self, _stderr=None: call_order.append(
+                    "super_restore",
+                ),
+            ):
+                qos.restore_unacked_once()
+        finally:
+            transport_mod._worker_pool = old_pool
+
+        assert call_order == ["drain", "shutdown", "drain", "super_restore"]
+        mock_executor.shutdown.assert_called_once_with(wait=True)
+
+    def test_restore_unacked_once_no_pool_fallback(self) -> None:
+        """Test that without a pool reference, single drain + super is used."""
+        import celery_redis_plus.transport as transport_mod
+
+        qos = object.__new__(QoS)
+        qos._fanout_tags = set()
+        qos._dirty = set()
+        qos._delivered = OrderedDict()
+        qos._delivered.restored = False  # type: ignore[attr-defined]
+        qos._delivered["tag1"] = MagicMock()
+        qos.restore_at_shutdown = True
+        qos._on_collect = MagicMock()
+
+        mock_channel = MagicMock()
+        mock_channel.do_restore = True
+        qos.channel = mock_channel
+
+        qos._drain_hub_callbacks = MagicMock()
+
+        call_order: list[str] = []
+        qos._drain_hub_callbacks.side_effect = lambda: call_order.append("drain")
+
+        old_pool = transport_mod._worker_pool
+        transport_mod._worker_pool = None
+        try:
+            with patch.object(
+                QoS.__bases__[0],
+                "restore_unacked_once",
+                side_effect=lambda _self, _stderr=None: call_order.append(
+                    "super_restore",
+                ),
+            ):
+                qos.restore_unacked_once()
+        finally:
+            transport_mod._worker_pool = old_pool
+
+        # Only one drain (no executor wait), then super restore
         assert call_order == ["drain", "super_restore"]
 
 
