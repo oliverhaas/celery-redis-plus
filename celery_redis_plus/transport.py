@@ -147,24 +147,20 @@ _ACK_MESSAGE_LUA = (_PACKAGE_DIR / "transport_ack_message.lua").read_text()
 
 _warned_priority_clamp = False
 
-# Reference to the worker's thread pool, captured via signal so that
-# restore_unacked_once can wait for threads to finish before restoring.
-_worker_pool: Any = None
-
-
-def _set_worker_pool(pool: Any) -> None:
-    global _worker_pool  # noqa: PLW0603
-    _worker_pool = pool
+# Per-app worker pool references, keyed by id(app).
+# Allows multiple Celery apps in the same process (tests, publisher+consumer)
+# without interfering with each other's executor-wait logic.
+_worker_pools: dict[int, Any] = {}
 
 
 @worker_ready.connect
 def _on_worker_ready(sender: Any, **kwargs: Any) -> None:
-    _set_worker_pool(sender.pool)
+    _worker_pools[id(sender.app)] = sender.pool
 
 
 @worker_shutdown.connect
 def _on_worker_shutdown(sender: Any, **kwargs: Any) -> None:
-    _set_worker_pool(None)
+    _worker_pools.pop(id(sender.app), None)
 
 
 # Celery's start_worker test helper uses TestWorkController which fires
@@ -175,9 +171,25 @@ try:
 
     @test_worker_started.connect
     def _on_test_worker_started(sender: Any, worker: Any, **kwargs: Any) -> None:
-        _set_worker_pool(worker.pool)
+        _worker_pools[id(worker.app)] = worker.pool
 except ImportError:  # pragma: no cover
     pass
+
+
+def _get_worker_pool_for_channel(channel: Channel) -> Any:
+    """Look up the worker pool for the Celery app that owns this channel.
+
+    Returns the pool if found, None otherwise.
+    """
+    try:
+        app = channel.connection.client.app  # type: ignore[union-attr]
+        return _worker_pools.get(id(app))
+    except AttributeError:
+        # Fallback for non-Celery usage or when the connection chain is broken.
+        # If there's exactly one pool registered, use it (single-app case).
+        if len(_worker_pools) == 1:
+            return next(iter(_worker_pools.values()))
+        return None
 
 
 def _queue_score(priority: int, timestamp: float | None = None) -> float:
@@ -426,7 +438,7 @@ class QoS(virtual.QoS):
         self._drain_hub_callbacks()
 
         if (
-            (pool := _worker_pool) is not None
+            (pool := _get_worker_pool_for_channel(self.channel)) is not None
             and (executor := getattr(pool, "executor", None)) is not None
             and hasattr(executor, "shutdown")
         ):
@@ -885,28 +897,6 @@ class Channel(virtual.Channel):
     def _messages_index_key(self, queue: str) -> str:
         """Get the Redis key for a queue's messages index sorted set."""
         return f"{MESSAGES_INDEX_PREFIX}{queue}"
-
-    def _get_message_from_hash(self, message_key: str, client: Any) -> dict[str, Any] | None:
-        """Fetch message payload from per-message hash.
-
-        Args:
-            message_key: The Redis key for the message hash.
-            client: Redis client to use.
-
-        Returns:
-            The message dict, or None if not found.
-        """
-        fields = client.hmget(message_key, "payload", "restore_count")
-        payload_json = fields[0]
-        if not payload_json:
-            return None
-        result: dict[str, Any] | None = loads(bytes_to_str(payload_json))
-        if result is not None:
-            restore_count = int(fields[1] or 0)
-            if restore_count > 0:
-                headers = result.setdefault("properties", {}).setdefault("headers", {})
-                headers["x-restore-count"] = restore_count
-        return result
 
     def _cleanup_expired_message(self, queue: str, delivery_tag: str, client: Any | None = None) -> None:
         """Remove messages_index entry for a message whose hash has expired."""

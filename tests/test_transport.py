@@ -1658,8 +1658,11 @@ class TestQoS:
         mock_pool = MagicMock(spec=["executor"])
         mock_pool.executor = mock_executor
 
-        old_pool = transport_mod._worker_pool
-        transport_mod._worker_pool = mock_pool
+        mock_app = MagicMock()
+        mock_channel.connection.client.app = mock_app
+
+        old_pools = transport_mod._worker_pools.copy()
+        transport_mod._worker_pools[id(mock_app)] = mock_pool
         try:
             with patch.object(
                 QoS.__bases__[0],
@@ -1670,7 +1673,8 @@ class TestQoS:
             ):
                 qos.restore_unacked_once()
         finally:
-            transport_mod._worker_pool = old_pool
+            transport_mod._worker_pools.clear()
+            transport_mod._worker_pools.update(old_pools)
 
         assert call_order == ["drain", "shutdown", "drain", "super_restore"]
         mock_executor.shutdown.assert_called_once_with(wait=True)
@@ -1697,8 +1701,8 @@ class TestQoS:
         call_order: list[str] = []
         qos._drain_hub_callbacks.side_effect = lambda: call_order.append("drain")
 
-        old_pool = transport_mod._worker_pool
-        transport_mod._worker_pool = None
+        old_pools = transport_mod._worker_pools.copy()
+        transport_mod._worker_pools.clear()
         try:
             with patch.object(
                 QoS.__bases__[0],
@@ -1709,10 +1713,141 @@ class TestQoS:
             ):
                 qos.restore_unacked_once()
         finally:
-            transport_mod._worker_pool = old_pool
+            transport_mod._worker_pools.clear()
+            transport_mod._worker_pools.update(old_pools)
 
         # Only one drain (no executor wait), then super restore
         assert call_order == ["drain", "super_restore"]
+
+    def test_restore_unacked_once_multi_app_isolation(self) -> None:
+        """Test that two concurrent apps don't interfere with each other's pool reference.
+
+        Simulates two Celery workers in the same process (e.g. tests, publisher+consumer).
+        Worker A shuts down → should NOT destroy Worker B's pool reference.
+        Worker B's restore should still find its own executor.
+        """
+        import celery_redis_plus.transport as transport_mod
+
+        # --- Simulate two workers starting ---
+        mock_app_a = MagicMock()
+        mock_app_b = MagicMock()
+
+        mock_executor_a = MagicMock()
+        mock_pool_a = MagicMock(spec=["executor"])
+        mock_pool_a.executor = mock_executor_a
+
+        mock_executor_b = MagicMock()
+        mock_pool_b = MagicMock(spec=["executor"])
+        mock_pool_b.executor = mock_executor_b
+
+        mock_worker_a = MagicMock()
+        mock_worker_a.app = mock_app_a
+        mock_worker_a.pool = mock_pool_a
+
+        mock_worker_b = MagicMock()
+        mock_worker_b.app = mock_app_b
+        mock_worker_b.pool = mock_pool_b
+
+        # Both workers start
+        transport_mod._on_worker_ready(sender=mock_worker_a)
+        transport_mod._on_worker_ready(sender=mock_worker_b)
+
+        # Worker A shuts down
+        transport_mod._on_worker_shutdown(sender=mock_worker_a)
+
+        # --- Worker B's QoS should still use executor_b ---
+        qos_b = object.__new__(QoS)
+        qos_b._fanout_tags = set()
+        qos_b._dirty = set()
+        qos_b._delivered = OrderedDict()
+        qos_b._delivered.restored = False  # type: ignore[attr-defined]
+        qos_b._delivered["tag1"] = MagicMock()
+        qos_b.restore_at_shutdown = True
+        qos_b._on_collect = MagicMock()
+
+        mock_channel_b = MagicMock()
+        mock_channel_b.do_restore = True
+        # Wire up so QoS can find its app
+        mock_channel_b.connection.client.app = mock_app_b
+        qos_b.channel = mock_channel_b
+
+        qos_b._drain_hub_callbacks = MagicMock()
+
+        call_order: list[str] = []
+        qos_b._drain_hub_callbacks.side_effect = lambda: call_order.append("drain")
+        mock_executor_b.shutdown.side_effect = lambda **_kw: call_order.append("shutdown")
+
+        try:
+            with patch.object(
+                QoS.__bases__[0],
+                "restore_unacked_once",
+                side_effect=lambda _self, _stderr=None: call_order.append(
+                    "super_restore",
+                ),
+            ):
+                qos_b.restore_unacked_once()
+        finally:
+            # Clean up global state
+            transport_mod._on_worker_shutdown(sender=mock_worker_b)
+
+        # Worker B should still have found its executor and waited
+        assert call_order == ["drain", "shutdown", "drain", "super_restore"]
+        mock_executor_b.shutdown.assert_called_once_with(wait=True)
+        # Worker A's executor should NOT have been called
+        mock_executor_a.shutdown.assert_not_called()
+
+    def test_restore_unacked_once_single_app_fallback(self) -> None:
+        """Test that pool lookup falls back to the only registered pool.
+
+        When using kombu directly (without Celery), the connection chain may
+        not have an .app attribute. If exactly one worker pool is registered,
+        use it as a safe fallback.
+        """
+        import celery_redis_plus.transport as transport_mod
+
+        qos = object.__new__(QoS)
+        qos._fanout_tags = set()
+        qos._dirty = set()
+        qos._delivered = OrderedDict()
+        qos._delivered.restored = False  # type: ignore[attr-defined]
+        qos._delivered["tag1"] = MagicMock()
+        qos.restore_at_shutdown = True
+        qos._on_collect = MagicMock()
+
+        mock_channel = MagicMock()
+        mock_channel.do_restore = True
+        # Simulate no .app attribute (pure kombu usage)
+        del mock_channel.connection.client.app
+        qos.channel = mock_channel
+
+        qos._drain_hub_callbacks = MagicMock()
+
+        call_order: list[str] = []
+        qos._drain_hub_callbacks.side_effect = lambda: call_order.append("drain")
+
+        mock_executor = MagicMock()
+        mock_executor.shutdown.side_effect = lambda **_kw: call_order.append("shutdown")
+
+        mock_pool = MagicMock(spec=["executor"])
+        mock_pool.executor = mock_executor
+
+        old_pools = transport_mod._worker_pools.copy()
+        transport_mod._worker_pools.clear()
+        transport_mod._worker_pools[42] = mock_pool  # Single entry, any key
+        try:
+            with patch.object(
+                QoS.__bases__[0],
+                "restore_unacked_once",
+                side_effect=lambda _self, _stderr=None: call_order.append(
+                    "super_restore",
+                ),
+            ):
+                qos.restore_unacked_once()
+        finally:
+            transport_mod._worker_pools.clear()
+            transport_mod._worker_pools.update(old_pools)
+
+        assert call_order == ["drain", "shutdown", "drain", "super_restore"]
 
 
 @pytest.mark.unit
@@ -4765,6 +4900,8 @@ class TestRestoreCount:
                 },
             }
 
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
             message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
             client.hset(
                 message_key,
@@ -4775,8 +4912,11 @@ class TestRestoreCount:
                     "restore_count": "3",
                 },
             )
+            # Add to queue so _get can consume it via Lua script
+            client.zadd(f"{QUEUE_KEY_PREFIX}celery", {delivery_tag: 1.0})
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() + 300})
 
-            message = channel._get_message_from_hash(message_key, client)
+            message = channel._get("celery")
             assert message is not None
             assert message["properties"]["headers"]["x-restore-count"] == 3
 
@@ -4799,6 +4939,8 @@ class TestRestoreCount:
                 },
             }
 
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
             message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
             client.hset(
                 message_key,
@@ -4809,8 +4951,11 @@ class TestRestoreCount:
                     "restore_count": "0",
                 },
             )
+            # Add to queue so _get can consume it via Lua script
+            client.zadd(f"{QUEUE_KEY_PREFIX}celery", {delivery_tag: 1.0})
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() + 300})
 
-            message = channel._get_message_from_hash(message_key, client)
+            message = channel._get("celery")
             assert message is not None
             assert "x-restore-count" not in message["properties"].get("headers", {})
 
