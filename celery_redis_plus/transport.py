@@ -40,6 +40,7 @@ from __future__ import annotations
 import functools
 import numbers
 import socket as socket_module
+import weakref
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from queue import Empty
@@ -147,20 +148,19 @@ _ACK_MESSAGE_LUA = (_PACKAGE_DIR / "transport_ack_message.lua").read_text()
 
 _warned_priority_clamp = False
 
-# Per-app worker pool references, keyed by id(app).
-# Allows multiple Celery apps in the same process (tests, publisher+consumer)
-# without interfering with each other's executor-wait logic.
-_worker_pools: dict[int, Any] = {}
+# Per-app worker pool references.  WeakKeyDictionary so entries auto-clean
+# when the Celery app is garbage-collected (no manual cleanup needed on crash).
+_worker_pools: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
 
 
 @worker_ready.connect
 def _on_worker_ready(sender: Any, **kwargs: Any) -> None:
-    _worker_pools[id(sender.app)] = sender.pool
+    _worker_pools[sender.app] = sender.pool
 
 
 @worker_shutdown.connect
 def _on_worker_shutdown(sender: Any, **kwargs: Any) -> None:
-    _worker_pools.pop(id(sender.app), None)
+    _worker_pools.pop(sender.app, None)
 
 
 # Celery's start_worker test helper uses TestWorkController which fires
@@ -171,7 +171,7 @@ try:
 
     @test_worker_started.connect
     def _on_test_worker_started(sender: Any, worker: Any, **kwargs: Any) -> None:
-        _worker_pools[id(worker.app)] = worker.pool
+        _worker_pools[worker.app] = worker.pool
 except ImportError:  # pragma: no cover
     pass
 
@@ -183,7 +183,7 @@ def _get_worker_pool_for_channel(channel: Channel) -> Any:
     """
     try:
         app = channel.connection.client.app  # type: ignore[union-attr]
-        return _worker_pools.get(id(app))
+        return _worker_pools.get(app)
     except AttributeError:
         # Fallback for non-Celery usage or when the connection chain is broken.
         # If there's exactly one pool registered, use it (single-app case).

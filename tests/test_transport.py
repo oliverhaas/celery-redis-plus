@@ -1662,7 +1662,7 @@ class TestQoS:
         mock_channel.connection.client.app = mock_app
 
         old_pools = transport_mod._worker_pools.copy()
-        transport_mod._worker_pools[id(mock_app)] = mock_pool
+        transport_mod._worker_pools[mock_app] = mock_pool
         try:
             with patch.object(
                 QoS.__bases__[0],
@@ -1833,7 +1833,8 @@ class TestQoS:
 
         old_pools = transport_mod._worker_pools.copy()
         transport_mod._worker_pools.clear()
-        transport_mod._worker_pools[42] = mock_pool  # Single entry, any key
+        dummy_app = MagicMock()
+        transport_mod._worker_pools[dummy_app] = mock_pool  # Single entry
         try:
             with patch.object(
                 QoS.__bases__[0],
