@@ -46,15 +46,15 @@ dev = [
   "celery-types-ng==0.25.6",
   "pre-commit==4.5.1",
   "pytest==9.0.2",
-  "pytest-cov==7.0.0",
+  "pytest-cov==7.1.0",
   "pytest-xdist>=3.8.0",
-  "redis[hiredis]==7.3.0",
-  "ruff==0.15.6",
+  "redis[hiredis]==7.4.0",
+  "ruff==0.15.7",
   "testcontainers==4.14.2",
-  "ty==0.0.23",
+  "ty==0.0.25",
   "valkey[libvalkey]==6.1.1",
 ]
-docs = ["mkdocs==1.6.1", "mkdocs-material==9.7.5", "mike==2.1.4"]
+docs = ["mkdocs==1.6.1", "mkdocs-material==9.7.6", "mike==2.1.4"]
 
 [build-system]
 requires = ["hatchling==1.29.0"]
