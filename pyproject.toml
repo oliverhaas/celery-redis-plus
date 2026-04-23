@@ -44,14 +44,14 @@ valkeys = "celery_redis_plus.transport:Transport"
 [dependency-groups]
 dev = [
   "celery-types-ng==0.25.6",
-  "pre-commit==4.5.1",
+  "pre-commit==4.6.0",
   "pytest==9.0.3",
   "pytest-cov==7.1.0",
   "pytest-xdist>=3.8.0",
   "redis[hiredis]==7.4.0",
-  "ruff==0.15.10",
+  "ruff==0.15.11",
   "testcontainers==4.14.2",
-  "ty==0.0.31",
+  "ty==0.0.32",
   "valkey[libvalkey]==6.1.1",
 ]
 docs = ["mkdocs==1.6.1", "mkdocs-material==9.7.6", "mike==2.2.0"]
