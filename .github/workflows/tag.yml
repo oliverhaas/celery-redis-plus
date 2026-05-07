@@ -1,21 +1,15 @@
-name: Tag
+name: Tag and Publish
 
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
+  push:
     branches: [main]
 
 jobs:
-  tag:
-    # Only run if CI succeeded and was triggered by push (not PR)
-    if: >
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push'
+  check-version:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: write
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.current }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -24,45 +18,83 @@ jobs:
       - name: Check version status
         id: version
         run: |
-          # Get current version
           CURRENT_VERSION=$(grep -m1 'version = ' pyproject.toml | cut -d'"' -f2)
           echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
 
-          # Check if version is already published on PyPI
           if curl -s "https://pypi.org/pypi/celery-redis-plus/$CURRENT_VERSION/json" | grep -q '"version"'; then
-            echo "on_pypi=true" >> $GITHUB_OUTPUT
-            echo "Version $CURRENT_VERSION already published on PyPI"
-          else
-            echo "on_pypi=false" >> $GITHUB_OUTPUT
-            echo "Version $CURRENT_VERSION not on PyPI"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "Version $CURRENT_VERSION already on PyPI — nothing to do"
+            exit 0
           fi
 
-          # Check if tag already exists (fetch tags first)
+          # Tag-exists is treated as "do nothing"; a broken tag must be deleted
+          # manually before a re-release. Auto-retrying on an existing tag is how
+          # we got stuck publishing the same broken commit repeatedly.
           git fetch --tags
           if git rev-parse "v$CURRENT_VERSION" >/dev/null 2>&1; then
-            echo "tag_exists=true" >> $GITHUB_OUTPUT
-            echo "Tag v$CURRENT_VERSION already exists"
-          else
-            echo "tag_exists=false" >> $GITHUB_OUTPUT
-            echo "Tag v$CURRENT_VERSION does not exist"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+            echo "Tag v$CURRENT_VERSION already exists — delete it manually to re-release"
+            exit 0
           fi
 
+          echo "should_release=true" >> $GITHUB_OUTPUT
+          echo "Will release v$CURRENT_VERSION after tests pass"
+
+  test:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run ruff check
+        run: uv run ruff check
+
+      - name: Run ruff format check
+        run: uv run ruff format --check
+
+      - name: Run ty check
+        run: uv run ty check celery_redis_plus/
+
+      - name: Run tests
+        run: uv run pytest -n auto
+
+  tag-and-trigger:
+    needs: [check-version, test]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
       - name: Create and push tag
-        if: steps.version.outputs.on_pypi == 'false' && steps.version.outputs.tag_exists == 'false'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "v${{ steps.version.outputs.current }}"
-          git push origin "v${{ steps.version.outputs.current }}"
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
 
+      # GITHUB_TOKEN-pushed tags don't trigger downstream workflows — explicit
+      # dispatch is required.
       - name: Trigger publish workflow
-        if: steps.version.outputs.on_pypi == 'false'
-        run: gh workflow run publish.yml -f version=${{ steps.version.outputs.current }} -R ${{ github.repository }}
+        run: gh workflow run publish.yml -f version=$VERSION -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Trigger docs workflow for new tag
-        if: steps.version.outputs.on_pypi == 'false' && steps.version.outputs.tag_exists == 'false'
-        run: gh workflow run docs.yml --ref "v${{ steps.version.outputs.current }}" -R ${{ github.repository }}
+        run: gh workflow run docs.yml --ref "v$VERSION" -R ${{ github.repository }}
         env:
           GH_TOKEN: ${{ github.token }}
