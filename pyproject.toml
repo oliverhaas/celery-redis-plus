@@ -49,9 +49,9 @@ dev = [
   "pytest-cov==7.1.0",
   "pytest-xdist>=3.8.0",
   "redis[hiredis]==7.4.0",
-  "ruff==0.15.13",
+  "ruff==0.15.14",
   "testcontainers==4.14.2",
-  "ty==0.0.35",
+  "ty==0.0.38",
   "valkey[libvalkey]==6.1.1",
 ]
 docs = ["mkdocs==1.6.1", "mkdocs-material==9.7.6", "mike==2.2.0"]
