@@ -885,7 +885,8 @@ class Channel(virtual.Channel):
         """
         return f"{QUEUE_KEY_PREFIX}{queue}"
 
-    def _queue_name(self, queue_key: str) -> str:
+    @staticmethod
+    def _queue_name(queue_key: str) -> str:
         """Extract logical queue name from a Redis queue key.
 
         Strips the 'queue:' prefix if present.
@@ -1579,10 +1580,10 @@ class Channel(virtual.Channel):
             return size
 
     def close(self) -> None:
-        if self._in_poll:
+        if self._in_poll is not None:
             with suppress(Empty, *_connection_errors):
                 self._bzmpop_read()
-        if self._in_fanout_poll:
+        if self._in_fanout_poll is not None:
             with suppress(Empty, *_connection_errors):
                 self._xread_read()
         if not self.closed:

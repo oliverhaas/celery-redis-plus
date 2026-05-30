@@ -404,7 +404,7 @@ Users have no way to know this header exists or how to use it for monitoring.
 - [ ] **DOCS**: Document transport options with types and valid ranges (issue #41)
 - [ ] **DOCS**: Create changelog/migration guide (issue #42)
 - [ ] **DOCS**: Document `x-restore-count` header for users (issue #43)
-- [ ] **MINOR**: Make `_queue_name` a static method (issue #34)
-- [ ] **MINOR**: Use `is not None` check in `close()` for `_in_poll` (issue #38)
+- [x] **MINOR**: Make `_queue_name` a static method (issue #34) — **DONE**: added `@staticmethod` decorator
+- [x] **MINOR**: Use `is not None` check in `close()` for `_in_poll` (issue #38) — **DONE**: fixed both `_in_poll` and `_in_fanout_poll` checks
 - [ ] **MINOR**: Document client/server clock divergence for score calculation (issue #5)
 - [ ] **MINOR**: Document SLOW mode pipeline non-atomicity (issue #6)
