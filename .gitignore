@@ -76,6 +76,9 @@ dmypy.json
 # MkDocs
 site/
 
+# Design specs / planning artifacts
+docs/superpowers/
+
 # OS
 .DS_Store
 Thumbs.db
