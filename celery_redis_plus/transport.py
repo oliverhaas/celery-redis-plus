@@ -55,7 +55,9 @@ import logging
 from celery.signals import worker_ready, worker_shutdown
 from kombu.exceptions import InconsistencyError, VersionMismatch
 from kombu.transport import virtual
-from kombu.transport.base import to_rabbitmq_queue_arguments  # type: ignore[attr-defined]
+from kombu.transport.base import (
+    to_rabbitmq_queue_arguments,  # type: ignore[attr-defined]  # ty: ignore[unresolved-import]
+)
 from kombu.utils.compat import register_after_fork
 from kombu.utils.encoding import bytes_to_str
 from kombu.utils.eventio import ERR, READ, poll
@@ -182,7 +184,7 @@ def _get_worker_pool_for_channel(channel: Channel) -> Any:
     Returns the pool if found, None otherwise.
     """
     try:
-        app = channel.connection.client.app  # type: ignore[union-attr]
+        app = channel.connection.client.app  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
         return _worker_pools.get(app)
     except AttributeError:
         # Fallback for non-Celery usage or when the connection chain is broken.
@@ -327,7 +329,7 @@ class GlobalKeyPrefixMixin:
 
     def parse_response(self, connection: Any, command_name: str, **options: Any) -> Any:
         """Parse a response from the Redis server."""
-        ret = super().parse_response(connection, command_name, **options)  # type: ignore[misc]
+        ret = super().parse_response(connection, command_name, **options)  # type: ignore[misc]  # ty: ignore[unresolved-attribute]
         if command_name == "BZMPOP" and ret:
             # BZMPOP returns (key, [(member, score), ...])
             key, members = ret
@@ -338,12 +340,12 @@ class GlobalKeyPrefixMixin:
         return ret
 
     def execute_command(self, *args: Any, **kwargs: Any) -> Any:
-        return super().execute_command(*self._prefix_args(list(args)), **kwargs)  # type: ignore[misc]
+        return super().execute_command(*self._prefix_args(list(args)), **kwargs)  # type: ignore[misc]  # ty: ignore[unresolved-attribute]
 
     def pipeline(self, transaction: bool = True, shard_hint: Any = None) -> PrefixedRedisPipeline:
         return PrefixedRedisPipeline(
-            self.connection_pool,  # type: ignore[attr-defined]
-            self.response_callbacks,  # type: ignore[attr-defined]
+            self.connection_pool,  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+            self.response_callbacks,  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
             transaction,
             shard_hint,
             global_keyprefix=self.global_keyprefix,
@@ -1857,7 +1859,7 @@ class Transport(virtual.Transport):
                 with suppress(KeyError):
                     loop.on_tick.remove(on_poll_start)
 
-        cycle._on_connection_disconnect = _on_disconnect  # type: ignore[method-assign]
+        cycle._on_connection_disconnect = _on_disconnect  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
 
         def on_poll_start() -> None:
             cycle_poll_start()
@@ -1870,12 +1872,12 @@ class Transport(virtual.Transport):
         loop.call_repeatedly(DEFAULT_REQUEUE_CHECK_INTERVAL, cycle.maybe_enqueue_due_messages)
 
         # Heartbeat to keep in-flight messages alive
-        visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]
+        visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         loop.call_repeatedly(visibility_timeout / 3, cycle.maybe_update_messages_index)
 
         # Store loop for dynamic timer registration (queue TTL refresh)
         cycle._loop = loop
 
-    def on_readable(self, fileno: int) -> Any:  # type: ignore[override]
+    def on_readable(self, fileno: int) -> Any:  # type: ignore[override]  # ty: ignore[invalid-method-override]
         """Handle AIO event for one of our file descriptors."""
         return self.cycle.on_readable(fileno)
