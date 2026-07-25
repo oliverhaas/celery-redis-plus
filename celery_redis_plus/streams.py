@@ -83,6 +83,7 @@ from .constants import (
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_MAX_RESTORE_COUNT,
     DEFAULT_PRIORITY_STEPS,
+    DEFAULT_REQUEUE_BATCH_LIMIT,
     DEFAULT_REQUEUE_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
@@ -115,6 +116,7 @@ logger = logging.getLogger(__name__)
 _PACKAGE_DIR = Path(__file__).parent
 _STREAMS_CONSUME_LUA = (_PACKAGE_DIR / "streams_consume.lua").read_text()
 _STREAMS_ACK_LUA = (_PACKAGE_DIR / "streams_ack.lua").read_text()
+_STREAMS_MOVE_DELAYED_LUA = (_PACKAGE_DIR / "streams_move_delayed.lua").read_text()
 
 
 def priority_to_level(priority: int, steps: Sequence[int]) -> int:
@@ -702,6 +704,65 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             delivery_tag = message["properties"]["delivery_tag"]
             cast("QoS", self.qos)._in_flight[delivery_tag] = (hit_key, entry_id)
             return message
+
+    def _move_delayed(self, queue: str) -> int:
+        """Move due delayed messages into their priority streams.
+
+        Runs the streams_move_delayed Lua script: members of ``delayed:{queue}``
+        whose delivery time has passed are XADDed to the stream matching their
+        bucketed priority and removed from the zset. Members whose delivery time
+        passed more than the effective message TTL ago are dropped instead
+        (lazy x-message-ttl). The script reads the current time via Redis TIME
+        rather than a caller-supplied timestamp, so a client clock ahead of the
+        server cannot destroy live messages.
+
+        Args:
+            queue: Queue name whose delayed zset is pumped.
+
+        Returns:
+            Number of messages moved into streams.
+        """
+        steps = sorted(self.priority_steps)
+
+        # Ensure consumer groups exist before the pump XADDs entries so
+        # consumers can read them right away (groups are created at id "0",
+        # so even a later re-create keeps existing entries deliverable)
+        for level in steps:
+            self._ensure_group(self._stream_key(queue, level))
+
+        # Effective message TTL in ms (0 = none); per-queue x-message-ttl (ms)
+        # is min'd with the channel-wide message_ttl (seconds)
+        message_ttl_ms = 0
+        if self.message_ttl is not None and self.message_ttl > 0:
+            message_ttl_ms = int(self.message_ttl * 1000)
+        if queue in self._message_ttls:
+            queue_ttl_ms = self._message_ttls[queue]
+            message_ttl_ms = queue_ttl_ms if message_ttl_ms == 0 else min(message_ttl_ms, queue_ttl_ms)
+
+        # Prefix keys since EVALSHA doesn't auto-prefix KEYS
+        delayed_key = f"{self.global_keyprefix}{self._delayed_key(queue)}"
+        stream_keys = [f"{self.global_keyprefix}{self._stream_key(queue, level)}" for level in steps]
+
+        with self.conn_or_acquire() as client:
+            move_script = client.register_script(_STREAMS_MOVE_DELAYED_LUA)
+            moved = int(
+                move_script(
+                    keys=[delayed_key, *stream_keys],
+                    args=[
+                        DEFAULT_REQUEUE_BATCH_LIMIT,
+                        message_ttl_ms,
+                        ",".join(str(step) for step in steps),
+                    ],
+                ),
+            )
+
+        if moved >= DEFAULT_REQUEUE_BATCH_LIMIT:
+            logger.warning(
+                "Queue %s hit delayed move batch limit of %d. There may be more messages waiting.",
+                queue,
+                DEFAULT_REQUEUE_BATCH_LIMIT,
+            )
+        return moved
 
     @property
     def priority_steps(self) -> list[int]:

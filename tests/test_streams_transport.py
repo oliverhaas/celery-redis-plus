@@ -10,7 +10,7 @@ import weakref
 from pathlib import Path
 from queue import Empty
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
 from kombu import Connection
@@ -25,6 +25,7 @@ from celery_redis_plus.constants import (
     CONSUMER_IDLE_CLEANUP_FACTOR,
     DEFAULT_CONSUMER_GROUP,
     DEFAULT_PRIORITY_STEPS,
+    DEFAULT_REQUEUE_BATCH_LIMIT,
     DELAYED_KEY_PREFIX,
     HEARTBEAT_INTERVAL_DIVISOR,
     SHUTDOWN_IDLE_MS,
@@ -2095,3 +2096,114 @@ class TestStreamsPoller:
         deferred.assert_called_once_with()
         assert not poller.after_read
         assert poller._in_protected_read is False
+
+
+@pytest.mark.unit
+class TestStreamsMoveDelayed:
+    """Tests for the delayed pump: streams_move_delayed script call and poller wiring."""
+
+    def _make_channel(self, global_keyprefix: str = "") -> tuple[Channel, MagicMock, MagicMock]:
+        """Build a bare Channel with mocked client whose register_script returns a script mock."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        # priority_steps is a read-only property reading self.connection.client.transport_options,
+        # and a bare object.__new__ instance has no connection, so mock the whole chain
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"priority_steps": [0, 3, 6, 9]}
+        channel.connection = mock_connection
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._ensure_group = MagicMock()
+
+        mock_client = MagicMock()
+        mock_script = MagicMock(return_value=0)
+        mock_client.register_script.return_value = mock_script
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        return channel, mock_client, mock_script
+
+    def test_move_delayed_passes_prefixed_keys_ascending_and_steps_csv(self, global_keyprefix: str) -> None:
+        """Test that _move_delayed passes prefixed delayed + stream keys (ascending) and steps CSV.
+
+        DEVIATION from the brief: the Lua script reads the current time via
+        Redis TIME rather than a caller-supplied now_ms ARGV slot (matching
+        transport_enqueue_due_messages.lua and streams_consume.lua), so ARGV
+        here is [batch_limit, message_ttl_ms, steps_csv] with no timestamp
+        argument to assert on.
+        """
+        channel, mock_client, mock_script = self._make_channel(global_keyprefix)
+
+        moved = channel._move_delayed("my_queue")
+
+        assert moved == 0
+        mock_client.register_script.assert_called_once()
+        keys = mock_script.call_args.kwargs["keys"]
+        args = mock_script.call_args.kwargs["args"]
+        assert keys[0] == f"{global_keyprefix}delayed:my_queue"
+        assert keys[1:] == [
+            f"{global_keyprefix}stream:my_queue:0",
+            f"{global_keyprefix}stream:my_queue:3",
+            f"{global_keyprefix}stream:my_queue:6",
+            f"{global_keyprefix}stream:my_queue:9",
+        ]
+        assert args[0] == DEFAULT_REQUEUE_BATCH_LIMIT
+        assert args[1] == 0  # No message TTL configured
+        assert args[2] == "0,3,6,9"
+
+    def test_move_delayed_sorts_steps_ascending(self) -> None:
+        """Test that unsorted priority_steps are sorted ascending for KEYS and the steps CSV."""
+        channel, _mock_client, mock_script = self._make_channel()
+
+        # The property getter already sorts, so feeding an unsorted transport option would
+        # never reach _move_delayed unsorted. Patch the property itself to hand the method a
+        # genuinely unsorted list and exercise its own sorted() guard.
+        with patch.object(Channel, "priority_steps", new_callable=PropertyMock, return_value=[9, 0, 6, 3]):
+            channel._move_delayed("my_queue")
+
+        keys = mock_script.call_args.kwargs["keys"]
+        args = mock_script.call_args.kwargs["args"]
+        assert keys[1:] == [
+            "stream:my_queue:0",
+            "stream:my_queue:3",
+            "stream:my_queue:6",
+            "stream:my_queue:9",
+        ]
+        assert args[2] == "0,3,6,9"
+
+    def test_move_delayed_message_ttl_args(self) -> None:
+        """Test effective message TTL: per-queue x-message-ttl (ms) is min'd with channel message_ttl (s)."""
+        # Per-queue TTL (5000 ms) is smaller than channel TTL (60 s): per-queue wins
+        channel, _mock_client, mock_script = self._make_channel()
+        channel.message_ttl = 60
+        channel._message_ttls = {"my_queue": 5000}
+        channel._move_delayed("my_queue")
+        assert mock_script.call_args.kwargs["args"][1] == 5000
+
+        # Only channel-wide TTL: seconds converted to ms
+        channel, _mock_client, mock_script = self._make_channel()
+        channel.message_ttl = 60
+        channel._move_delayed("my_queue")
+        assert mock_script.call_args.kwargs["args"][1] == 60000
+
+    def test_move_delayed_returns_moved_count(self) -> None:
+        """Test that _move_delayed returns the count reported by the Lua script."""
+        channel, _mock_client, mock_script = self._make_channel()
+        mock_script.return_value = 7
+
+        assert channel._move_delayed("my_queue") == 7
+
+    def test_move_delayed_ensures_groups_for_all_levels(self) -> None:
+        """Test that consumer groups are ensured (unprefixed keys) before the pump XADDs entries."""
+        channel, _mock_client, _mock_script = self._make_channel()
+
+        channel._move_delayed("my_queue")
+
+        assert channel._ensure_group.call_args_list == [
+            call("stream:my_queue:0"),
+            call("stream:my_queue:3"),
+            call("stream:my_queue:6"),
+            call("stream:my_queue:9"),
+        ]
