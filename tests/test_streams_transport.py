@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import time
@@ -29,6 +30,7 @@ from celery_redis_plus.constants import (
     STREAM_KEY_PREFIX,
 )
 from celery_redis_plus.streams import (
+    _STREAMS_ACK_LUA,
     _STREAMS_CONSUME_LUA,
     Channel,
     MultiChannelPoller,
@@ -1260,3 +1262,74 @@ class TestStreamsGet:
         # is mocked here, so nothing re-adds them)
         assert channel._ensured_groups == set()
         assert mock_qos._in_flight == {"tag123": ("stream:my_queue:9", "1700000000000-0")}
+
+
+@pytest.mark.unit
+class TestStreamsQoSAck:
+    """Tests for QoS.ack: atomic XACK + XDEL via streams_ack.lua."""
+
+    def test_ack_calls_script_and_pops_in_flight(self, global_keyprefix: str) -> None:
+        """Test ack runs streams_ack.lua with prefixed stream key and pops the in-flight entry."""
+        mock_client = MagicMock()
+        mock_script = MagicMock()
+        mock_client.register_script.return_value = mock_script
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+
+        mock_channel = MagicMock()
+        mock_channel.global_keyprefix = global_keyprefix
+        mock_channel.consumer_group = "celery"
+        mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        qos = object.__new__(QoS)
+        qos.channel = mock_channel
+        qos._fanout_tags = set()
+        qos._in_flight = {"tag1": (f"{STREAM_KEY_PREFIX}my_queue:0", "1700000000000-0")}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.ack("tag1")
+
+        mock_client.register_script.assert_called_once_with(_STREAMS_ACK_LUA)
+        mock_script.assert_called_once_with(
+            keys=[f"{global_keyprefix}{STREAM_KEY_PREFIX}my_queue:0"],
+            args=["celery", "1700000000000-0", ""],
+        )
+        assert "tag1" not in qos._in_flight
+        qos._quick_ack.assert_called_once_with("tag1")
+
+    def test_ack_fanout_tag_bypasses_stream_ack(self) -> None:
+        """Test ack for fanout message discards the tag without touching Redis."""
+        qos = object.__new__(QoS)
+        qos.channel = MagicMock()
+        qos._fanout_tags = {"tag1"}
+        qos._in_flight = {}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.ack("tag1")
+
+        assert "tag1" not in qos._fanout_tags
+        qos.channel.conn_or_acquire.assert_not_called()
+        qos._quick_ack.assert_called_once_with("tag1")
+
+    def test_ack_missing_metadata_logs_critical_and_acks(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test ack without in-flight metadata logs critical but still acks locally."""
+        qos = object.__new__(QoS)
+        qos.channel = MagicMock()
+        qos._fanout_tags = set()
+        qos._in_flight = {}
+        qos._delivered = {}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        with caplog.at_level(logging.CRITICAL, logger="celery_redis_plus.streams"):
+            qos.ack("ghost-tag")
+
+        assert "Cannot ack message" in caplog.text
+        qos.channel.conn_or_acquire.assert_not_called()
+        qos._quick_ack.assert_called_once_with("ghost-tag")

@@ -114,6 +114,7 @@ logger = logging.getLogger(__name__)
 # Load Lua scripts at module init
 _PACKAGE_DIR = Path(__file__).parent
 _STREAMS_CONSUME_LUA = (_PACKAGE_DIR / "streams_consume.lua").read_text()
+_STREAMS_ACK_LUA = (_PACKAGE_DIR / "streams_ack.lua").read_text()
 
 
 def priority_to_level(priority: int, steps: Sequence[int]) -> int:
@@ -160,6 +161,38 @@ class QoS(virtual.QoS):
         self._in_flight: dict[str, tuple[str, str]] = {}
         # For streams fanout: track delivery tags that came from fanout (no ack needed)
         self._fanout_tags: set[str] = set()
+
+    def ack(self, delivery_tag: str) -> None:
+        # Fanout messages don't need Redis cleanup (no consumer groups)
+        if delivery_tag in self._fanout_tags:
+            self._fanout_tags.discard(delivery_tag)
+        elif delivery_tag in self._in_flight:
+            # Regular stream message: atomic Lua removes the PEL entry
+            # (XACK) and the stream entry (XDEL) in one round trip
+            self._ack_by_tag(delivery_tag)
+        else:
+            # Metadata lost (e.g. channel restart). The PEL entry stays and
+            # will be reclaimed by a peer after visibility_timeout.
+            logger.critical("Cannot ack message: no in-flight metadata for delivery_tag %r", delivery_tag)
+        super().ack(delivery_tag)
+
+    def _ack_by_tag(self, delivery_tag: str, requeue_payload: str = "") -> None:
+        """Atomically XACK and XDEL a message's stream entry via Lua.
+
+        When requeue_payload is non-empty, the script XADDs the copy to the
+        stream tail before acking, so a connection drop cannot tear requeue
+        and ack apart. The copy starts with a fresh delivery count, so
+        voluntary requeues never count toward the poison cap.
+        """
+        stream_key, message_id = self._in_flight.pop(delivery_tag)
+        # Prefix key since EVALSHA doesn't auto-prefix KEYS
+        prefixed_stream_key = f"{self.channel.global_keyprefix}{stream_key}"
+        with self.channel.conn_or_acquire() as client:
+            ack_script = client.register_script(_STREAMS_ACK_LUA)
+            ack_script(
+                keys=[prefixed_stream_key],
+                args=[self.channel.consumer_group, message_id, requeue_payload],
+            )
 
     @cached_property
     def visibility_timeout(self) -> float:
