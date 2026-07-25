@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from kombu import Connection
 from kombu.transport import TRANSPORT_ALIASES, get_transport_cls
+from vine import promise
 
 from celery_redis_plus import signals
 from celery_redis_plus.constants import (
@@ -561,3 +562,106 @@ class TestStreamsTransportSetup:
         assert poller.maybe_heartbeat() is None
         assert poller.maybe_refresh_queue_expires() is None
         assert poller._update_expires_timer() is None
+
+
+@pytest.mark.unit
+class TestStreamsQueueCycle:
+    """Tests for consume registration: active_queues, queue-cycle refresh, and fanout tracking."""
+
+    def _make_channel(self) -> Channel:
+        """Bare channel carrying exactly the state consume registration touches."""
+        channel = object.__new__(Channel)
+        channel._tag_to_queue = {}
+        channel._active_queues = []
+        channel._consumers = set()
+        channel._queue_cycle = []
+        channel._fanout_queues = {}
+        channel.active_fanout_queues = set()
+        mock_connection = MagicMock()
+        mock_connection._callbacks = {}
+        mock_connection.cycle._in_protected_read = False
+        channel.connection = mock_connection
+        return channel
+
+    def test_active_queues_excludes_fanout(self) -> None:
+        """Test that active_queues is the watched queue set minus fanout queues."""
+        channel = object.__new__(Channel)
+        channel._active_queues = ["q1", "q2", "bcast"]
+        channel.active_fanout_queues = {"bcast"}
+
+        assert channel.active_queues == {"q1", "q2"}
+
+    def test_update_queue_cycle_reflects_active_queues(self) -> None:
+        """Test that _update_queue_cycle rebuilds _queue_cycle from active_queues."""
+        channel = object.__new__(Channel)
+        channel._active_queues = ["q1", "bcast", "q2"]
+        channel.active_fanout_queues = {"bcast"}
+        channel._queue_cycle = []
+
+        channel._update_queue_cycle()
+
+        assert set(channel._queue_cycle) == {"q1", "q2"}
+        assert len(channel._queue_cycle) == 2
+
+    def test_basic_consume_updates_queue_cycle(self) -> None:
+        """Test that basic_consume registers the queue in the round-robin cycle."""
+        channel = self._make_channel()
+
+        channel.basic_consume("celery", no_ack=True, callback=lambda *_a: None, consumer_tag="ctag-1")
+
+        assert "celery" in channel._active_queues
+        assert channel._queue_cycle == ["celery"]
+
+    def test_basic_consume_fanout_queue_tracked_not_cycled(self) -> None:
+        """Test that a fanout queue goes to active_fanout_queues, not the XREADGROUP cycle."""
+        channel = self._make_channel()
+        channel._fanout_queues["bcast"] = ("bcast_exchange", "")
+
+        channel.basic_consume("bcast", no_ack=True, callback=lambda *_a: None, consumer_tag="ctag-f")
+
+        assert "bcast" in channel.active_fanout_queues
+        assert channel._queue_cycle == []
+
+    def test_basic_cancel_updates_queue_cycle(self) -> None:
+        """Test that basic_cancel removes the queue and rebuilds the cycle."""
+        channel = self._make_channel()
+        channel.basic_consume("celery", no_ack=True, callback=lambda *_a: None, consumer_tag="ctag-1")
+        # Prime a stale cycle so the test proves basic_cancel rebuilds it
+        channel._queue_cycle = ["stale-entry", "celery"]
+
+        channel.basic_cancel("ctag-1")
+
+        assert "celery" not in channel._active_queues
+        assert channel._queue_cycle == []
+
+    def test_basic_cancel_removes_fanout_queue(self) -> None:
+        """Test that cancelling a fanout consumer stops XREAD tracking for its queue."""
+        channel = self._make_channel()
+        channel._fanout_queues["bcast"] = ("bcast_exchange", "")
+        channel.basic_consume("bcast", no_ack=True, callback=lambda *_a: None, consumer_tag="ctag-f")
+        channel.active_fanout_queues.add("bcast")  # no-op once basic_consume tracks fanout
+
+        channel.basic_cancel("ctag-f")
+
+        assert "bcast" not in channel.active_fanout_queues
+
+    def test_basic_cancel_deferred_during_protected_read(self) -> None:
+        """Test that basic_cancel defers via an after_read promise during a protected read."""
+        channel = self._make_channel()
+        channel.basic_consume("celery", no_ack=True, callback=lambda *_a: None, consumer_tag="ctag-1")
+        channel.connection.cycle._in_protected_read = True
+
+        channel.basic_cancel("ctag-1")
+
+        # The cancel must not have run yet
+        assert "celery" in channel._active_queues
+        channel.connection.cycle.after_read.add.assert_called_once()
+        deferred = channel.connection.cycle.after_read.add.call_args[0][0]
+        assert isinstance(deferred, promise)
+        assert deferred.fun == channel._basic_cancel
+        assert deferred.args == ("ctag-1",)
+
+        # Running the promise performs the deferred cancel
+        deferred()
+        assert "celery" not in channel._active_queues
+        assert channel._queue_cycle == []
