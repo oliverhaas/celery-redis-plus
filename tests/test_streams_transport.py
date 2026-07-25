@@ -5040,3 +5040,125 @@ class TestStreamsShutdownRestore:
             qos.restore_unacked_once()
 
         assert mock_client.xclaim.call_count == 1
+
+
+@pytest.mark.integration
+class TestStreamsShutdownRestoreIntegration:
+    """Integration tests for QoS.restore_unacked_once against real Redis/Valkey.
+
+    Exercises the real client returned by Channel._get_client() (plain
+    redis-py/valkey-py when global_keyprefix is falsy, PrefixedStrictRedis
+    when truthy, via the parametrized global_keyprefix fixture), so both
+    XCLAIM prefixing paths actually run against a live server.
+    """
+
+    def test_restore_unacked_once_releases_message_for_instant_peer_reclaim(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """The graceful shutdown release lets a peer reclaim the message immediately.
+
+        Sequence: publish and consume via one channel ("producer-worker") so
+        the entry sits in its PEL, call restore_unacked_once() (no worker
+        pool registered for this connection, so it goes straight to the
+        XCLAIM IDLE release), then read XPENDING directly to confirm the
+        entry's idle time is now far above visibility_timeout while
+        times_delivered is untouched by the release itself, then confirm a
+        second channel's reclaim pass picks the entry up right away, well
+        inside a visibility_timeout deliberately set long enough that a
+        natural timeout expiry could not explain the pickup.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "shutdown-integration-queue"
+        visibility_timeout = 20.0
+
+        producer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "producer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        reclaimer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "reclaimer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        try:
+            producer_channel = cast("Channel", producer_conn.channel())
+
+            message = {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-integration-shutdown",
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                },
+            }
+            producer_channel._put(queue, message)
+
+            # Consume into the PEL as "producer-worker", standing in for a
+            # worker whose Consumer bootstep is closing while the message is
+            # still in flight.
+            consumed = producer_channel._get(queue)
+            assert consumed["properties"]["delivery_tag"] == "tag-integration-shutdown"
+
+            producer_qos = cast("QoS", producer_channel.qos)
+            stream_key, _message_id = producer_qos._in_flight["tag-integration-shutdown"]
+
+            # No real Celery worker pool is registered for this connection;
+            # patching just skips the executor-wait branch (covered by unit
+            # tests) so this test isolates the XCLAIM IDLE release itself.
+            with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=None):
+                producer_qos.restore_unacked_once()
+
+            assert producer_qos._in_flight == {}
+
+            with producer_channel.conn_or_acquire() as client:
+                pending_after = client.xpending_range(
+                    stream_key,
+                    producer_channel.consumer_group,
+                    min="-",
+                    max="+",
+                    count=10,
+                )
+            assert len(pending_after) == 1
+            entry = pending_after[0]
+            # Idle time is now enormous: far above visibility_timeout (20s = 20000ms).
+            assert entry["time_since_delivered"] >= SHUTDOWN_IDLE_MS
+            # The release itself never bumps times_delivered: still 1, the
+            # count from the original XREADGROUP delivery.
+            assert int(entry["times_delivered"]) == 1
+
+            reclaimer_channel = cast("Channel", reclaimer_conn.channel())
+            delivered: list[Any] = []
+            reclaimer_channel.basic_consume(
+                queue,
+                no_ack=False,
+                callback=delivered.append,
+                consumer_tag="reclaimer-ctag",
+            )
+
+            start = time.monotonic()
+            processed = reclaimer_channel._reclaim_and_deliver(queue, budget=10)
+            elapsed = time.monotonic() - start
+        finally:
+            producer_conn.close()
+            reclaimer_conn.close()
+
+        assert processed == 1
+        assert len(delivered) == 1
+        assert delivered[0].delivery_tag == "tag-integration-shutdown"
+        # Reclaimed well inside the visibility_timeout window: this proves
+        # the pickup came from the artificial idle release, not from
+        # visibility_timeout naturally elapsing.
+        assert elapsed < visibility_timeout / 2
