@@ -263,6 +263,14 @@ class GlobalKeyPrefixMixin:
         "ZREVRANGEBYSCORE",
         "ZSCORE",
         "XADD",
+        "XACK",
+        "XDEL",
+        "XLEN",
+        "XPENDING",
+        "XAUTOCLAIM",
+        "XCLAIM",
+        "XRANGE",
+        "XTRIM",
     ]
 
     @staticmethod
@@ -298,11 +306,27 @@ class GlobalKeyPrefixMixin:
             return args[: streams_idx + 1] + prefixed_keys + stream_ids
         return args
 
+    @staticmethod
+    def _prefix_xgroup_args(args: list[Any], prefix: str) -> list[Any]:
+        """Prefix the stream key in XGROUP and XINFO commands.
+
+        XGROUP CREATE|SETID|DESTROY|CREATECONSUMER|DELCONSUMER key ...
+        XINFO STREAM|GROUPS|CONSUMERS key ...
+
+        The subcommand is args[0]; the key is args[1].
+        """
+        if len(args) > 1:
+            return [args[0], prefix + str(args[1]), *args[2:]]
+        return args
+
     PREFIXED_COMPLEX_COMMANDS: ClassVar[dict[str, dict[str, int | None] | Callable[..., list[Any]]]] = {
         "DEL": {"args_start": 0, "args_end": None},
         "WATCH": {"args_start": 0, "args_end": None},
         "BZMPOP": _prefix_bzmpop_args,
         "XREAD": _prefix_xread_args,
+        "XREADGROUP": _prefix_xread_args,
+        "XGROUP": _prefix_xgroup_args,
+        "XINFO": _prefix_xgroup_args,
     }
 
     def _prefix_args(self, args: list[Any]) -> list[Any]:
