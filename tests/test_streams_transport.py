@@ -7,6 +7,7 @@ import os
 import socket
 import time
 import weakref
+from collections import OrderedDict
 from pathlib import Path
 from queue import Empty
 from types import SimpleNamespace
@@ -4940,3 +4941,102 @@ class TestStreamsShutdownRestore:
 
         broken_channel = MagicMock(spec=[])  # Empty spec: no attributes at all
         _drain_hub_callbacks(broken_channel)  # AttributeError path, must not raise
+
+    def _make_qos(self) -> tuple[QoS, MagicMock, MagicMock]:
+        """Build a bare streams QoS with a mocked channel and client."""
+        qos = object.__new__(QoS)
+        qos._on_collect = MagicMock()
+        qos._dirty = set()
+        qos._delivered = OrderedDict()
+        qos._delivered.restored = False
+        qos._in_flight = {}
+
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+
+        mock_channel = MagicMock()
+        mock_channel.do_restore = True
+        mock_channel.consumer_group = "celery"
+        mock_channel.consumer_name = "workerhost:1234"
+        mock_channel.connection.cycle._loop = None  # No hub: drain step is a no-op
+        mock_channel.conn_or_acquire.return_value = mock_client
+        qos.channel = mock_channel
+        return qos, mock_channel, mock_client
+
+    def test_restore_unacked_once_xclaims_in_flight_per_stream(self) -> None:
+        """In-flight entries are XCLAIMed with idle=SHUTDOWN_IDLE_MS and justid, grouped per stream."""
+        qos, _mock_channel, mock_client = self._make_qos()
+        qos._in_flight = {
+            "tag1": ("stream:celery:9", "1111-0"),
+            "tag2": ("stream:celery:9", "1111-1"),
+            "tag3": ("stream:other:0", "2222-0"),
+        }
+
+        with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=None):
+            qos.restore_unacked_once()
+
+        assert mock_client.xclaim.call_count == 2
+        calls_by_stream = {call.args[0]: call for call in mock_client.xclaim.call_args_list}
+
+        celery_call = calls_by_stream["stream:celery:9"]
+        assert celery_call.args[1] == "celery"  # consumer group
+        assert celery_call.args[2] == "workerhost:1234"  # consumer name
+        assert celery_call.args[3] == 0  # min_idle_time
+        assert celery_call.args[4] == ["1111-0", "1111-1"]  # ids grouped per stream
+        assert celery_call.kwargs == {"idle": SHUTDOWN_IDLE_MS, "justid": True}
+
+        other_call = calls_by_stream["stream:other:0"]
+        assert other_call.args[4] == ["2222-0"]
+        assert other_call.kwargs == {"idle": SHUTDOWN_IDLE_MS, "justid": True}
+
+        assert qos._in_flight == {}
+
+    def test_restore_unacked_once_waits_for_executor_before_xclaim(self) -> None:
+        """executor.shutdown(wait=True) completes before any XCLAIM is sent."""
+        qos, _mock_channel, mock_client = self._make_qos()
+        qos._in_flight = {"tag1": ("stream:celery:0", "1111-0")}
+
+        call_order: list[str] = []
+        mock_executor = MagicMock()
+        mock_executor.shutdown.side_effect = lambda **_kwargs: call_order.append("executor")
+        mock_pool = MagicMock()
+        mock_pool.executor = mock_executor
+        mock_client.xclaim.side_effect = lambda *_args, **_kwargs: call_order.append("xclaim")
+
+        with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=mock_pool):
+            qos.restore_unacked_once()
+
+        mock_executor.shutdown.assert_called_once_with(wait=True)
+        assert call_order == ["executor", "xclaim"]
+
+    def test_restore_unacked_once_does_not_re_add_messages(self) -> None:
+        """Shutdown release never re-publishes payloads: no XADD, no _put, no base restore."""
+        qos, mock_channel, mock_client = self._make_qos()
+        qos._in_flight = {"tag1": ("stream:celery:0", "1111-0")}
+        mock_message = MagicMock()
+        mock_message.delivery_info = {"routing_key": "celery"}
+        qos._delivered["tag1"] = mock_message
+        qos.restore_unacked = MagicMock()
+
+        with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=None):
+            qos.restore_unacked_once()
+
+        qos.restore_unacked.assert_not_called()
+        mock_client.xadd.assert_not_called()
+        mock_channel._put.assert_not_called()
+        mock_channel._restore.assert_not_called()
+        mock_client.xclaim.assert_called_once()
+
+    def test_restore_unacked_once_second_call_is_noop(self) -> None:
+        """A second restore_unacked_once call does not XCLAIM again."""
+        qos, _mock_channel, mock_client = self._make_qos()
+        qos._in_flight = {"tag1": ("stream:celery:0", "1111-0")}
+
+        with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=None):
+            qos.restore_unacked_once()
+            assert mock_client.xclaim.call_count == 1
+            assert qos._delivered.restored is True
+            qos.restore_unacked_once()
+
+        assert mock_client.xclaim.call_count == 1

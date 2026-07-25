@@ -96,6 +96,7 @@ from .constants import (
     DELAYED_KEY_PREFIX,
     HEARTBEAT_INTERVAL_DIVISOR,
     MAX_PRIORITY,
+    SHUTDOWN_IDLE_MS,
     STREAM_KEY_PREFIX,
 )
 from .signals import _get_worker_nodename_for_channel
@@ -109,6 +110,8 @@ from .transport import (
     _client_exceptions,
     _client_lib_name,
     _connection_errors,
+    _drain_hub_callbacks,
+    _get_worker_pool_for_channel,
     client_lib,
 )
 
@@ -235,6 +238,82 @@ class QoS(virtual.QoS):
                 )
         self._ack_by_tag(delivery_tag, requeue_payload=requeue_payload)
         super().ack(delivery_tag)
+
+    def restore_unacked_once(self, stderr: Any = None) -> None:
+        """Release in-flight messages for instant reclaim, waiting for threads first.
+
+        Celery's shutdown order fires restore_unacked_once (during Consumer
+        close) BEFORE Pool.on_stop() waits for threads.  By calling
+        executor.shutdown(wait=True) here first, all threads complete and
+        their ack callbacks land in hub._ready.  The second drain catches
+        them, so only truly unfinished messages are released.
+        executor.shutdown() is idempotent, so Pool.on_stop()'s later call
+        is a no-op.
+
+        Unlike the sorted set transport, no payload is re-added: the
+        remaining PEL entries are XCLAIMed with an artificial idle time
+        (SHUTDOWN_IDLE_MS, far above any sane visibility timeout), which
+        makes them instantly reclaimable by a peer's reclaim pass
+        (Channel._reclaim_and_deliver's XPENDING-IDLE discovery followed by
+        a counting XCLAIM). JUSTID transfers no payloads and does not itself
+        bump delivery counts; the peer's reclaim redelivery does, so each
+        graceful handoff costs one restore_count increment on surviving
+        messages.
+        """
+        _drain_hub_callbacks(self.channel)
+
+        if (
+            (pool := _get_worker_pool_for_channel(self.channel)) is not None
+            and (executor := getattr(pool, "executor", None)) is not None
+            and hasattr(executor, "shutdown")
+        ):
+            executor.shutdown(wait=True)
+            _drain_hub_callbacks(self.channel)
+
+        # Mirror virtual.QoS.restore_unacked_once guards (once-only via the
+        # restored flag on _delivered) but replace its re-add restore path
+        # with the atomic XCLAIM IDLE release.  No super() call.
+        self._on_collect.cancel()  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        self._flush()  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        state = self._delivered
+
+        if not self.restore_at_shutdown or not self.channel.do_restore:
+            return
+        if getattr(state, "restored", None):
+            return
+
+        try:
+            if self._in_flight:
+                by_stream: dict[str, list[str]] = {}
+                for stream_key, message_id in self._in_flight.values():
+                    by_stream.setdefault(stream_key, []).append(message_id)
+                with self.channel.conn_or_acquire() as client:
+                    for stream_key, message_ids in by_stream.items():
+                        try:
+                            # Release only; the peer's reclaim redelivery bumps times_delivered by one.
+                            client.xclaim(
+                                stream_key,
+                                self.channel.consumer_group,
+                                self.channel.consumer_name,
+                                0,
+                                message_ids,
+                                idle=SHUTDOWN_IDLE_MS,
+                                justid=True,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to release in-flight messages on %s for instant reclaim;"
+                                " peers will reclaim them after the visibility timeout",
+                                stream_key,
+                                exc_info=True,
+                            )
+                logger.info(
+                    "Released %d in-flight message(s) for instant reclaim by peers",
+                    len(self._in_flight),
+                )
+                self._in_flight.clear()
+        finally:
+            state.restored = True  # type: ignore[attr-defined]  # ty: ignore[invalid-assignment]
 
     @cached_property
     def visibility_timeout(self) -> float:
