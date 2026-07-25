@@ -2986,6 +2986,60 @@ class TestStreamsReclaim:
         channel._ensure_group.assert_called_once_with("stream:celery:0")
         channel.connection._deliver.assert_called_once()
 
+    def test_maybe_enqueue_due_messages_pumps_and_reclaims_with_shared_budget(self) -> None:
+        """The requeue cycle runs the delayed pump then reclaim per queue, sharing one budget."""
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        channel.qos = MagicMock()
+        channel.active_queues = {"q1", "q2"}
+        channel._queue_cycle = ["q1", "q2"]
+        channel._move_delayed.side_effect = [3, 5]
+        channel._reclaim_and_deliver.side_effect = [2, 4]
+        poller._channels.add(channel)
+
+        total = poller.maybe_enqueue_due_messages()
+
+        assert total == 14
+        assert channel._move_delayed.call_args_list == [call("q1"), call("q2")]
+        assert channel._reclaim_and_deliver.call_args_list == [
+            call("q1", DEFAULT_REQUEUE_BATCH_LIMIT - 3),
+            call("q2", DEFAULT_REQUEUE_BATCH_LIMIT - 10),
+        ]
+
+    def test_maybe_enqueue_due_messages_continues_after_queue_error(self) -> None:
+        """An error on one queue is logged and does not abort the cycle for later queues."""
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        channel.qos = MagicMock()
+        channel.active_queues = {"q1", "q2"}
+        channel._queue_cycle = ["q1", "q2"]
+        channel._move_delayed.side_effect = [RuntimeError("boom"), 1]
+        channel._reclaim_and_deliver.return_value = 0
+        poller._channels.add(channel)
+
+        total = poller.maybe_enqueue_due_messages()
+
+        assert total == 1
+        assert channel._move_delayed.call_count == 2
+        channel._reclaim_and_deliver.assert_called_once_with("q2", DEFAULT_REQUEUE_BATCH_LIMIT - 1)
+
+    def test_maybe_enqueue_due_messages_skips_inactive_channels(self) -> None:
+        """Channels without a QoS or without active queues are skipped entirely."""
+        poller = MultiChannelPoller()
+        no_qos_channel = MagicMock()
+        no_qos_channel.qos = None
+        idle_channel = MagicMock()
+        idle_channel.qos = MagicMock()
+        idle_channel.active_queues = set()
+        poller._channels.add(no_qos_channel)
+        poller._channels.add(idle_channel)
+
+        total = poller.maybe_enqueue_due_messages()
+
+        assert total == 0
+        no_qos_channel._move_delayed.assert_not_called()
+        idle_channel._move_delayed.assert_not_called()
+
 
 @pytest.mark.unit
 class TestStreamsPoison:

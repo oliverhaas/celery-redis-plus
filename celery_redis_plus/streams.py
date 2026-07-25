@@ -378,28 +378,45 @@ class MultiChannelPoller:
         return self._fd_to_chan
 
     def maybe_enqueue_due_messages(self) -> int:
-        """Move due delayed messages into their priority streams.
+        """Run the periodic requeue cycle: delayed pump plus reclaim.
 
-        Walks every channel's active queues and pumps each queue's delayed
-        zset via the streams_move_delayed Lua script. Failures are logged and
-        retried on the next cycle so the periodic timer survives connection
-        errors.
+        For each channel's watched queues this first moves due delayed messages
+        into their priority streams, then reclaims messages whose consumer has
+        been idle past the visibility timeout. A single budget of
+        DEFAULT_REQUEUE_BATCH_LIMIT is shared across both passes per channel so
+        one busy queue cannot starve the cycle.
 
         Returns:
-            Total number of messages moved across all channels.
+            Total number of messages moved or reclaimed across all channels.
         """
-        total_moved = 0
+        total = 0
         for channel in self._channels:
+            qos = channel.qos
+            if qos is None or not channel.active_queues:
+                continue
+            budget = DEFAULT_REQUEUE_BATCH_LIMIT
             for queue in channel._queue_cycle:
+                if budget <= 0:
+                    logger.warning(
+                        "Requeue cycle hit batch limit of %d. There may be more messages waiting.",
+                        DEFAULT_REQUEUE_BATCH_LIMIT,
+                    )
+                    break
                 try:
-                    total_moved += channel._move_delayed(queue)
+                    moved = channel._move_delayed(queue)
+                    budget -= moved
+                    total += moved
+                    if budget > 0:
+                        reclaimed = channel._reclaim_and_deliver(queue, budget)
+                        budget -= reclaimed
+                        total += reclaimed
                 except Exception:
                     logger.warning(
-                        "Failed to move delayed messages for queue %s, will retry next cycle",
+                        "Failed to process due messages for queue %s, will retry next cycle",
                         queue,
                         exc_info=True,
                     )
-        return total_moved
+        return total
 
     def maybe_heartbeat(self) -> None:
         """Send XCLAIM JUSTID heartbeats for in-flight messages.
