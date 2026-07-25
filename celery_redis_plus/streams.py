@@ -245,11 +245,8 @@ class MultiChannelPoller:
         self._loop: Any = None
         self._expires_timer_entry: Any = None
         self._expires_timer_interval: float | None = None
-        # Per-channel rotation offset into channel._queue_cycle for the requeue
-        # cycle (see maybe_enqueue_due_messages): keyed directly by the Channel
-        # instance, which is already hashable by identity (channels live in the
-        # _channels set above), so no id() reuse hazard once a channel is
-        # garbage collected after discard().
+        # Rotation offset into each channel's queue cycle; see maybe_enqueue_due_messages.
+        # Keyed by the channel itself, so discard() drops the entry with no id() reuse hazard.
         self._requeue_offsets: dict[Channel, int] = {}
 
     def close(self) -> None:
@@ -918,10 +915,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                     except self.ResponseError as exc:
                         if "NOGROUP" not in str(exc):
                             raise
-                        # Stream deleted out of band (cross-process purge,
-                        # queue delete, x-expires expiry): drop the stale
-                        # cache, recreate the queue's groups, retry once.
-                        # A second NOGROUP propagates to the caller.
+                        # Stream deleted out of band (purge, queue delete, x-expires).
+                        # Recreate the groups and retry once; a second NOGROUP propagates.
                         self._invalidate_group(queue)
                         for level_key in self._stream_keys_for_queue(queue):
                             self._ensure_group(level_key)
@@ -947,12 +942,9 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             break
                         continue
 
-                    # XAUTOCLAIM replies carry no delivery counts, so fetch them via
-                    # XPENDING bounded to the claimed ID range (XAUTOCLAIM returns
-                    # entries in ascending ID order). An unbounded min="-"/max="+"
-                    # window truncates at its count, and this worker's own in-flight
-                    # PEL entries with lower IDs would displace claimed entries,
-                    # silently zeroing their restore counts.
+                    # Delivery counts come from XPENDING, bounded to the claimed ID range:
+                    # an unbounded window truncates at its count, letting this worker's own
+                    # lower-ID entries displace the claimed ones and zero their restore counts.
                     pending = client.xpending_range(
                         stream_key,
                         self.consumer_group,
@@ -1168,10 +1160,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                     raise Empty from None
                 if "NOGROUP" not in str(exc):
                     raise
-                # Stream deleted out of band (cross-process purge, queue
-                # delete, x-expires expiry): drop the stale cache, recreate
-                # the groups, and retry this queue once. A second NOGROUP
-                # propagates.
+                # Stream deleted out of band (purge, queue delete, x-expires).
+                # Recreate the groups and retry once; a second NOGROUP propagates.
                 self._invalidate_group(queue)
                 for stream_key in stream_keys:
                     self._ensure_group(stream_key)
