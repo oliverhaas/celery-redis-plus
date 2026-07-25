@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from kombu import Connection
 from kombu.transport import TRANSPORT_ALIASES, get_transport_cls
+from kombu.utils.eventio import ERR, READ
 from kombu.utils.json import dumps as json_dumps
 from vine import promise
 
@@ -1938,3 +1939,159 @@ class TestStreamsConsumeRead:
             "q1",
         )
         channel._xreadgroup_start.assert_not_called()
+
+
+@pytest.mark.unit
+class TestStreamsPoller:
+    """Unit tests for the streams MultiChannelPoller registration and drain cycle."""
+
+    def test_register_xreadgroup_registers_socket_and_runs_pass(self) -> None:
+        """Test _register_XREADGROUP registers the client socket and runs the non-blocking pass."""
+        poller = object.__new__(MultiChannelPoller)
+        poller._fd_to_chan = {}
+        poller._chan_to_sock = {}
+        poller.poller = MagicMock()
+
+        channel = MagicMock()
+        channel._in_poll = None
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 7
+        channel.client.connection._sock = mock_sock
+        channel._consume_read.return_value = True
+
+        result = poller._register_XREADGROUP(channel)
+
+        assert result is True
+        channel._consume_read.assert_called_once()
+        assert poller._fd_to_chan[7] == (channel, "XREADGROUP")
+        assert poller._chan_to_sock[(channel, channel.client, "XREADGROUP")] is mock_sock
+        poller.poller.register.assert_called_once_with(mock_sock, poller.eventflags)
+        assert channel._in_poll is False
+
+    def test_register_xreadgroup_skips_pass_when_read_pending(self) -> None:
+        """Test _register_XREADGROUP does not re-send while a blocking read is pending."""
+        poller = object.__new__(MultiChannelPoller)
+        poller._fd_to_chan = {}
+        poller.poller = MagicMock()
+
+        channel = MagicMock()
+        mock_sock = MagicMock()
+        channel.client.connection._sock = mock_sock
+        channel._in_poll = channel.client.connection  # blocking XREADGROUP pending
+        poller._chan_to_sock = {(channel, channel.client, "XREADGROUP"): mock_sock}
+
+        result = poller._register_XREADGROUP(channel)
+
+        assert result is False
+        channel._consume_read.assert_not_called()
+        poller.poller.register.assert_not_called()
+
+    def test_register_xreadgroup_suppresses_empty(self) -> None:
+        """Test _register_XREADGROUP returns False when the pass raises Empty (blocking read armed)."""
+        poller = object.__new__(MultiChannelPoller)
+        poller._fd_to_chan = {}
+        poller._chan_to_sock = {}
+        poller.poller = MagicMock()
+
+        channel = MagicMock()
+        channel._in_poll = None
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 7
+        channel.client.connection._sock = mock_sock
+        channel._consume_read.side_effect = Empty
+
+        result = poller._register_XREADGROUP(channel)
+
+        assert result is False
+        channel._consume_read.assert_called_once()
+
+    def test_on_poll_start_registers_active_channels(self) -> None:
+        """Test on_poll_start registers queue channels for XREADGROUP and fanout channels for XREAD."""
+        poller = object.__new__(MultiChannelPoller)
+        queue_channel = MagicMock()
+        queue_channel.active_queues = {"q1"}
+        queue_channel.active_fanout_queues = set()
+        queue_channel.qos.can_consume.return_value = True
+        fanout_channel = MagicMock()
+        fanout_channel.active_queues = set()
+        fanout_channel.active_fanout_queues = {"fq"}
+        fanout_channel.qos.can_consume.return_value = True
+        poller._channels = {queue_channel, fanout_channel}
+        poller._register_XREADGROUP = MagicMock()
+        poller._register_XREAD = MagicMock()
+
+        poller.on_poll_start()
+
+        poller._register_XREADGROUP.assert_called_once_with(queue_channel)
+        poller._register_XREAD.assert_called_once_with(fanout_channel)
+
+    def test_handle_event_read_dispatches_handler(self) -> None:
+        """Test handle_event dispatches READ events to the channel's registered handler."""
+        poller = object.__new__(MultiChannelPoller)
+        channel = MagicMock()
+        channel.qos.can_consume.return_value = True
+        handler = MagicMock(return_value=True)
+        channel.handlers = {"XREADGROUP": handler}
+        poller._fd_to_chan = {7: (channel, "XREADGROUP")}
+
+        ret = poller.handle_event(7, READ)
+
+        handler.assert_called_once_with()
+        assert ret == (True, poller)
+
+    def test_handle_event_err_routes_to_poll_error(self) -> None:
+        """Test handle_event routes ERR events to channel._poll_error with the cmd type."""
+        poller = object.__new__(MultiChannelPoller)
+        channel = MagicMock()
+        poller._fd_to_chan = {7: (channel, "XREADGROUP")}
+
+        ret = poller.handle_event(7, ERR)
+
+        channel._poll_error.assert_called_once_with("XREADGROUP")
+        assert ret is None
+
+    def test_get_returns_after_nonblocking_hit(self) -> None:
+        """Test get() returns without polling when the non-blocking pass delivers."""
+        poller = object.__new__(MultiChannelPoller)
+        poller.after_read = set()
+        channel = MagicMock()
+        channel.active_queues = {"q1"}
+        channel.active_fanout_queues = set()
+        channel.qos.can_consume.return_value = True
+        poller._channels = {channel}
+        poller._register_XREADGROUP = MagicMock(return_value=True)
+        poller._register_XREAD = MagicMock()
+        poller.poller = MagicMock()
+
+        poller.get(MagicMock())
+
+        poller._register_XREADGROUP.assert_called_once_with(channel)
+        poller.poller.poll.assert_not_called()
+        assert poller._in_protected_read is False
+
+    def test_get_raises_empty_and_drains_after_read(self) -> None:
+        """Test get() raises Empty on no events and drains deferred after_read callbacks."""
+        poller = object.__new__(MultiChannelPoller)
+        deferred = MagicMock()
+        poller.after_read = {deferred}
+        channel = MagicMock()
+        channel.active_queues = {"q1"}
+        channel.active_fanout_queues = set()
+        channel.qos.can_consume.return_value = True
+        poller._channels = {channel}
+        poller._register_XREADGROUP = MagicMock(return_value=False)
+        poller._register_XREAD = MagicMock()
+        poller.poller = MagicMock()
+        poller.poller.poll.return_value = []
+
+        with pytest.raises(Empty):
+            poller.get(MagicMock())
+
+        # Asserting the registration pass and the poll (not just the drain)
+        # keeps this test red against the Task 3 scaffold's placeholder get(),
+        # which raises Empty immediately and never registers or polls
+        poller._register_XREADGROUP.assert_called_once_with(channel)
+        poller.poller.poll.assert_called_once()
+        deferred.assert_called_once_with()
+        assert not poller.after_read
+        assert poller._in_protected_read is False

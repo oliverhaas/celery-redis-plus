@@ -280,17 +280,100 @@ class MultiChannelPoller:
             client.connection = client.connection_pool.get_connection()
         return client.connection._sock is not None and (channel, client, cmd) in self._chan_to_sock
 
-    def on_poll_start(self) -> None:
-        """Start blocking reads for all consuming channels.
+    def _register_XREADGROUP(self, channel: Channel) -> bool:
+        """Enable XREADGROUP mode for channel (queue streams).
 
-        Placeholder: XREADGROUP/XREAD registration is added with the consume
-        cycle; until then there are no sockets to watch.
+        Runs the non-blocking EVALSHA consume pass inline; when every queue
+        is empty the channel arms a blocking XREADGROUP and keeps _in_poll
+        set until the reply is parsed by _xreadgroup_read.
+
+        Returns:
+            True if the non-blocking pass delivered a message.
         """
+        ident = channel, channel.client, "XREADGROUP"
+        if not self._client_registered(channel, channel.client, "XREADGROUP"):
+            channel._in_poll = False
+            self._register(*ident)
+        if not channel._in_poll:
+            try:
+                return channel._consume_read()
+            except Empty:
+                return False
+        return False
+
+    def _register_XREAD(self, channel: Channel) -> None:
+        """Enable XREAD mode for channel (fanout streams)."""
+        ident = channel, channel.subclient, "XREAD"
+        if not self._client_registered(channel, channel.subclient, "XREAD"):
+            channel._in_fanout_poll = False
+            self._register(*ident)
+        if not channel._in_fanout_poll:
+            channel._xread_start()
+
+    def on_poll_start(self) -> None:
+        for channel in self._channels:
+            qos = channel.qos
+            if qos is not None and channel.active_queues and qos.can_consume():
+                self._register_XREADGROUP(channel)
+            if qos is not None and channel.active_fanout_queues and qos.can_consume():
+                self._register_XREAD(channel)
 
     def on_poll_init(self, poller: Any) -> None:
         self.poller = poller
         # Initial pump on startup (delayed messages and reclaim)
         self.maybe_enqueue_due_messages()
+
+    def on_readable(self, fileno: int) -> bool | None:
+        chan, cmd_type = self._fd_to_chan[fileno]
+        qos = chan.qos
+        if qos is not None and qos.can_consume():
+            return chan.handlers[cmd_type]()
+        return None
+
+    def handle_event(self, fileno: int, event: int) -> tuple[Any, MultiChannelPoller] | None:
+        if event & READ:
+            return self.on_readable(fileno), self
+        if event & ERR:
+            chan, cmd_type = self._fd_to_chan[fileno]
+            chan._poll_error(cmd_type)
+        return None
+
+    def get(self, callback: Any, timeout: float | None = None) -> None:
+        self._in_protected_read = True
+        try:
+            for channel in self._channels:
+                qos = channel.qos
+                if (
+                    qos is not None
+                    and channel.active_queues
+                    and qos.can_consume()
+                    and self._register_XREADGROUP(channel)
+                ):
+                    # The non-blocking pass delivered a message
+                    return
+                if qos is not None and channel.active_fanout_queues and qos.can_consume():
+                    self._register_XREAD(channel)
+
+            events = self.poller.poll(timeout)
+            if events:
+                for fileno, event in events:
+                    ret = self.handle_event(fileno, event)
+                    if ret:
+                        return
+            raise Empty
+        finally:
+            self._in_protected_read = False
+            while self.after_read:
+                try:
+                    fun = self.after_read.pop()
+                except KeyError:
+                    break
+                else:
+                    fun()
+
+    @property
+    def fds(self) -> dict[int, tuple[Channel, str]]:
+        return self._fd_to_chan
 
     def maybe_enqueue_due_messages(self) -> int:
         """Move due delayed messages and reclaim timed-out deliveries.
@@ -322,45 +405,6 @@ class MultiChannelPoller:
 
         Placeholder: filled in with queue TTL support.
         """
-
-    def on_readable(self, fileno: int) -> bool | None:
-        chan, cmd_type = self._fd_to_chan[fileno]
-        qos = chan.qos
-        if qos is not None and qos.can_consume():
-            return chan.handlers[cmd_type]()
-        return None
-
-    def handle_event(self, fileno: int, event: int) -> tuple[Any, MultiChannelPoller] | None:
-        if event & READ:
-            return self.on_readable(fileno), self
-        if event & ERR:
-            chan, cmd_type = self._fd_to_chan[fileno]
-            chan._poll_error(cmd_type)
-        return None
-
-    def get(self, callback: Any, timeout: float | None = None) -> None:
-        """Drain events synchronously (no event loop).
-
-        Placeholder: queue/fanout registration is added with the consume cycle;
-        until then there is never anything to read, but after_read promises are
-        still honored.
-        """
-        self._in_protected_read = True
-        try:
-            raise Empty
-        finally:
-            self._in_protected_read = False
-            while self.after_read:
-                try:
-                    fun = self.after_read.pop()
-                except KeyError:
-                    break
-                else:
-                    fun()
-
-    @property
-    def fds(self) -> dict[int, tuple[Channel, str]]:
-        return self._fd_to_chan
 
 
 class Channel(FanoutStreamsMixin, virtual.Channel):
