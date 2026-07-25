@@ -178,13 +178,16 @@ except ImportError:  # pragma: no cover
     pass
 
 
-def _get_worker_pool_for_channel(channel: Channel) -> Any:
+def _get_worker_pool_for_channel(channel: Any) -> Any:
     """Look up the worker pool for the Celery app that owns this channel.
+
+    Accepts any of this package's Channel types (sorted set or streams);
+    only the connection.client.app attribute chain is accessed.
 
     Returns the pool if found, None otherwise.
     """
     try:
-        app = channel.connection.client.app  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+        app = channel.connection.client.app
         return _worker_pools.get(app)
     except AttributeError:
         # Fallback for non-Celery usage or when the connection chain is broken.
@@ -192,6 +195,29 @@ def _get_worker_pool_for_channel(channel: Channel) -> Any:
         if len(_worker_pools) == 1:
             return next(iter(_worker_pools.values()))
         return None
+
+
+def _drain_hub_callbacks(channel: Any) -> None:
+    """Execute pending hub callbacks to flush deferred acks.
+
+    The hub's _ready set holds callbacks scheduled via call_soon().
+    During graceful shutdown, worker threads may have completed tasks
+    and scheduled ack callbacks that haven't fired yet. Processing
+    them here ensures those delivery tags are marked dirty before
+    the remaining _delivered entries are evaluated.
+
+    Shared by this module's QoS and the streams transport's QoS.
+    """
+    try:
+        hub = channel.connection.cycle._loop
+    except AttributeError:
+        return
+    if hub is None:
+        return
+    ready = hub._pop_ready()
+    for cb in ready:
+        with suppress(Exception):
+            cb()
 
 
 def _queue_score(priority: int, timestamp: float | None = None) -> float:
@@ -470,22 +496,10 @@ class QoS(virtual.QoS):
     def _drain_hub_callbacks(self) -> None:
         """Execute pending hub callbacks to flush deferred acks.
 
-        The hub's _ready set holds callbacks scheduled via call_soon().
-        During graceful shutdown, worker threads may have completed tasks
-        and scheduled ack callbacks that haven't fired yet. Processing
-        them here ensures those delivery tags are marked dirty before
-        the remaining _delivered entries are evaluated.
+        Thin wrapper around the module-level _drain_hub_callbacks so the
+        drain step stays mockable per QoS instance in tests.
         """
-        try:
-            hub = self.channel.connection.cycle._loop
-        except AttributeError:
-            return
-        if hub is None:
-            return
-        ready = hub._pop_ready()
-        for cb in ready:
-            with suppress(Exception):
-                cb()
+        _drain_hub_callbacks(self.channel)
 
     def maybe_update_messages_index(self) -> None:
         """Update scores of delivered messages to now + visibility_timeout.

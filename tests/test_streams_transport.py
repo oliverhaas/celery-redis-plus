@@ -4908,3 +4908,35 @@ class TestStreamsHeartbeatIntegration:
 
         assert processed == 0
         assert delivered == []
+
+
+@pytest.mark.unit
+class TestStreamsShutdownRestore:
+    """Graceful shutdown: executor wait, then XCLAIM IDLE release of in-flight messages."""
+
+    def test_drain_hub_callbacks_module_function_runs_callbacks(self) -> None:
+        """Module-level _drain_hub_callbacks pops hub._ready and runs every callback."""
+        from celery_redis_plus.transport import _drain_hub_callbacks
+
+        callback_fail = MagicMock(side_effect=RuntimeError("boom"))
+        callback_ok = MagicMock()
+
+        mock_channel = MagicMock()
+        mock_channel.connection.cycle._loop._pop_ready.return_value = [callback_fail, callback_ok]
+
+        _drain_hub_callbacks(mock_channel)
+
+        # Both ran despite the first one raising (exceptions are suppressed)
+        callback_fail.assert_called_once()
+        callback_ok.assert_called_once()
+
+    def test_drain_hub_callbacks_module_function_safe_without_hub(self) -> None:
+        """Module-level _drain_hub_callbacks is a no-op without a hub or connection."""
+        from celery_redis_plus.transport import _drain_hub_callbacks
+
+        no_loop_channel = MagicMock()
+        no_loop_channel.connection.cycle._loop = None
+        _drain_hub_callbacks(no_loop_channel)  # Must not raise
+
+        broken_channel = MagicMock(spec=[])  # Empty spec: no attributes at all
+        _drain_hub_callbacks(broken_channel)  # AttributeError path, must not raise
