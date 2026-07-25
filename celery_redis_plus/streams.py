@@ -183,6 +183,16 @@ class QoS(virtual.QoS):
         self._fanout_tags: set[str] = set()
 
     def ack(self, delivery_tag: str) -> None:
+        if self.channel.closed:
+            # The channel was released by Transport._collect on a lost
+            # connection, not a real shutdown: there is no client left to
+            # talk to (conn_or_acquire() would try to rebuild a pool that
+            # kombu's Connection.collect() has already severed from a
+            # client), and the broker still owns this PEL entry, so a peer
+            # will reclaim it after the visibility timeout. Nothing to do here.
+            logger.debug("Skipping ack for delivery_tag %r: channel is closed", delivery_tag)
+            super().ack(delivery_tag)
+            return
         # Fanout messages don't need Redis cleanup (no consumer groups)
         if delivery_tag in self._fanout_tags:
             self._fanout_tags.discard(delivery_tag)
@@ -215,6 +225,14 @@ class QoS(virtual.QoS):
             )
 
     def reject(self, delivery_tag: str, requeue: bool = False) -> None:
+        if self.channel.closed:
+            # See ack(): the channel was released by Transport._collect, so
+            # there is no client left to talk to. The broker still owns this
+            # PEL entry and a peer will reclaim it after the visibility
+            # timeout, regardless of requeue.
+            logger.debug("Skipping reject for delivery_tag %r: channel is closed", delivery_tag)
+            super().ack(delivery_tag)
+            return
         # Fanout messages: requeue not supported (fire-and-forget broadcast)
         if delivery_tag in self._fanout_tags:
             self._fanout_tags.discard(delivery_tag)
@@ -334,7 +352,7 @@ class QoS(virtual.QoS):
                         len(released_tags),
                     )
                     for tag in released_tags:
-                        del self._in_flight[tag]
+                        self._in_flight.pop(tag, None)
         finally:
             state.restored = True  # type: ignore[attr-defined]  # ty: ignore[invalid-assignment]
 
@@ -1605,7 +1623,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         if self._in_fanout_poll:
             with suppress(Empty, *_connection_errors):
                 self._xread_read()
-        if not self.closed:
+        already_closed = self.closed
+        if not already_closed:
             self.connection.cycle.discard(self)
 
             client = self.__dict__.get("client")
@@ -1613,9 +1632,14 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 for queue in self._fanout_queues:
                     if queue in self.auto_delete_queues:
                         self.queue_delete(queue, client=client)
+        super().close()
+        if not already_closed:
+            # Runs after super().close() (which calls restore_unacked_once)
+            # on purpose: conn_or_acquire() can lazily rebuild self._pool
+            # during the restore, and that rebuilt pool must be disconnected
+            # too, not just whatever pool existed before restore ran.
             self._disconnect_pools()
             self._close_clients()
-        super().close()
 
     def _close_clients(self) -> None:
         for name in ("client", "subclient"):

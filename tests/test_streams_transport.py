@@ -46,7 +46,12 @@ from celery_redis_plus.streams import (
     client_lib,
     priority_to_level,
 )
-from celery_redis_plus.transport import PrefixedStrictRedis, _client_exceptions, _connection_errors
+from celery_redis_plus.transport import (
+    PrefixedStrictRedis,
+    _client_exceptions,
+    _connection_errors,
+    _release_channel_on_collect,
+)
 
 
 @pytest.mark.unit
@@ -1320,6 +1325,7 @@ class TestStreamsQoSAck:
         mock_context.__exit__ = MagicMock(return_value=False)
 
         mock_channel = MagicMock()
+        mock_channel.closed = False
         mock_channel.global_keyprefix = global_keyprefix
         mock_channel.consumer_group = "celery"
         mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
@@ -1345,7 +1351,7 @@ class TestStreamsQoSAck:
     def test_ack_fanout_tag_bypasses_stream_ack(self) -> None:
         """Test ack for fanout message discards the tag without touching Redis."""
         qos = object.__new__(QoS)
-        qos.channel = MagicMock()
+        qos.channel = MagicMock(closed=False)
         qos._fanout_tags = {"tag1"}
         qos._in_flight = {}
         qos._delivered = {"tag1": MagicMock()}
@@ -1361,7 +1367,7 @@ class TestStreamsQoSAck:
     def test_ack_missing_metadata_logs_critical_and_acks(self, caplog: pytest.LogCaptureFixture) -> None:
         """Test ack without in-flight metadata logs critical but still acks locally."""
         qos = object.__new__(QoS)
-        qos.channel = MagicMock()
+        qos.channel = MagicMock(closed=False)
         qos._fanout_tags = set()
         qos._in_flight = {}
         qos._delivered = {}
@@ -1374,6 +1380,39 @@ class TestStreamsQoSAck:
         assert "Cannot ack message" in caplog.text
         qos.channel.conn_or_acquire.assert_not_called()
         qos._quick_ack.assert_called_once_with("ghost-tag")
+
+    def test_ack_after_channel_closed_does_not_raise(self) -> None:
+        """N1 regression: acking a released channel's in-flight tag must not raise.
+
+        Simulates the state right after Transport._collect() has run: the
+        channel is marked closed, and kombu's Connection.collect() has
+        severed channel.connection.client to None (Connection.
+        _do_close_transport does this unconditionally after any collect).
+        Before the fix, this fell through to _ack_by_tag(), which calls
+        conn_or_acquire() -> the .pool property -> _get_pool() ->
+        _connparams(), and _connparams() raises TypeError when
+        self.connection.client is None. The entry must stay in _in_flight so
+        a peer reclaims it after the visibility timeout instead.
+        """
+        channel = object.__new__(Channel)
+        channel.connection = MagicMock()
+        channel.connection.client = None
+        channel.closed = True
+        channel._pool = None
+        channel._async_pool = None
+
+        qos = object.__new__(QoS)
+        qos.channel = channel
+        qos._fanout_tags = set()
+        qos._in_flight = {"tag1": (f"{STREAM_KEY_PREFIX}my_queue:0", "1700000000000-0")}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.ack("tag1")
+
+        qos._quick_ack.assert_called_once_with("tag1")
+        assert "tag1" in qos._in_flight
 
 
 @pytest.mark.unit
@@ -1391,6 +1430,7 @@ class TestStreamsQoSReject:
         mock_context.__exit__ = MagicMock(return_value=False)
 
         mock_channel = MagicMock()
+        mock_channel.closed = False
         mock_channel.global_keyprefix = global_keyprefix
         mock_channel.consumer_group = "celery"
         mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
@@ -1434,6 +1474,7 @@ class TestStreamsQoSReject:
         mock_context.__exit__ = MagicMock(return_value=False)
 
         mock_channel = MagicMock()
+        mock_channel.closed = False
         mock_channel.global_keyprefix = global_keyprefix
         mock_channel.consumer_group = "celery"
         mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
@@ -1458,7 +1499,7 @@ class TestStreamsQoSReject:
     def test_reject_fanout_tag_ignores_requeue(self) -> None:
         """Test reject for fanout message discards the tag; requeue unsupported for broadcast."""
         qos = object.__new__(QoS)
-        qos.channel = MagicMock()
+        qos.channel = MagicMock(closed=False)
         qos._fanout_tags = {"tag1"}
         qos._in_flight = {}
         qos._delivered = {}
@@ -1474,7 +1515,7 @@ class TestStreamsQoSReject:
     def test_reject_missing_metadata_logs_critical_and_acks(self, caplog: pytest.LogCaptureFixture) -> None:
         """Test reject without in-flight metadata logs critical but still acks locally."""
         qos = object.__new__(QoS)
-        qos.channel = MagicMock()
+        qos.channel = MagicMock(closed=False)
         qos._fanout_tags = set()
         qos._in_flight = {}
         qos._delivered = {}
@@ -1499,6 +1540,7 @@ class TestStreamsQoSReject:
         mock_context.__exit__ = MagicMock(return_value=False)
 
         mock_channel = MagicMock()
+        mock_channel.closed = False
         mock_channel.global_keyprefix = ""
         mock_channel.consumer_group = "celery"
         mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
@@ -1519,6 +1561,33 @@ class TestStreamsQoSReject:
         )
         assert "tag1" not in qos._in_flight
         qos._quick_ack.assert_called_once_with("tag1")
+
+    def test_reject_after_channel_closed_does_not_raise(self) -> None:
+        """N1 regression: rejecting a released channel's in-flight tag must not raise.
+
+        See TestStreamsQoSAck.test_ack_after_channel_closed_does_not_raise:
+        same collected-channel state, but through reject()'s _ack_by_tag()
+        branch instead of ack()'s.
+        """
+        channel = object.__new__(Channel)
+        channel.connection = MagicMock()
+        channel.connection.client = None
+        channel.closed = True
+        channel._pool = None
+        channel._async_pool = None
+
+        qos = object.__new__(QoS)
+        qos.channel = channel
+        qos._fanout_tags = set()
+        qos._in_flight = {"tag1": (f"{STREAM_KEY_PREFIX}my_queue:0", "1700000000000-0")}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.reject("tag1", requeue=True)
+
+        qos._quick_ack.assert_called_once_with("tag1")
+        assert "tag1" in qos._in_flight
 
 
 @pytest.mark.unit
@@ -5148,6 +5217,81 @@ class TestStreamsCollectVsClose:
         mock_qos.restore_unacked_once.assert_called_once()
         assert channel.closed is True
 
+    def test_collect_disconnects_pool_and_closes_clients(self) -> None:
+        """_release_channel_on_collect actually releases pool/client resources.
+
+        The other tests in this class use a channel with no cached pool or
+        client, so _disconnect_pools()/_close_clients() run as no-ops and
+        never prove any resource is actually released. This gives the channel
+        a real pool and client stand-in and asserts both are torn down.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        channel, _mock_qos = self._make_bare_channel()
+        mock_pool = MagicMock()
+        channel._pool = mock_pool
+        mock_client = MagicMock()
+        mock_client_connection = MagicMock()
+        mock_client.connection = mock_client_connection
+        channel.__dict__["client"] = mock_client
+        transport._avail_channels = [channel]
+        transport.channels = []
+
+        transport._collect(connection=MagicMock())
+
+        mock_pool.disconnect.assert_called_once()
+        assert channel._pool is None
+        mock_client_connection.disconnect.assert_called_once()
+        assert mock_client.connection is None
+
+    def test_collect_releases_channels_from_channels_list(self) -> None:
+        """Transport._collect also releases transport.channels, not just _avail_channels."""
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        channel, mock_qos = self._make_bare_channel()
+        transport._avail_channels = []
+        transport.channels = [channel]
+
+        transport._collect(connection=MagicMock())
+
+        mock_qos.restore_unacked_once.assert_not_called()
+        assert channel.closed is True
+
+    def test_release_channel_on_collect_already_closed_is_noop(self) -> None:
+        """A channel already closed (e.g. by a prior collect) is left untouched."""
+        channel, mock_qos = self._make_bare_channel()
+        channel.closed = True
+        channel._disconnect_pools = MagicMock()
+        channel._close_clients = MagicMock()
+
+        _release_channel_on_collect(channel)
+
+        mock_qos._on_collect.cancel.assert_not_called()
+        channel._disconnect_pools.assert_not_called()
+        channel._close_clients.assert_not_called()
+
+    def test_close_disconnects_a_pool_rebuilt_during_restore(self) -> None:
+        """A pool lazily rebuilt by restore_unacked_once() during close() must not leak.
+
+        N5 regression: _disconnect_pools()/_close_clients() now run AFTER
+        super().close() (which calls restore_unacked_once()) specifically so
+        that a pool conn_or_acquire() rebuilds mid-restore gets disconnected
+        too, instead of only whatever pool existed before restore ran.
+        """
+        channel, mock_qos = self._make_bare_channel()
+        rebuilt_pool = MagicMock()
+
+        def fake_restore(stderr: Any = None) -> None:
+            channel._pool = rebuilt_pool
+
+        mock_qos.restore_unacked_once.side_effect = fake_restore
+
+        channel.close()
+
+        mock_qos.restore_unacked_once.assert_called_once()
+        rebuilt_pool.disconnect.assert_called_once()
+        assert channel._pool is None
+
 
 @pytest.mark.integration
 class TestStreamsShutdownRestoreIntegration:
@@ -5171,12 +5315,12 @@ class TestStreamsShutdownRestoreIntegration:
         the entry sits in its PEL, then call the real producer_channel.close()
         (the production path: a Consumer bootstep closing its channel while
         the message is still in flight), not restore_unacked_once() directly.
-        close() runs _disconnect_pools()/_close_clients() (tearing down the
-        channel's pool, so channel._pool is None) before virtual.Channel.close()
-        reaches QoS.restore_unacked_once(), so this also proves
-        conn_or_acquire() lazily rebuilds a pool at release time rather than
-        assuming one is still live. Then read XPENDING directly to confirm the
-        entry's idle time is now far above visibility_timeout while
+        close() runs virtual.Channel.close() (which reaches
+        QoS.restore_unacked_once()) before _disconnect_pools()/_close_clients()
+        tear the channel's pool down, so whatever pool conn_or_acquire() uses
+        during the release is disconnected afterward rather than leaked. Then
+        read XPENDING directly to confirm the entry's idle time is now far
+        above visibility_timeout while
         times_delivered is untouched by the release itself, then confirm a
         second channel's reclaim pass picks the entry up right away, well
         inside a visibility_timeout deliberately set long enough that a
