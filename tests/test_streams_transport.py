@@ -4274,6 +4274,10 @@ class TestStreamsHeartbeat:
         channel._qos = mock_qos
 
         mock_client = MagicMock()
+        # Every requested id comes back as still pending, so no "no longer
+        # pending" warning fires here; that path is covered separately by
+        # test_heartbeat_logs_ids_no_longer_pending_without_pruning_in_flight.
+        mock_client.xclaim.side_effect = lambda *args, **_kwargs: args[4]
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
         mock_context.__exit__ = MagicMock(return_value=False)
@@ -4304,6 +4308,7 @@ class TestStreamsHeartbeat:
         channel._qos = mock_qos
 
         mock_client = MagicMock()
+        mock_client.xclaim.return_value = ["1111-0"]
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
         mock_context.__exit__ = MagicMock(return_value=False)
@@ -4337,8 +4342,47 @@ class TestStreamsHeartbeat:
         mock_qos._in_flight = {"tag1": ("stream:celery:0", "1111-0")}
         channel._qos = mock_qos
 
+        # conn_or_acquire itself fails (e.g. the connection cannot be
+        # established at all), so there is no per-stream loop to isolate;
+        # this exercises the outer guard.
+        channel.conn_or_acquire = MagicMock(side_effect=ConnectionError("connection lost"))
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+            patch("celery_redis_plus.streams.logger") as mock_logger,
+        ):
+            channel._heartbeat()  # Must not raise
+
+        mock_logger.warning.assert_called_once()
+
+    def test_heartbeat_stream_error_does_not_abort_other_streams(self) -> None:
+        """Test that a non-NOGROUP error heartbeating one stream still lets the rest heartbeat.
+
+        Before this fix, any exception other than a NOGROUP ResponseError
+        propagated out of the per-stream loop and was caught by the outer
+        try/except, abandoning every remaining stream for that cycle. One
+        unlucky stream would silently stop heartbeats for all others,
+        causing exactly the spurious-reclaim failure this method exists to
+        prevent.
+        """
+        channel = object.__new__(Channel)
+        channel.ResponseError = _client_exceptions.ResponseError
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {
+            "tag1": ("stream:celery:9", "1111-0"),
+            "tag2": ("stream:celery:0", "2222-0"),
+        }
+        channel._qos = mock_qos
+
         mock_client = MagicMock()
-        mock_client.xclaim.side_effect = ConnectionError("connection lost")
+
+        def _xclaim(stream_key: str, *args: object, **kwargs: object) -> list[object]:
+            if stream_key == "stream:celery:9":
+                raise ConnectionError("connection reset")
+            return ["2222-0"]
+
+        mock_client.xclaim.side_effect = _xclaim
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
         mock_context.__exit__ = MagicMock(return_value=False)
@@ -4351,7 +4395,53 @@ class TestStreamsHeartbeat:
         ):
             channel._heartbeat()  # Must not raise
 
+        # Both streams were attempted; the failure on the first did not
+        # prevent the second from being heartbeated.
+        assert mock_client.xclaim.call_count == 2
+        mock_client.xclaim.assert_any_call("stream:celery:0", "celery", "worker-1", 0, ["2222-0"], justid=True)
         mock_logger.warning.assert_called_once()
+        assert mock_logger.warning.call_args.kwargs.get("exc_info") is True
+
+    def test_heartbeat_logs_ids_no_longer_pending_without_pruning_in_flight(self) -> None:
+        """Test that ids missing from the XCLAIM JUSTID reply are logged, not pruned.
+
+        An id requested but absent from the reply is no longer in the PEL
+        (already acked through another path, or its stream entry was
+        deleted). That is observable and worth a warning, but _in_flight
+        must not be pruned from it: _in_flight is what the ack path
+        resolves a delivery tag through, and the local task for that id
+        may still be executing.
+        """
+        channel = object.__new__(Channel)
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {
+            "tag1": ("stream:celery:9", "1111-0"),
+            "tag2": ("stream:celery:9", "2222-0"),
+        }
+        channel._qos = mock_qos
+
+        mock_client = MagicMock()
+        # Only 1111-0 comes back as still pending; 2222-0 was acked elsewhere.
+        mock_client.xclaim.return_value = [b"1111-0"]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+            patch("celery_redis_plus.streams.logger") as mock_logger,
+        ):
+            channel._heartbeat()
+
+        assert mock_qos._in_flight == {
+            "tag1": ("stream:celery:9", "1111-0"),
+            "tag2": ("stream:celery:9", "2222-0"),
+        }
+        mock_logger.warning.assert_called_once()
+        args = mock_logger.warning.call_args.args
+        assert args[1:] == (1, 2, "stream:celery:9")
 
     def test_heartbeat_nogroup_invalidates_stream_and_continues(self) -> None:
         """Test a NOGROUP on one stream drops its cached ensure while other streams still heartbeat."""
@@ -4373,7 +4463,7 @@ class TestStreamsHeartbeat:
                 raise _client_exceptions.ResponseError(
                     "NOGROUP No such key 'stream:celery:9' or consumer group 'celery'",
                 )
-            return []
+            return ["2222-0"]
 
         mock_client.xclaim.side_effect = _xclaim
         mock_context = MagicMock()
@@ -4404,6 +4494,20 @@ class TestStreamsHeartbeat:
         channel1._heartbeat.assert_called_once_with()
         channel2._heartbeat.assert_called_once_with()
 
+    @staticmethod
+    def _heartbeat_timer_call(mock_loop: MagicMock, transport: Transport) -> Any:
+        """Return the single call_repeatedly call that registers the heartbeat timer.
+
+        Filters by identity of transport.cycle.maybe_heartbeat (not assert_any_call)
+        and asserts there is exactly one such registration, so a stale duplicate
+        registration would fail the test instead of passing unnoticed.
+        """
+        heartbeat_calls = [
+            c for c in mock_loop.call_repeatedly.call_args_list if c.args[1] is transport.cycle.maybe_heartbeat
+        ]
+        assert len(heartbeat_calls) == 1
+        return heartbeat_calls[0]
+
     def test_register_with_event_loop_registers_heartbeat_timer(self) -> None:
         """Test that the heartbeat timer defaults to visibility_timeout / HEARTBEAT_INTERVAL_DIVISOR."""
         transport = object.__new__(Transport)
@@ -4414,10 +4518,8 @@ class TestStreamsHeartbeat:
 
         transport.register_with_event_loop(mock_connection, mock_loop)
 
-        mock_loop.call_repeatedly.assert_any_call(
-            DEFAULT_VISIBILITY_TIMEOUT / HEARTBEAT_INTERVAL_DIVISOR,
-            transport.cycle.maybe_heartbeat,
-        )
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == DEFAULT_VISIBILITY_TIMEOUT / HEARTBEAT_INTERVAL_DIVISOR
 
     def test_register_with_event_loop_heartbeat_derived_from_visibility_timeout(self) -> None:
         """Test that a custom visibility_timeout scales the default heartbeat interval."""
@@ -4429,7 +4531,8 @@ class TestStreamsHeartbeat:
 
         transport.register_with_event_loop(mock_connection, mock_loop)
 
-        mock_loop.call_repeatedly.assert_any_call(20.0, transport.cycle.maybe_heartbeat)
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == 20.0
 
     def test_register_with_event_loop_heartbeat_interval_override(self) -> None:
         """Test that the heartbeat_interval transport option overrides the derived default."""
@@ -4441,7 +4544,8 @@ class TestStreamsHeartbeat:
 
         transport.register_with_event_loop(mock_connection, mock_loop)
 
-        mock_loop.call_repeatedly.assert_any_call(7, transport.cycle.maybe_heartbeat)
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == 7
 
     def test_register_with_event_loop_clamps_heartbeat_interval_equal_to_visibility_timeout(self) -> None:
         """Test that heartbeat_interval == visibility_timeout is clamped rather than honored as-is.
@@ -4460,7 +4564,8 @@ class TestStreamsHeartbeat:
         with patch("celery_redis_plus.streams.logger") as mock_logger:
             transport.register_with_event_loop(mock_connection, mock_loop)
 
-        mock_loop.call_repeatedly.assert_any_call(20.0, transport.cycle.maybe_heartbeat)
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == 20.0
         mock_logger.warning.assert_called_once()
 
     def test_register_with_event_loop_clamps_heartbeat_interval_above_visibility_timeout(self) -> None:
@@ -4474,7 +4579,148 @@ class TestStreamsHeartbeat:
         with patch("celery_redis_plus.streams.logger") as mock_logger:
             transport.register_with_event_loop(mock_connection, mock_loop)
 
-        mock_loop.call_repeatedly.assert_any_call(20.0, transport.cycle.maybe_heartbeat)
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == 20.0
+        mock_logger.warning.assert_called_once()
+
+    def test_register_with_event_loop_honors_heartbeat_interval_at_half_visibility_timeout(self) -> None:
+        """Test that heartbeat_interval == visibility_timeout / 2 is honored, not clamped.
+
+        This is the boundary M3 fixed: the clamp must leave meaningful
+        headroom (at least 2 heartbeats per visibility_timeout window)
+        rather than only rejecting values that equal or exceed
+        visibility_timeout outright.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": 100, "heartbeat_interval": 50}
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == 50
+        mock_logger.warning.assert_not_called()
+
+    def test_register_with_event_loop_clamps_heartbeat_interval_just_above_half_visibility_timeout(self) -> None:
+        """Test that a heartbeat_interval leaving less than half of visibility_timeout as headroom is clamped.
+
+        Before M3 the clamp only rejected values >= visibility_timeout, so a
+        value like 0.9 * visibility_timeout passed straight through with
+        essentially zero safety margin against a slow tick or GC pause.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": 100, "heartbeat_interval": 51}
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == 20.0
+        mock_logger.warning.assert_called_once()
+
+    def test_register_with_event_loop_clamps_heartbeat_interval_zero(self) -> None:
+        """Test that heartbeat_interval=0 falls back to the default instead of disabling heartbeats.
+
+        kombu's Timer._reschedules guards call_repeatedly with
+        `if lsince and lsince >= secs`, which is never true when secs is 0,
+        so a zero interval would silently disable every heartbeat callback
+        forever instead of raising or firing constantly.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": 100, "heartbeat_interval": 0}
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == 20.0
+        mock_logger.warning.assert_called_once()
+
+    def test_register_with_event_loop_clamps_heartbeat_interval_negative(self) -> None:
+        """Test that a negative heartbeat_interval falls back to the default.
+
+        A negative secs would fire the heartbeat callback on every hub tick
+        (the opposite failure mode from zero), which is just as invalid a
+        configuration as a too-large or zero value.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": 100, "heartbeat_interval": -5}
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == 20.0
+        mock_logger.warning.assert_called_once()
+
+    def test_register_with_event_loop_clamps_heartbeat_interval_nan(self) -> None:
+        """Test that a non-finite heartbeat_interval (NaN) falls back to the default.
+
+        Every comparison with NaN is False, so the chained
+        `0 < heartbeat_interval <= max_safe_heartbeat_interval` check
+        rejects it naturally without a separate math.isfinite check.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": 100, "heartbeat_interval": float("nan")}
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == 20.0
+        mock_logger.warning.assert_called_once()
+
+    def test_register_with_event_loop_visibility_timeout_zero_falls_back_to_default(self) -> None:
+        """Test that visibility_timeout=0 is treated as invalid configuration, not honored.
+
+        A zero visibility_timeout is nonsensical for this transport (every
+        message would be immediately eligible for reclaim) and, left
+        unguarded, would also poison the heartbeat_interval derivation
+        (visibility_timeout / HEARTBEAT_INTERVAL_DIVISOR == 0, which is
+        itself an invalid heartbeat_interval). It is rejected outright and
+        replaced with DEFAULT_VISIBILITY_TIMEOUT.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": 0}
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == DEFAULT_VISIBILITY_TIMEOUT / HEARTBEAT_INTERVAL_DIVISOR
+        mock_logger.warning.assert_called_once()
+
+    def test_register_with_event_loop_visibility_timeout_negative_falls_back_to_default(self) -> None:
+        """Test that a negative visibility_timeout is also treated as invalid configuration."""
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": -10}
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == DEFAULT_VISIBILITY_TIMEOUT / HEARTBEAT_INTERVAL_DIVISOR
         mock_logger.warning.assert_called_once()
 
 
@@ -4499,12 +4745,20 @@ class TestStreamsHeartbeatIntegration:
         elapsed time is well past visibility_timeout.
 
         Sequence: publish and consume via one channel ("producer-worker",
-        simulating a long-running task that has not acked yet), call
-        _heartbeat() on that channel every half of a short visibility_timeout
-        so the PEL idle clock never crosses the timeout, then have a second
-        channel with a different consumer identity ("reclaimer-worker") try
-        to reclaim it. The reclaim must find nothing: the heartbeat resets
-        the idle clock before it ever qualifies as abandoned.
+        simulating a long-running task that has not acked yet), set up a
+        second channel with a different consumer identity
+        ("reclaimer-worker") and its consumer group up front, then call
+        _heartbeat() on the producer channel every half of a short
+        visibility_timeout so the PEL idle clock never crosses the timeout.
+        The reclaimer's channel construction (ping) and basic_consume (which
+        issues an XGROUP CREATE round trip per priority stream) happen
+        before the heartbeat loop, not in the window between the last
+        heartbeat and the reclaim check below: if that setup ran after the
+        loop instead, it would compete with visibility_timeout for time and
+        could make this test fail against correct code on a slow container
+        start or a loaded CI host. Only _reclaim_and_deliver itself runs in
+        that window. The reclaim must find nothing: the heartbeat resets the
+        idle clock before it ever qualifies as abandoned.
         """
         host, port, _image = redis_container
         broker_url = f"redis://{host}:{port}/0"
@@ -4547,12 +4801,10 @@ class TestStreamsHeartbeatIntegration:
             consumed = producer_channel._get(queue)
             assert consumed["properties"]["delivery_tag"] == "tag-integration-heartbeat"
 
-            # Heartbeat well past visibility_timeout, resetting idle every
-            # half-period so it never crosses the timeout.
-            for _ in range(6):
-                time.sleep(visibility_timeout / 2)
-                producer_channel._heartbeat()
-
+            # Build the reclaimer's channel and consumer group up front, so
+            # that setup cost is paid before the heartbeat loop rather than
+            # in the critical window between the last heartbeat and the
+            # reclaim check below.
             reclaimer_channel = cast("Channel", reclaimer_conn.channel())
             delivered: list[Any] = []
             reclaimer_channel.basic_consume(
@@ -4561,6 +4813,12 @@ class TestStreamsHeartbeatIntegration:
                 callback=delivered.append,
                 consumer_tag="reclaimer-ctag",
             )
+
+            # Heartbeat well past visibility_timeout, resetting idle every
+            # half-period so it never crosses the timeout.
+            for _ in range(6):
+                time.sleep(visibility_timeout / 2)
+                producer_channel._heartbeat()
 
             processed = reclaimer_channel._reclaim_and_deliver(queue, budget=10)
         finally:

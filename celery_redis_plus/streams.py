@@ -42,7 +42,10 @@ Transport Options
 * ``visibility_timeout``: Seconds of heartbeat silence before in-flight messages are
   reclaimed from a dead worker (default: 300)
 * ``heartbeat_interval``: XCLAIM JUSTID heartbeat cadence in seconds
-  (default: ``visibility_timeout / 5``)
+  (default: ``visibility_timeout / 5``). Must be a positive number no greater
+  than half of ``visibility_timeout``; an out-of-range value (including a
+  non-positive or non-numeric ``visibility_timeout``) is overridden back to
+  the derived default and a warning is logged
 * ``max_restore_count``: Delivery-count cap before poisoned messages are dropped or
   dead-lettered (default: None = no limit)
 * ``dead_letter_stream``: Stream to copy poisoned messages to (default: None)
@@ -835,12 +838,20 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         a long-running task never counts toward the poison cap and its entry
         is never reclaimed by a peer while this worker is alive.
 
-        A NOGROUP on one stream means that stream (and its group, PEL
-        included) was deleted out of band; there is nothing left to keep
-        alive there, so its cached ensure is dropped (the next consume
-        pass re-creates the group) and the remaining streams are still
-        heartbeated. Other errors are logged and swallowed so the
-        periodic heartbeat timer survives transient connection failures.
+        A failure heartbeating one stream, NOGROUP or otherwise, is logged
+        and does not stop the remaining streams from being heartbeated this
+        cycle: letting one bad stream cancel every other stream's heartbeat
+        would itself cause the spurious reclaims this method exists to
+        prevent. A NOGROUP specifically means that stream (and its group,
+        PEL included) was deleted out of band, so its cached ensure is
+        dropped too (the next consume pass re-creates the group).
+
+        Because min_idle_time=0 claims unconditionally, a worker that stalls
+        past the visibility timeout (a GC pause, blocked I/O) and then
+        recovers can claim an entry back from a peer that legitimately
+        reclaimed it in the meantime, racing that peer for the same message.
+        This is inherent to XCLAIM and to the at-least-once contract, not a
+        bug in this method, and is not addressed here.
         """
         qos = self.qos
         if qos is None:
@@ -860,7 +871,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             with self.conn_or_acquire() as client:
                 for stream_key, message_ids in ids_by_stream.items():
                     try:
-                        client.xclaim(
+                        refreshed = client.xclaim(
                             stream_key,
                             self.consumer_group,
                             self.consumer_name,
@@ -869,11 +880,46 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             justid=True,
                         )
                     except self.ResponseError as exc:
-                        if "NOGROUP" not in str(exc):
-                            raise
-                        # Stream deleted out of band: drop the cached ensure
-                        # and keep heartbeating the other streams
-                        self._ensured_groups.discard(stream_key)
+                        if "NOGROUP" in str(exc):
+                            # Stream deleted out of band: drop the cached ensure
+                            # and keep heartbeating the other streams
+                            self._ensured_groups.discard(stream_key)
+                        else:
+                            logger.warning(
+                                "Failed to heartbeat stream %s, will retry next cycle",
+                                stream_key,
+                                exc_info=True,
+                            )
+                        continue
+                    except Exception:
+                        # A failure on one stream must not abort the loop: the
+                        # remaining streams still need their heartbeat this cycle.
+                        logger.warning(
+                            "Failed to heartbeat stream %s, will retry next cycle",
+                            stream_key,
+                            exc_info=True,
+                        )
+                        continue
+
+                    # justid=True returns exactly the ids that were still
+                    # pending and had their idle clock reset. An id requested
+                    # but absent from the reply is no longer in the PEL
+                    # (already acked through another path, or its stream
+                    # entry was deleted): observability only, logged below.
+                    # Do NOT prune _in_flight from this reply: _in_flight is
+                    # what the ack path resolves a delivery tag through, and
+                    # the local task for a "missing" id may still be
+                    # executing, so dropping it here would break its ack.
+                    refreshed_ids = {bytes_to_str(entry_id) for entry_id in refreshed}
+                    missing = [message_id for message_id in message_ids if message_id not in refreshed_ids]
+                    if missing:
+                        logger.warning(
+                            "Heartbeat found %d of %d in-flight ids no longer pending on stream %s "
+                            "(already acked elsewhere, or the stream entry was deleted)",
+                            len(missing),
+                            len(message_ids),
+                            stream_key,
+                        )
         except Exception:
             logger.warning("Failed to heartbeat in-flight messages, will retry next cycle", exc_info=True)
 
@@ -1754,16 +1800,36 @@ class Transport(virtual.Transport):
         # Periodic pump: delayed messages, PEL reclaim, and consumer hygiene
         loop.call_repeatedly(DEFAULT_REQUEUE_CHECK_INTERVAL, cycle.maybe_enqueue_due_messages)
 
-        # Heartbeat keeps in-flight PEL entries alive while tasks are running
+        # Heartbeat keeps in-flight PEL entries alive while tasks are running.
+        # visibility_timeout must be a positive real number: besides being
+        # this transport's own reclaim window, it is the denominator used to
+        # derive a safe heartbeat_interval below, so an invalid value here
+        # would poison that derivation too. Treat anything else as invalid
+        # configuration and fall back to the transport default.
         transport_options = connection.client.transport_options  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         visibility_timeout = transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)
-        default_heartbeat_interval = visibility_timeout / HEARTBEAT_INTERVAL_DIVISOR
-        heartbeat_interval = transport_options.get("heartbeat_interval", default_heartbeat_interval)
-        if heartbeat_interval >= visibility_timeout:
+        if not (isinstance(visibility_timeout, numbers.Real) and visibility_timeout > 0):
             logger.warning(
-                "heartbeat_interval %s is >= visibility_timeout %s, which guarantees "
-                "spurious reclaims of this worker's own live messages; falling back "
-                "to the default of %s instead of honoring it",
+                "visibility_timeout %r is not a positive number; falling back to the default of %s",
+                visibility_timeout,
+                DEFAULT_VISIBILITY_TIMEOUT,
+            )
+            visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        default_heartbeat_interval = visibility_timeout / HEARTBEAT_INTERVAL_DIVISOR
+        # HEARTBEAT_INTERVAL_DIVISOR already picks a default cadence with
+        # headroom to spare (5 heartbeats per visibility_timeout window). A
+        # configured heartbeat_interval must not be allowed to erase that
+        # margin: require at least 2 heartbeats per window (interval <=
+        # visibility_timeout / 2), matching the same divide-for-headroom
+        # intent at a looser, still-safe bound.
+        max_safe_heartbeat_interval = visibility_timeout / 2
+        heartbeat_interval = transport_options.get("heartbeat_interval", default_heartbeat_interval)
+        if not (isinstance(heartbeat_interval, numbers.Real) and 0 < heartbeat_interval <= max_safe_heartbeat_interval):
+            logger.warning(
+                "heartbeat_interval %r must be a positive number no greater than half of "
+                "visibility_timeout %s to leave headroom against spurious reclaims of this "
+                "worker's own live messages; falling back to the default of %s instead of "
+                "honoring it",
                 heartbeat_interval,
                 visibility_timeout,
                 default_heartbeat_interval,
