@@ -573,7 +573,6 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             args = [
                 self.consumer_group,
                 self.consumer_name,
-                int(time() * 1000),
                 ttl_ms,
             ]
             try:

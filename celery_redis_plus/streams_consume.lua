@@ -6,20 +6,35 @@
 --
 -- Handles expired entries (x-message-ttl) lazily: an entry whose ID
 -- timestamp is older than the TTL is XACK+XDEL'd and the same stream is
--- retried, so expired messages are dropped instead of delivered.
+-- retried, so expired messages are dropped instead of delivered. The
+-- number of drops across ALL keys in this invocation is capped
+-- (max_drops) so a large expired backlog cannot block single-threaded
+-- Redis for an unbounded amount of time; once the cap is reached the
+-- script stops and returns false, and the next _get call resumes
+-- draining the backlog.
+--
+-- Current time is read via redis.call('TIME') rather than a caller-
+-- supplied timestamp: expiry is judged against the server's clock (the
+-- same clock that minted the entry IDs being compared), never the
+-- calling host's clock.
 --
 -- KEYS: [stream:q:9, stream:q:6, ...] - one queue's level stream keys,
 --       highest priority level first (with global_keyprefix applied)
 -- ARGV: [1] = consumer group name,
 --       [2] = consumer name,
---       [3] = now in milliseconds,
---       [4] = message TTL in milliseconds (0 = no TTL)
+--       [3] = message TTL in milliseconds (0 = no TTL)
 -- Returns: {stream_key, entry_id, payload} or false (nil to redis-py)
 
 local group = ARGV[1]
 local consumer = ARGV[2]
-local now_ms = tonumber(ARGV[3])
-local ttl_ms = tonumber(ARGV[4])
+local ttl_ms = tonumber(ARGV[3])
+
+local time_result = redis.call('TIME')
+local now_ms = tonumber(time_result[1]) * 1000 + math.floor(tonumber(time_result[2]) / 1000)
+
+-- Bound total expired-entry drops across all keys in this invocation.
+local max_drops = 100
+local drops = 0
 
 for i = 1, #KEYS do
     local key = KEYS[i]
@@ -38,6 +53,12 @@ for i = 1, #KEYS do
                 -- Expired (x-message-ttl): drop and retry the same stream
                 redis.call('XACK', key, group, entry_id)
                 redis.call('XDEL', key, entry_id)
+                drops = drops + 1
+                if drops >= max_drops then
+                    -- Drop cap reached: stop now with bounded work done.
+                    -- The next _get call continues draining the backlog.
+                    return false
+                end
             else
                 return {key, entry_id, payload}
             end

@@ -1053,7 +1053,7 @@ class TestStreamsGet:
     """Tests for the synchronous Channel._get consume path (streams_consume Lua script)."""
 
     def test_get_calls_consume_script_with_level_keys_highest_first(self, global_keyprefix: str) -> None:
-        """Test _get passes prefixed level-stream KEYS (highest level first) and group/consumer/now/ttl ARGV."""
+        """Test _get passes prefixed level-stream KEYS (highest level first) and group/consumer/ttl ARGV."""
         channel = object.__new__(Channel)
         channel.global_keyprefix = global_keyprefix
         channel.message_ttl = None
@@ -1081,13 +1081,11 @@ class TestStreamsGet:
         mock_context.__exit__ = MagicMock(return_value=False)
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
 
-        before_ms = int(time.time() * 1000)
         with (
             patch.object(Channel, "consumer_group", "celery", create=True),
             patch.object(Channel, "consumer_name", "testhost:4242", create=True),
         ):
             message = channel._get("my_queue")
-        after_ms = int(time.time() * 1000)
 
         assert message == payload
         # Consumer groups are ensured for every level stream (avoids NOGROUP inside the script)
@@ -1101,12 +1099,12 @@ class TestStreamsGet:
             f"{global_keyprefix}stream:my_queue:3",
             f"{global_keyprefix}stream:my_queue:0",
         ]
-        # ARGV: group, consumer, now_ms, message_ttl_ms (0 = no TTL)
+        # ARGV: group, consumer, message_ttl_ms (0 = no TTL); now is read
+        # server-side via redis.call('TIME') inside the script
         args = mock_script.call_args.kwargs["args"]
         assert args[0] == "celery"
         assert args[1] == "testhost:4242"
-        assert before_ms <= int(args[2]) <= after_ms
-        assert int(args[3]) == 0
+        assert int(args[2]) == 0
 
     def test_get_raises_empty_on_nil(self) -> None:
         """Test _get raises Empty and records no metadata when the script returns nil."""
@@ -1219,7 +1217,7 @@ class TestStreamsGet:
             channel._get("my_queue")
 
         args = mock_script.call_args.kwargs["args"]
-        assert int(args[3]) == expected_ttl_ms
+        assert int(args[2]) == expected_ttl_ms
 
     def test_get_nogroup_invalidates_and_retries_once(self) -> None:
         """Test _get self-heals NOGROUP (stream deleted out of band): invalidate, re-ensure, retry once."""
