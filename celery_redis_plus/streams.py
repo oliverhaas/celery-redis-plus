@@ -62,6 +62,7 @@ import os
 import socket as socket_module
 from contextlib import contextmanager, suppress
 from queue import Empty
+from time import time
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from kombu.exceptions import VersionMismatch
@@ -70,6 +71,7 @@ from kombu.utils.compat import register_after_fork
 from kombu.utils.eventio import ERR, READ, poll
 from kombu.utils.functional import accepts_argument
 from kombu.utils.imports import symbol_by_name
+from kombu.utils.json import dumps
 from kombu.utils.objects import cached_property
 from kombu.utils.url import _parse_url
 from vine import promise
@@ -471,6 +473,48 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 if "BUSYGROUP" not in str(exc):
                     raise
         self._ensured_groups.add(stream_key)
+
+    def _put(self, queue: str, message: dict[str, Any], **kwargs: Any) -> None:
+        """Publish a message to a queue's priority stream or the delayed zset.
+
+        Immediate messages are XADDed to the stream for their priority level
+        (consumer group ensured first, so the entry is registered in the PEL
+        on first XREADGROUP). Native delayed messages (delay > requeue check
+        interval) are ZADDed to the delayed zset as the full serialized
+        message, scored by absolute delivery time in milliseconds; the
+        delayed pump moves them into their priority stream when due.
+
+        Args:
+            queue: Target queue name.
+            message: Message dict with 'properties' containing optional 'eta'
+                     (Unix timestamp float) for delayed delivery.
+        """
+        now = time()
+
+        # eta is a Unix timestamp (float) in properties, similar to priority.
+        # Native delayed delivery only applies if delay > requeue check interval.
+        # Shorter delays are handled by Celery's built-in eta logic (immediate delivery).
+        eta_timestamp: float | None = message["properties"].get("eta")
+
+        if eta_timestamp is not None and (eta_timestamp - now) > DEFAULT_REQUEUE_CHECK_INTERVAL:
+            # Member is the self-contained serialized message; score is the
+            # absolute delivery time in milliseconds
+            delayed_key = self._delayed_key(queue)
+            with self.conn_or_acquire() as client:
+                client.zadd(delayed_key, {dumps(message): eta_timestamp * 1000})
+                if queue in self._expires:
+                    client.pexpire(delayed_key, self._expires[queue])
+            return
+
+        priority = self._get_message_priority(message, reverse=False)
+        level = priority_to_level(priority, self.priority_steps)
+        stream_key = self._stream_key(queue, level)
+        # Group must exist before XADD so the entry is visible to XREADGROUP '>'
+        self._ensure_group(stream_key)
+        with self.conn_or_acquire() as client:
+            client.xadd(name=stream_key, fields={"payload": dumps(message)}, id="*")
+            if queue in self._expires:
+                client.pexpire(stream_key, self._expires[queue])
 
     @property
     def priority_steps(self) -> list[int]:

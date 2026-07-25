@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from kombu import Connection
 from kombu.transport import TRANSPORT_ALIASES, get_transport_cls
+from kombu.utils.json import dumps as json_dumps
 from vine import promise
 
 from celery_redis_plus import signals
@@ -762,3 +764,218 @@ class TestStreamsEnsureGroup:
             channel._ensure_group("stream:my_queue:0")
 
         assert "stream:my_queue:0" not in channel._ensured_groups
+
+
+@pytest.mark.unit
+class TestStreamsPut:
+    """Unit tests for Channel._put (XADD to priority stream / ZADD to delayed zset)."""
+
+    def test_put_immediate_xadds_to_level_stream(self, global_keyprefix: str) -> None:
+        """Test that an immediate message is XADDed to the level-0 stream with the group ensured first."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._expires = {}
+        channel._ensure_group = MagicMock()
+        # priority_steps reads self.connection.client.transport_options, and a bare
+        # object.__new__ instance has no connection, so mock the whole chain
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        message = {
+            "body": '{"task": "test"}',
+            "properties": {
+                "delivery_tag": "tag123",
+                "delivery_info": {"exchange": "celery", "routing_key": "my_queue"},
+                "headers": {},
+            },
+        }
+
+        channel._put("my_queue", message)
+
+        channel._ensure_group.assert_called_once_with("stream:my_queue:0")
+        mock_client.xadd.assert_called_once_with(
+            name="stream:my_queue:0",
+            fields={"payload": json_dumps(message)},
+            id="*",
+        )
+        mock_client.zadd.assert_not_called()
+        mock_client.pexpire.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("priority", "expected_level"),
+        [(0, 0), (2, 0), (3, 3), (5, 3), (6, 6), (8, 6), (9, 9), (200, 9)],
+    )
+    def test_put_priority_bucketing_selects_level_stream(self, priority: int, expected_level: int) -> None:
+        """Test that message priority is bucketed onto the highest step <= priority."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._expires = {}
+        channel._ensure_group = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        message = {
+            "body": '{"task": "test"}',
+            "properties": {
+                "delivery_tag": "tag123",
+                "priority": priority,
+                "delivery_info": {"exchange": "celery", "routing_key": "my_queue"},
+                "headers": {},
+            },
+        }
+
+        channel._put("my_queue", message)
+
+        channel._ensure_group.assert_called_once_with(f"stream:my_queue:{expected_level}")
+        mock_client.xadd.assert_called_once_with(
+            name=f"stream:my_queue:{expected_level}",
+            fields={"payload": json_dumps(message)},
+            id="*",
+        )
+
+    def test_put_native_delayed_zadds_with_eta_ms_score(self, global_keyprefix: str) -> None:
+        """Test that a message with eta beyond the requeue check interval goes to the delayed zset."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._expires = {}
+        channel._ensure_group = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        eta_timestamp = time.time() + 120  # far beyond the patched DEFAULT_REQUEUE_CHECK_INTERVAL (2s)
+        message = {
+            "body": '{"task": "test"}',
+            "properties": {
+                "delivery_tag": "tag123",
+                "eta": eta_timestamp,
+                "delivery_info": {"exchange": "celery", "routing_key": "my_queue"},
+                "headers": {},
+            },
+        }
+
+        channel._put("my_queue", message)
+
+        channel._ensure_group.assert_not_called()
+        mock_client.xadd.assert_not_called()
+        mock_client.zadd.assert_called_once()
+        args, _kwargs = mock_client.zadd.call_args
+        assert args[0] == "delayed:my_queue"
+        assert args[1] == {json_dumps(message): eta_timestamp * 1000}
+        mock_client.pexpire.assert_not_called()
+
+    def test_put_short_eta_goes_to_stream(self, global_keyprefix: str) -> None:
+        """Test that a short eta (below the requeue check interval) is published immediately."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._expires = {}
+        channel._ensure_group = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        eta_timestamp = time.time() + 1  # below the patched DEFAULT_REQUEUE_CHECK_INTERVAL (2s)
+        message = {
+            "body": '{"task": "test"}',
+            "properties": {
+                "delivery_tag": "tag123",
+                "eta": eta_timestamp,
+                "delivery_info": {"exchange": "celery", "routing_key": "my_queue"},
+                "headers": {},
+            },
+        }
+
+        channel._put("my_queue", message)
+
+        mock_client.zadd.assert_not_called()
+        mock_client.xadd.assert_called_once_with(
+            name="stream:my_queue:0",
+            fields={"payload": json_dumps(message)},
+            id="*",
+        )
+
+    def test_put_immediate_applies_x_expires_pexpire(self, global_keyprefix: str) -> None:
+        """Test that x-expires queues get PEXPIRE on the touched stream key."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._expires = {"my_queue": 30_000}
+        channel._ensure_group = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        message = {
+            "body": '{"task": "test"}',
+            "properties": {
+                "delivery_tag": "tag123",
+                "delivery_info": {"exchange": "celery", "routing_key": "my_queue"},
+                "headers": {},
+            },
+        }
+
+        channel._put("my_queue", message)
+
+        mock_client.pexpire.assert_called_once_with("stream:my_queue:0", 30_000)
+
+    def test_put_delayed_applies_x_expires_pexpire(self, global_keyprefix: str) -> None:
+        """Test that x-expires queues get PEXPIRE on the delayed zset for native delayed messages."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._expires = {"my_queue": 30_000}
+        channel._ensure_group = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        eta_timestamp = time.time() + 120
+        message = {
+            "body": '{"task": "test"}',
+            "properties": {
+                "delivery_tag": "tag123",
+                "eta": eta_timestamp,
+                "delivery_info": {"exchange": "celery", "routing_key": "my_queue"},
+                "headers": {},
+            },
+        }
+
+        channel._put("my_queue", message)
+
+        mock_client.pexpire.assert_called_once_with("delayed:my_queue", 30_000)
