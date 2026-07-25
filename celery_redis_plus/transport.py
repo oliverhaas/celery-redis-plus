@@ -271,6 +271,21 @@ class GlobalKeyPrefixMixin:
         "XCLAIM",
         "XRANGE",
         "XTRIM",
+        # redis-py sends each XGROUP/XINFO subcommand as a single
+        # space-joined command name (e.g. "XGROUP CREATE", "XINFO STREAM")
+        # rather than "XGROUP" plus a separate subcommand token, and the
+        # stream key is always the first argument that follows. Simple
+        # prefixing of args[0] is therefore correct for every subcommand,
+        # unlike the two-token shape a fixed-position "XGROUP"/"XINFO"
+        # entry in PREFIXED_COMPLEX_COMMANDS would assume.
+        "XGROUP CREATE",
+        "XGROUP SETID",
+        "XGROUP DESTROY",
+        "XGROUP CREATECONSUMER",
+        "XGROUP DELCONSUMER",
+        "XINFO STREAM",
+        "XINFO GROUPS",
+        "XINFO CONSUMERS",
     ]
 
     @staticmethod
@@ -306,27 +321,12 @@ class GlobalKeyPrefixMixin:
             return args[: streams_idx + 1] + prefixed_keys + stream_ids
         return args
 
-    @staticmethod
-    def _prefix_xgroup_args(args: list[Any], prefix: str) -> list[Any]:
-        """Prefix the stream key in XGROUP and XINFO commands.
-
-        XGROUP CREATE|SETID|DESTROY|CREATECONSUMER|DELCONSUMER key ...
-        XINFO STREAM|GROUPS|CONSUMERS key ...
-
-        The subcommand is args[0]; the key is args[1].
-        """
-        if len(args) > 1:
-            return [args[0], prefix + str(args[1]), *args[2:]]
-        return args
-
     PREFIXED_COMPLEX_COMMANDS: ClassVar[dict[str, dict[str, int | None] | Callable[..., list[Any]]]] = {
         "DEL": {"args_start": 0, "args_end": None},
         "WATCH": {"args_start": 0, "args_end": None},
         "BZMPOP": _prefix_bzmpop_args,
         "XREAD": _prefix_xread_args,
         "XREADGROUP": _prefix_xread_args,
-        "XGROUP": _prefix_xgroup_args,
-        "XINFO": _prefix_xgroup_args,
     }
 
     def _prefix_args(self, args: list[Any]) -> list[Any]:
@@ -353,13 +353,6 @@ class GlobalKeyPrefixMixin:
 
     def parse_response(self, connection: Any, command_name: str, **options: Any) -> Any:
         """Parse a response from the Redis server."""
-        if command_name == "XAUTOCLAIM" and options.get("parse_justid"):
-            # redis-py's parse_xautoclaim collapses a JUSTID reply down to just
-            # the claimed id list (dropping the cursor and deleted-id list
-            # entirely) instead of returning the (cursor, ids, deleted) triple
-            # the server actually sends. Read the raw reply ourselves so
-            # cursor-driven pagination keeps working for a JUSTID claim.
-            return connection.read_response()
         ret = super().parse_response(connection, command_name, **options)  # type: ignore[misc]  # ty: ignore[unresolved-attribute]
         if command_name == "BZMPOP" and ret:
             # BZMPOP returns (key, [(member, score), ...])

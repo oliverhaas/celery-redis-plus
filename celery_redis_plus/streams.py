@@ -856,58 +856,69 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
     def _reclaim_and_deliver(self, queue: str, budget: int) -> int:  # noqa: PLR0912, PLR0915
         """Reclaim messages idle past the visibility timeout and deliver them locally.
 
-        Runs a two-phase XAUTOCLAIM/XCLAIM cursor loop over each of the
-        queue's priority level streams (highest level first):
+        Runs a discover-then-claim pass over each of the queue's priority
+        level streams (highest level first):
 
-        1. ``XAUTOCLAIM ... JUSTID`` transfers ownership and resets idle time
-           for entries idle past visibility_timeout, without touching their
-           delivery count. This is safe to run over every idle entry: an id
-           this pass ends up not taking simply waits in this consumer's PEL
-           for a later pass.
-        2. The claimed ids are filtered: ids already in-flight somewhere in
-           this process (see _own_in_flight_message_ids) are dropped, then
-           the remainder is truncated to the smaller of the remaining budget
-           and the channel's remaining QoS prefetch capacity
+        1. ``XPENDING ... IDLE min_idle_ms`` pages through the group's
+           pending entries list (in id order, starting from "-") for entries
+           idle past visibility_timeout, without claiming or incrementing
+           anything. Being read-only, this is safe to run over every idle
+           entry: one this pass ends up not taking simply stays parked in the
+           PEL for a later pass to find again. Pages are walked with an
+           exclusive cursor (next page's ``min`` is ``"(" + last_id``),
+           terminating when a page returns fewer entries than requested
+           (Redis only returns a short page once it has scanned to the end
+           of the pending list).
+        2. The discovered ids are filtered: ids already in-flight somewhere
+           in this process (see _own_in_flight_message_ids) are dropped, and
+           ids older than the effective x-message-ttl are acked away right
+           here (XACK does not care which consumer currently owns an entry,
+           so there is no need to claim an expired id first). The remainder
+           is truncated to the smaller of the remaining budget and the
+           channel's remaining QoS prefetch capacity
            (qos.can_consume_max_estimate(); unbounded prefetch skips this
-           axis). Only the survivors are claimed for real.
-        3. ``XCLAIM`` (min_idle_time=0, since JUSTID already reset idle to 0)
-           claims exactly the survivors, fetching their payloads and bumping
-           their delivery count exactly once each. An id can still vanish
-           from the stream between steps 1 and 3 (concurrent XDEL/trim);
-           XCLAIM simply omits it rather than returning a placeholder, so the
-           reply may legitimately be shorter than the survivor list.
+           axis). Only the survivors are claimed.
+        3. ``XCLAIM`` with the real min_idle_time (not 0) claims exactly the
+           survivors, fetching their payloads and bumping their delivery
+           count exactly once each. Using the real min_idle_time makes this
+           race-safe against a competing reclaimer: if another worker
+           claimed one of these ids between steps 1 and 3, its idle time was
+           just reset, so this XCLAIM correctly does not take it. An id can
+           also vanish from the stream between steps 1 and 3 (concurrent
+           XDEL/trim); either way XCLAIM simply omits it rather than
+           returning a placeholder, so the reply may legitimately be shorter
+           than the survivor list.
 
         This keeps delivery counts honest: an entry this pass skips or never
-        delivers (own in-flight, or filtered out for lack of budget/prefetch
-        capacity) never reaches XCLAIM, so its counter is never bumped.
-        Delivery counts themselves are fetched via an XPENDING query bounded
-        to the claimed ID range (an unbounded window truncates at its count
-        and this worker's own lower-ID in-flight entries would displace the
-        claimed ones); restore_count = times_delivered - 1 (the first
-        delivery is not a restore).
+        claims (own in-flight, lazily expired, or filtered out for lack of
+        budget/prefetch capacity) never reaches XCLAIM, so its counter is
+        never bumped. times_delivered is read once, in step 1, before this
+        pass's own claim runs; restore_count = times_delivered with no
+        adjustment, since step 3's XCLAIM adds exactly one more delivery for
+        whichever ids it actually claims and the pre-claim count already
+        excludes that increment (the first delivery, via XREADGROUP, is
+        itself the message's 1st times_delivered; restore_count = 1 means
+        this is its first restore).
 
         Messages exceeding max_restore_count are dropped, optionally copied to
-        dead_letter_stream first. Messages older than the effective
-        x-message-ttl are acked and skipped; the cutoff is computed from the
-        server's clock (read once per call via TIME, and only when a TTL is
-        actually configured), never the caller's, so a worker clock running
-        ahead of the server cannot delete un-expired messages. A payload that
-        fails to parse is treated the same as a missing payload: logged,
-        acked away so it cannot loop forever, and counted against budget.
+        dead_letter_stream first. A payload that fails to parse is treated
+        the same as a missing payload: logged, acked away so it cannot loop
+        forever, and counted against budget.
 
         Actual deliveries respect the channel's QoS prefetch_count: once
         qos.can_consume() goes false (checked right after each delivery) the
-        pass stops immediately, leaving any remaining claimed entries in this
-        worker's own PEL for a later reclaim pass instead of flooding the
-        channel past its limit. Callers are expected to skip invoking this
-        method at all when qos.can_consume() is already false (see
+        pass stops immediately, leaving any remaining discovered entries in
+        the PEL for a later reclaim pass instead of flooding the channel
+        past its limit. Callers are expected to skip invoking this method at
+        all when qos.can_consume() is already false (see
         MultiChannelPoller.maybe_enqueue_due_messages).
 
-        A NOGROUP from XAUTOCLAIM means the stream (and with it its consumer
-        group) was deleted out of band while this channel's _ensured_groups
-        cache was warm; the cache is invalidated, the queue's groups are
-        re-created, and the call is retried once. A second NOGROUP propagates
-        to maybe_enqueue_due_messages, which logs and retries next cycle.
+        A NOGROUP from either XPENDING or XCLAIM means the stream (and with
+        it its consumer group) was deleted out of band while this channel's
+        _ensured_groups cache was warm; the cache is invalidated, the
+        queue's groups are re-created, and the failing call is retried once.
+        A second NOGROUP propagates to maybe_enqueue_due_messages, which
+        logs and retries next cycle.
 
         Args:
             queue: Queue name to reclaim messages for.
@@ -916,8 +927,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         Returns:
             Number of claimed entries processed (delivered or dropped); an
             entry recognized as already in-flight somewhere in this process,
-            or left unclaimed for lack of budget/prefetch capacity, is not
-            counted.
+            lazily expired, or left unclaimed for lack of budget/prefetch
+            capacity, is not counted.
         """
         if budget <= 0:
             return 0
@@ -946,21 +957,17 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 server_seconds, server_micros = client.time()
                 now_ms = int(server_seconds) * 1000 + int(server_micros) // 1000
             for stream_key in self._stream_keys_for_queue(queue):
-                cursor = "0-0"
+                cursor = "-"
                 while processed < budget and not prefetch_exhausted:
-                    claim_kwargs: dict[str, Any] = {
-                        "min_idle_time": min_idle_ms,
-                        "start_id": cursor,
-                        "count": min(budget - processed, 100),
-                        "justid": True,
+                    page_count = min(budget - processed, 100)
+                    pending_kwargs: dict[str, Any] = {
+                        "min": cursor,
+                        "max": "+",
+                        "count": page_count,
+                        "idle": min_idle_ms,
                     }
                     try:
-                        result = client.xautoclaim(
-                            stream_key,
-                            self.consumer_group,
-                            self.consumer_name,
-                            **claim_kwargs,
-                        )
+                        pending = client.xpending_range(stream_key, self.consumer_group, **pending_kwargs)
                     except self.ResponseError as exc:
                         if "NOGROUP" not in str(exc):
                             raise
@@ -969,75 +976,77 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                         self._invalidate_group(queue)
                         for level_key in self._stream_keys_for_queue(queue):
                             self._ensure_group(level_key)
-                        result = client.xautoclaim(
-                            stream_key,
-                            self.consumer_group,
-                            self.consumer_name,
-                            **claim_kwargs,
-                        )
-                    cursor = bytes_to_str(result[0])
-                    claimed_ids = [bytes_to_str(message_id) for message_id in result[1]]
-                    # Redis 7.0+ adds a third reply element: ids deleted from the stream
-                    # while still pending. They carry no payload; never treat them as work.
-                    deleted_ids = result[2] if len(result) > 2 else []  # noqa: PLR2004
-                    if deleted_ids:
-                        logger.warning(
-                            "Stream %s: ignoring %d pending entries whose stream entries were deleted.",
-                            stream_key,
-                            len(deleted_ids),
-                        )
-                    if not claimed_ids:
-                        if cursor == "0-0":
-                            break
-                        continue
+                        pending = client.xpending_range(stream_key, self.consumer_group, **pending_kwargs)
+                    if not pending:
+                        break
 
-                    # Own-in-flight ids are dropped before the counting claim below so
-                    # their delivery counter is never bumped; the remainder is capped to
-                    # the smaller of the remaining budget and prefetch capacity for the
-                    # same reason (an id we cannot deliver this pass should not look
+                    page_ids = [bytes_to_str(entry["message_id"]) for entry in pending]
+                    times_delivered = {
+                        bytes_to_str(entry["message_id"]): int(entry["times_delivered"]) for entry in pending
+                    }
+                    last_id = page_ids[-1]
+                    page_short = len(pending) < page_count
+
+                    # Prefix key since EVALSHA doesn't auto-prefix KEYS
+                    prefixed_stream = f"{self.global_keyprefix}{stream_key}"
+
+                    # Own-in-flight ids are dropped before claiming so their delivery
+                    # counter is never bumped. Lazily-expired ids (x-message-ttl) are
+                    # acked away right here since XACK does not care which consumer
+                    # currently owns the entry, so there is no need to claim it first.
+                    own_ids = self._own_in_flight_message_ids(stream_key)
+                    survivor_ids: list[str] = []
+                    for message_id in page_ids:
+                        if message_id in own_ids:
+                            continue
+                        # Lazy x-message-ttl drop: entry ids encode creation time in ms
+                        if ttl_ms > 0 and int(message_id.split("-")[0]) < now_ms - ttl_ms:
+                            processed += 1
+                            ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id, ""])
+                            continue
+                        survivor_ids.append(message_id)
+
+                    # The remainder is capped to the smaller of the remaining budget and
+                    # prefetch capacity (an id we cannot deliver this pass should not look
                     # delivered either). can_consume_max_estimate() is None when
                     # prefetch_count is unbounded, so that axis is skipped entirely.
-                    own_ids = self._own_in_flight_message_ids(stream_key)
-                    survivor_ids = [message_id for message_id in claimed_ids if message_id not in own_ids]
                     capacity = qos.can_consume_max_estimate() if qos is not None else None
                     remaining_budget = budget - processed
                     take = remaining_budget if capacity is None else min(remaining_budget, capacity)
                     survivor_ids = survivor_ids[: max(take, 0)]
                     if not survivor_ids:
-                        if cursor == "0-0":
+                        if page_short:
                             break
+                        cursor = "(" + last_id
                         continue
 
-                    # Prefix key since EVALSHA doesn't auto-prefix KEYS
-                    prefixed_stream = f"{self.global_keyprefix}{stream_key}"
-                    # min_idle_time=0: JUSTID above already reset idle to 0 for these
-                    # ids, and this is the claim that counts, bumping times_delivered
-                    # exactly once for each survivor.
-                    claimed = client.xclaim(
-                        stream_key,
-                        self.consumer_group,
-                        self.consumer_name,
-                        min_idle_time=0,
-                        message_ids=survivor_ids,
-                    )
-
-                    # Delivery counts come from XPENDING, bounded to the claimed ID range:
-                    # an unbounded window truncates at its count, letting this worker's own
-                    # lower-ID in-flight entries displace the claimed ones and zero their
-                    # restore counts.
-                    pending = client.xpending_range(
-                        stream_key,
-                        self.consumer_group,
-                        min=survivor_ids[0],
-                        max=survivor_ids[-1],
-                        # Generous headroom: own in-flight entries can still interleave
-                        # inside the claimed range, and per-call claims are capped at 100
-                        count=len(survivor_ids) + 1000,
-                        consumername=self.consumer_name,
-                    )
-                    times_delivered = {
-                        bytes_to_str(entry["message_id"]): int(entry["times_delivered"]) for entry in pending
+                    # Real min_idle_time (not 0): if a competing worker claimed one of
+                    # these ids between the XPENDING discovery above and this XCLAIM,
+                    # its idle time was just reset and this call correctly skips it,
+                    # making this pass race-safe against a competing reclaimer.
+                    claim_kwargs: dict[str, Any] = {
+                        "min_idle_time": min_idle_ms,
+                        "message_ids": survivor_ids,
                     }
+                    try:
+                        claimed = client.xclaim(
+                            stream_key,
+                            self.consumer_group,
+                            self.consumer_name,
+                            **claim_kwargs,
+                        )
+                    except self.ResponseError as exc:
+                        if "NOGROUP" not in str(exc):
+                            raise
+                        self._invalidate_group(queue)
+                        for level_key in self._stream_keys_for_queue(queue):
+                            self._ensure_group(level_key)
+                        claimed = client.xclaim(
+                            stream_key,
+                            self.consumer_group,
+                            self.consumer_name,
+                            **claim_kwargs,
+                        )
 
                     for message_id, fields in claimed:
                         if prefetch_exhausted:
@@ -1066,20 +1075,18 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             continue
 
                         processed += 1
-                        # Lazy x-message-ttl drop: entry ids encode their creation time in ms
-                        if ttl_ms > 0 and int(message_id_str.split("-")[0]) < now_ms - ttl_ms:
-                            ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id_str, ""])
-                            continue
-                        # The bounded XPENDING query above covers every claimed id, so a
-                        # miss should be unreachable; fall back defensively, do not crash
+                        # times_delivered was read in step 1, before this pass's own
+                        # XCLAIM above; every id in `claimed` came from survivor_ids,
+                        # itself built from this same page, so a miss here should be
+                        # unreachable. Fall back defensively rather than crash.
                         if message_id_str not in times_delivered:
                             logger.warning(
-                                "Stream %s: claimed entry %s missing from bounded XPENDING reply; "
+                                "Stream %s: claimed entry %s missing from XPENDING discovery reply; "
                                 "assuming first delivery.",
                                 stream_key,
                                 message_id_str,
                             )
-                        restore_count = times_delivered.get(message_id_str, 1) - 1
+                        restore_count = times_delivered.get(message_id_str, 0)
                         if self.max_restore_count is not None and restore_count > self.max_restore_count:
                             if self.dead_letter_stream is not None:
                                 # Copy to the dead-letter stream before dropping (approximate cap)
@@ -1106,8 +1113,9 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                         self.connection._deliver(message, queue)
                         if qos is not None and not qos.can_consume():
                             prefetch_exhausted = True
-                    if cursor == "0-0" or prefetch_exhausted:
+                    if page_short or prefetch_exhausted:
                         break
+                    cursor = "(" + last_id
                 if processed >= budget or prefetch_exhausted:
                     break
         return processed
