@@ -456,6 +456,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         self.auto_delete_queues: set[str] = set()
         self._fanout_queues: dict[str, tuple[str, str]] = {}
         self.handlers = {"XREADGROUP": self._xreadgroup_read, "XREAD": self._xread_read}
+        self._consume_script_sha: str | None = None
         # Track last-read stream ID per stream for fanout (start with $ = only new messages)
         self._stream_offsets: dict[str, str] = {}
         # Per-queue TTL state from x-expires and x-message-ttl queue arguments
@@ -731,6 +732,93 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         ret = super().basic_cancel(consumer_tag)
         self._update_queue_cycle()
         return ret
+
+    def _ensure_consume_script_sha(self) -> str:
+        """Load and cache the streams_consume Lua script SHA."""
+        if self._consume_script_sha is None:
+            self._consume_script_sha = self.client.script_load(_STREAMS_CONSUME_LUA)
+        return self._consume_script_sha
+
+    def _consume_read(self, **options: Any) -> bool:
+        """Non-blocking priority consume pass over all watched queues.
+
+        Sends a raw EVALSHA of the streams_consume Lua script per queue in
+        _queue_cycle order and parses each reply inline. The script walks
+        the queue's level streams highest priority first with non-blocking
+        XREADGROUP, so delivery and PEL registration are atomic in Redis.
+
+        On the first hit: records the entry in QoS._in_flight, delivers the
+        message, and returns True. When every queue is empty: arms a
+        blocking XREADGROUP over all watched streams via _xreadgroup_start()
+        (keeps _in_poll set) and raises Empty.
+
+        A NOGROUP reply means the queue's stream (and its consumer group)
+        was deleted out of band while this channel's _ensured_groups cache
+        was warm; the cache is invalidated, the groups are re-created, and
+        the EVALSHA is retried once for that queue.
+        """
+        for queue in self._queue_cycle:
+            sha = self._ensure_consume_script_sha()
+            stream_keys = self._stream_keys_for_queue(queue)
+            for stream_key in stream_keys:
+                self._ensure_group(stream_key)
+            # Prefix keys manually since EVALSHA doesn't auto-prefix KEYS
+            keys = [f"{self.global_keyprefix}{stream_key}" for stream_key in stream_keys]
+            # Effective message TTL in ms (0 = none): per-queue x-message-ttl
+            # takes the minimum with the channel-level message_ttl (seconds)
+            ttl_ms = 0 if self.message_ttl is None else int(self.message_ttl * 1000)
+            if queue in self._message_ttls:
+                queue_ttl_ms = self._message_ttls[queue]
+                ttl_ms = queue_ttl_ms if ttl_ms == 0 else min(ttl_ms, queue_ttl_ms)
+
+            command_args: tuple[Any, ...] = (
+                "EVALSHA",
+                sha,
+                len(keys),
+                *keys,
+                self.consumer_group,
+                self.consumer_name,
+                str(ttl_ms),
+            )
+            self.client.connection.send_command(*command_args)
+            try:
+                result = self.client.parse_response(self.client.connection, "EVALSHA", **options)
+            except self.connection_errors:
+                self.client.connection.disconnect()
+                raise
+            except self.ResponseError as exc:
+                if "NOSCRIPT" in str(exc):
+                    # Script evicted from cache, reload on next tick
+                    self._consume_script_sha = None
+                    raise Empty from None
+                if "NOGROUP" not in str(exc):
+                    raise
+                # Stream deleted out of band (cross-process purge, queue
+                # delete, x-expires expiry): drop the stale cache, recreate
+                # the groups, and retry this queue once. A second NOGROUP
+                # propagates.
+                self._invalidate_group(queue)
+                for stream_key in stream_keys:
+                    self._ensure_group(stream_key)
+                self.client.connection.send_command(*command_args)
+                result = self.client.parse_response(self.client.connection, "EVALSHA", **options)
+
+            if result:
+                result_stream = bytes_to_str(result[0])
+                # KEYS were prefixed for EVALSHA; strip so _in_flight stores unprefixed keys
+                if self.global_keyprefix and result_stream.startswith(self.global_keyprefix):
+                    result_stream = result_stream[len(self.global_keyprefix) :]
+                entry_id = bytes_to_str(result[1])
+                message: dict[str, Any] = loads(bytes_to_str(result[2]))
+                delivery_tag = message["properties"]["delivery_tag"]
+                if self.qos is not None:
+                    cast("QoS", self.qos)._in_flight[delivery_tag] = (result_stream, entry_id)
+                self.connection._deliver(message, queue)
+                return True
+
+        # Every watched queue is empty: arm the blocking XREADGROUP (sets _in_poll)
+        self._xreadgroup_start()
+        raise Empty
 
     def _xreadgroup_start(self, timeout: float | None = None) -> None:
         """Send a blocking XREADGROUP over all watched level streams.

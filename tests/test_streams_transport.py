@@ -1701,3 +1701,240 @@ class TestStreamsXReadGroup:
         # The next non-blocking pass re-runs _ensure_group per queue,
         # re-creating the groups
         assert channel._ensured_groups == set()
+
+
+@pytest.mark.unit
+class TestStreamsConsumeRead:
+    """Unit tests for the non-blocking EVALSHA consume pass (_consume_read)."""
+
+    def test_consume_read_delivers_first_hit(self, global_keyprefix: str) -> None:
+        """Test _consume_read delivers on the first Lua hit and records _in_flight."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._queue_cycle = ["q1"]
+        channel._in_poll = None
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._consume_script_sha = "sha123"
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:q1:9", "stream:q1:0"])
+        channel._xreadgroup_start = MagicMock()
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        mock_client = MagicMock()
+        channel.client = mock_client
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        payload = b'{"body": "test", "properties": {"delivery_tag": "tagA"}}'
+        mock_client.parse_response.return_value = [f"{global_keyprefix}stream:q1:9".encode(), b"1111-0", payload]
+
+        result = channel._consume_read()
+
+        assert result is True
+        sent_args = mock_client.connection.send_command.call_args[0]
+        assert sent_args[0] == "EVALSHA"
+        assert sent_args[1] == "sha123"
+        assert sent_args[2] == 2
+        assert sent_args[3] == f"{global_keyprefix}stream:q1:9"
+        assert sent_args[4] == f"{global_keyprefix}stream:q1:0"
+        assert sent_args[5] == "celery"
+        assert sent_args[6] == "host:42"
+        # ttl_ms; now is read server-side via redis.call('TIME') inside the script
+        assert sent_args[7] == "0"
+        assert channel._ensure_group.call_count == 2
+        assert mock_qos._in_flight == {"tagA": ("stream:q1:9", "1111-0")}
+        mock_connection._deliver.assert_called_once_with(
+            {"body": "test", "properties": {"delivery_tag": "tagA"}},
+            "q1",
+        )
+        channel._xreadgroup_start.assert_not_called()
+
+    def test_consume_read_loads_script_when_sha_missing(self) -> None:
+        """Test _consume_read loads and caches the Lua script SHA when unset."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._queue_cycle = ["q1"]
+        channel._in_poll = None
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._consume_script_sha = None
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:q1:9", "stream:q1:0"])
+        channel._xreadgroup_start = MagicMock()
+        mock_client = MagicMock()
+        mock_client.script_load.return_value = "newsha"
+        mock_client.parse_response.return_value = None
+        channel.client = mock_client
+
+        with pytest.raises(Empty):
+            channel._consume_read()
+
+        mock_client.script_load.assert_called_once()
+        assert channel._consume_script_sha == "newsha"
+        assert mock_client.connection.send_command.call_args[0][1] == "newsha"
+
+    def test_consume_read_passes_effective_message_ttl(self) -> None:
+        """Test _consume_read passes min(channel message_ttl, per-queue x-message-ttl) in ms."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._queue_cycle = ["q1"]
+        channel._in_poll = None
+        channel.message_ttl = 10  # seconds -> 10000 ms
+        channel._message_ttls = {"q1": 5000}  # ms, smaller -> wins
+        channel._consume_script_sha = "sha123"
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:q1:9", "stream:q1:0"])
+        channel._xreadgroup_start = MagicMock()
+        mock_client = MagicMock()
+        mock_client.parse_response.return_value = None
+        channel.client = mock_client
+
+        with pytest.raises(Empty):
+            channel._consume_read()
+
+        assert mock_client.connection.send_command.call_args[0][7] == "5000"
+
+    def test_consume_read_total_miss_arms_blocking_read(self) -> None:
+        """Test _consume_read polls every queue, then arms the blocking XREADGROUP and raises Empty."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._queue_cycle = ["q1", "q2"]
+        channel._in_poll = None
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._consume_script_sha = "sha123"
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(side_effect=lambda q: [f"stream:{q}:9", f"stream:{q}:0"])
+        channel._xreadgroup_start = MagicMock()
+        mock_client = MagicMock()
+        mock_client.parse_response.return_value = None
+        channel.client = mock_client
+
+        with pytest.raises(Empty):
+            channel._consume_read()
+
+        assert mock_client.connection.send_command.call_count == 2
+        channel._xreadgroup_start.assert_called_once_with()
+
+    def test_consume_read_noscript_resets_sha(self) -> None:
+        """Test NOSCRIPT recovery: reset cached SHA, raise Empty, no blocking read armed."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._queue_cycle = ["q1"]
+        channel._in_poll = None
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._consume_script_sha = "sha123"
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:q1:9", "stream:q1:0"])
+        channel._xreadgroup_start = MagicMock()
+        mock_client = MagicMock()
+        mock_client.parse_response.side_effect = _client_exceptions.ResponseError(
+            "NOSCRIPT No matching script. Please use EVAL.",
+        )
+        channel.client = mock_client
+
+        with pytest.raises(Empty):
+            channel._consume_read()
+
+        assert channel._consume_script_sha is None
+        channel._xreadgroup_start.assert_not_called()
+
+    def test_consume_read_connection_error_disconnects(self) -> None:
+        """Test _consume_read disconnects the raw connection on connection errors."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._queue_cycle = ["q1"]
+        channel._in_poll = None
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._consume_script_sha = "sha123"
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:q1:9", "stream:q1:0"])
+        channel._xreadgroup_start = MagicMock()
+        mock_client = MagicMock()
+        mock_client.parse_response.side_effect = _client_exceptions.ConnectionError("connection lost")
+        channel.client = mock_client
+
+        with pytest.raises(_client_exceptions.ConnectionError):
+            channel._consume_read()
+
+        mock_client.connection.disconnect.assert_called_once()
+        channel._xreadgroup_start.assert_not_called()
+
+    def test_consume_read_nogroup_reensures_and_retries_once(self) -> None:
+        """Test NOGROUP recovery: drop cached groups, re-ensure, resend the EVALSHA once, deliver the hit."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._queue_cycle = ["q1"]
+        channel._in_poll = None
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._consume_script_sha = "sha123"
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensured_groups = {"stream:q1:9", "stream:q1:0"}
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:q1:9", "stream:q1:0"])
+        channel._xreadgroup_start = MagicMock()
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        mock_client = MagicMock()
+        payload = b'{"body": "test", "properties": {"delivery_tag": "tagA"}}'
+        # First parse: NOGROUP (stream deleted out of band while the cache
+        # was warm). Second parse (after re-ensure + resend): a hit.
+        mock_client.parse_response.side_effect = [
+            _client_exceptions.ResponseError(
+                "NOGROUP No such key 'stream:q1:9' or consumer group 'celery' in XREADGROUP with GROUP option",
+            ),
+            [b"stream:q1:9", b"1111-0", payload],
+        ]
+        channel.client = mock_client
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        result = channel._consume_read()
+
+        assert result is True
+        # The EVALSHA was sent twice: initial attempt + one retry
+        assert mock_client.connection.send_command.call_count == 2
+        # 2 upfront ensures + 2 re-ensures after the cache invalidation
+        assert channel._ensure_group.call_count == 4
+        # _invalidate_group discarded the stale cache entries (_ensure_group
+        # is mocked here, so nothing re-adds them)
+        assert channel._ensured_groups == set()
+        assert mock_qos._in_flight == {"tagA": ("stream:q1:9", "1111-0")}
+        mock_connection._deliver.assert_called_once_with(
+            {"body": "test", "properties": {"delivery_tag": "tagA"}},
+            "q1",
+        )
+        channel._xreadgroup_start.assert_not_called()
