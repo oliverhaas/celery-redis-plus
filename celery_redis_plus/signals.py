@@ -67,9 +67,8 @@ def _convert_eta_to_properties(
         properties["eta"] = float(eta_value)
 
 
-# Per-app worker nodenames for stable stream consumer names.  WeakKeyDictionary
-# so entries auto-clean when the Celery app is garbage-collected (mirrors
-# _worker_pools in transport.py).
+# Per-app worker nodenames for stable stream consumer names; weak so entries
+# clear when the app is collected (mirrors _worker_pools in transport.py).
 _worker_nodenames: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
 
 

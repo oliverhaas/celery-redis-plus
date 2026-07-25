@@ -21,11 +21,8 @@ __all__ = ["Transport", "__version__"]
 __version__ = version("celery-redis-plus")
 
 
-# Register the valkey://, valkeys://, valkey-streams://, and valkeys-streams://
-# URL schemes as kombu transport aliases, plus the valkey+streams and
-# valkeys+streams names for broker_transport users. kombu splits bare URL
-# schemes at '+' before alias lookup, so the '+' forms only work at the
-# broker_transport level, never in a bare broker URL.
+# kombu splits bare URL schemes at '+' before alias lookup, so the '+' forms
+# only work at the broker_transport level, never in a bare broker URL.
 def _register_transport_aliases() -> None:
     """Register valkey transport aliases with kombu."""
     try:

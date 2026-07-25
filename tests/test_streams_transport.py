@@ -632,7 +632,6 @@ class TestStreamsQueueCycle:
         """Test that basic_cancel removes the queue and rebuilds the cycle."""
         channel = self._make_channel()
         channel.basic_consume("celery", no_ack=True, callback=lambda *_a: None, consumer_tag="ctag-1")
-        # Prime a stale cycle so the test proves basic_cancel rebuilds it
         channel._queue_cycle = ["stale-entry", "celery"]
 
         channel.basic_cancel("ctag-1")
@@ -659,7 +658,6 @@ class TestStreamsQueueCycle:
 
         channel.basic_cancel("ctag-1")
 
-        # The cancel must not have run yet
         assert "celery" in channel._active_queues
         channel.connection.cycle.after_read.add.assert_called_once()
         deferred = channel.connection.cycle.after_read.add.call_args[0][0]
@@ -667,7 +665,6 @@ class TestStreamsQueueCycle:
         assert deferred.fun == channel._basic_cancel
         assert deferred.args == ("ctag-1",)
 
-        # Running the promise performs the deferred cancel
         deferred()
         assert "celery" not in channel._active_queues
         assert channel._queue_cycle == []
@@ -1069,7 +1066,6 @@ class TestStreamsGet:
         payload = {"body": "test", "properties": {"delivery_tag": "tag123"}}
         mock_client = MagicMock()
         mock_script = MagicMock()
-        # Lua script returns [stream_key, entry_id, payload]
         mock_script.return_value = [
             f"{global_keyprefix}stream:my_queue:9".encode(),
             b"1700000000000-0",
@@ -1259,7 +1255,6 @@ class TestStreamsGet:
 
         assert message == payload
         assert mock_script.call_count == 2
-        # 2 upfront ensures + 2 re-ensures after the cache invalidation
         assert channel._ensure_group.call_count == 4
         # _invalidate_group discarded the stale cache entries (_ensure_group
         # is mocked here, so nothing re-adds them)

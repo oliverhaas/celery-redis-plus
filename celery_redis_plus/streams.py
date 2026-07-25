@@ -513,9 +513,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         """
         now = time()
 
-        # eta is a Unix timestamp (float) in properties, similar to priority.
-        # Native delayed delivery only applies if delay > requeue check interval.
-        # Shorter delays are handled by Celery's built-in eta logic (immediate delivery).
+        # Shorter delays fall through to Celery's own eta logic (immediate delivery)
         eta_timestamp: float | None = message["properties"].get("eta")
 
         if eta_timestamp is not None and (eta_timestamp - now) > DEFAULT_REQUEUE_CHECK_INTERVAL:

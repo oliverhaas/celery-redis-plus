@@ -53,9 +53,7 @@ STREAM_KEY_PREFIX = "stream:"
 # Prefix for per-queue delayed message sorted sets: delayed:{queue}
 DELAYED_KEY_PREFIX = "delayed:"
 
-# Default priority steps for the streams transport (buckets in the 0-255
-# priority space, sorted ascending). A message goes to the highest step <= its
-# priority, or the lowest step if its priority is below all steps.
+# Priority buckets in the 0-255 space, ascending; see priority_to_level()
 DEFAULT_PRIORITY_STEPS = [0, 3, 6, 9]
 
 # Default consumer group name used on every queue stream
