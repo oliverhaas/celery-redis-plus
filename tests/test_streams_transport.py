@@ -1333,3 +1333,148 @@ class TestStreamsQoSAck:
         assert "Cannot ack message" in caplog.text
         qos.channel.conn_or_acquire.assert_not_called()
         qos._quick_ack.assert_called_once_with("ghost-tag")
+
+
+@pytest.mark.unit
+class TestStreamsQoSReject:
+    """Tests for QoS.reject: plain ack or atomic requeue-copy via streams_ack.lua."""
+
+    def test_reject_with_requeue_passes_payload_to_script(self, global_keyprefix: str) -> None:
+        """Test reject with requeue sends the serialized message as the script's requeue payload."""
+        mock_client = MagicMock()
+        mock_script = MagicMock()
+        mock_client.register_script.return_value = mock_script
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+
+        mock_channel = MagicMock()
+        mock_channel.global_keyprefix = global_keyprefix
+        mock_channel.consumer_group = "celery"
+        mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        raw_payload = {
+            "body": '{"task": "test"}',
+            "properties": {
+                "delivery_tag": "tag1",
+                "delivery_info": {"exchange": "celery", "routing_key": "my_queue"},
+            },
+        }
+        mock_message = MagicMock()
+        mock_message._raw = raw_payload
+
+        qos = object.__new__(QoS)
+        qos.channel = mock_channel
+        qos._fanout_tags = set()
+        qos._in_flight = {"tag1": (f"{STREAM_KEY_PREFIX}my_queue:9", "1700000000000-0")}
+        qos._delivered = {"tag1": mock_message}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.reject("tag1", requeue=True)
+
+        mock_client.register_script.assert_called_once_with(_STREAMS_ACK_LUA)
+        mock_script.assert_called_once_with(
+            keys=[f"{global_keyprefix}{STREAM_KEY_PREFIX}my_queue:9"],
+            args=["celery", "1700000000000-0", json_dumps(raw_payload)],
+        )
+        assert "tag1" not in qos._in_flight
+        qos._quick_ack.assert_called_once_with("tag1")
+
+    def test_reject_without_requeue_plain_ack(self, global_keyprefix: str) -> None:
+        """Test reject without requeue runs a plain ack (empty requeue payload)."""
+        mock_client = MagicMock()
+        mock_script = MagicMock()
+        mock_client.register_script.return_value = mock_script
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+
+        mock_channel = MagicMock()
+        mock_channel.global_keyprefix = global_keyprefix
+        mock_channel.consumer_group = "celery"
+        mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        qos = object.__new__(QoS)
+        qos.channel = mock_channel
+        qos._fanout_tags = set()
+        qos._in_flight = {"tag1": (f"{STREAM_KEY_PREFIX}my_queue:0", "1700000000000-0")}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.reject("tag1", requeue=False)
+
+        mock_script.assert_called_once_with(
+            keys=[f"{global_keyprefix}{STREAM_KEY_PREFIX}my_queue:0"],
+            args=["celery", "1700000000000-0", ""],
+        )
+        assert "tag1" not in qos._in_flight
+        qos._quick_ack.assert_called_once_with("tag1")
+
+    def test_reject_fanout_tag_ignores_requeue(self) -> None:
+        """Test reject for fanout message discards the tag; requeue unsupported for broadcast."""
+        qos = object.__new__(QoS)
+        qos.channel = MagicMock()
+        qos._fanout_tags = {"tag1"}
+        qos._in_flight = {}
+        qos._delivered = {}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.reject("tag1", requeue=True)
+
+        assert "tag1" not in qos._fanout_tags
+        qos.channel.conn_or_acquire.assert_not_called()
+        qos._quick_ack.assert_called_once_with("tag1")
+
+    def test_reject_missing_metadata_logs_critical_and_acks(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test reject without in-flight metadata logs critical but still acks locally."""
+        qos = object.__new__(QoS)
+        qos.channel = MagicMock()
+        qos._fanout_tags = set()
+        qos._in_flight = {}
+        qos._delivered = {}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        with caplog.at_level(logging.CRITICAL, logger="celery_redis_plus.streams"):
+            qos.reject("ghost-tag", requeue=True)
+
+        assert "Cannot reject message" in caplog.text
+        qos.channel.conn_or_acquire.assert_not_called()
+        qos._quick_ack.assert_called_once_with("ghost-tag")
+
+    def test_reject_requeue_without_delivered_message_falls_back_to_plain_ack(self) -> None:
+        """Test reject with requeue but no delivered message acks without a requeue copy."""
+        mock_client = MagicMock()
+        mock_script = MagicMock()
+        mock_client.register_script.return_value = mock_script
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+
+        mock_channel = MagicMock()
+        mock_channel.global_keyprefix = ""
+        mock_channel.consumer_group = "celery"
+        mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        qos = object.__new__(QoS)
+        qos.channel = mock_channel
+        qos._fanout_tags = set()
+        qos._in_flight = {"tag1": (f"{STREAM_KEY_PREFIX}my_queue:0", "1700000000000-0")}
+        qos._delivered = {}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.reject("tag1", requeue=True)
+
+        mock_script.assert_called_once_with(
+            keys=[f"{STREAM_KEY_PREFIX}my_queue:0"],
+            args=["celery", "1700000000000-0", ""],
+        )
+        assert "tag1" not in qos._in_flight
+        qos._quick_ack.assert_called_once_with("tag1")

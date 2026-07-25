@@ -194,6 +194,33 @@ class QoS(virtual.QoS):
                 args=[self.channel.consumer_group, message_id, requeue_payload],
             )
 
+    def reject(self, delivery_tag: str, requeue: bool = False) -> None:
+        # Fanout messages: requeue not supported (fire-and-forget broadcast)
+        if delivery_tag in self._fanout_tags:
+            self._fanout_tags.discard(delivery_tag)
+            super().ack(delivery_tag)
+            return
+        if delivery_tag not in self._in_flight:
+            # Metadata lost (e.g. channel restart). The PEL entry stays and
+            # will be reclaimed by a peer after visibility_timeout.
+            logger.critical("Cannot reject message: no in-flight metadata for delivery_tag %r", delivery_tag)
+            super().ack(delivery_tag)
+            return
+        requeue_payload = ""
+        if requeue:
+            if self._delivered is not None and delivery_tag in self._delivered:
+                # Serialize the locally held message so the XADD copy, XACK,
+                # and XDEL run in ONE atomic script. Never re-read the entry
+                # from the stream: a re-read races against peer claims.
+                requeue_payload = dumps(self._delivered[delivery_tag]._raw)
+            else:
+                logger.critical(
+                    "Cannot requeue message: no delivered message for delivery_tag %r, acking without requeue",
+                    delivery_tag,
+                )
+        self._ack_by_tag(delivery_tag, requeue_payload=requeue_payload)
+        super().ack(delivery_tag)
+
     @cached_property
     def visibility_timeout(self) -> float:
         return self.channel.visibility_timeout
