@@ -31,7 +31,7 @@ from celery_redis_plus.streams import (
     client_lib,
     priority_to_level,
 )
-from celery_redis_plus.transport import PrefixedStrictRedis
+from celery_redis_plus.transport import PrefixedStrictRedis, _client_exceptions
 
 
 @pytest.mark.unit
@@ -665,3 +665,100 @@ class TestStreamsQueueCycle:
         deferred()
         assert "celery" not in channel._active_queues
         assert channel._queue_cycle == []
+
+
+@pytest.mark.unit
+class TestStreamsEnsureGroup:
+    """Unit tests for Channel._ensure_group (lazy consumer group creation with BUSYGROUP cache)."""
+
+    def test_ensure_group_creates_group_with_mkstream(self) -> None:
+        """Test that _ensure_group creates the group at id 0 with MKSTREAM and caches the stream key."""
+        channel = object.__new__(Channel)
+        channel._ensured_groups = set()
+        channel.ResponseError = _client_exceptions.ResponseError
+        # consumer_group reads self.connection.client.transport_options, and a bare
+        # object.__new__ instance has no connection, so mock the whole chain
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        channel._ensure_group("stream:my_queue:0")
+
+        mock_client.xgroup_create.assert_called_once_with(
+            "stream:my_queue:0",
+            DEFAULT_CONSUMER_GROUP,
+            id="0",
+            mkstream=True,
+        )
+        assert "stream:my_queue:0" in channel._ensured_groups
+
+    def test_ensure_group_cached_key_skips_redis_call(self) -> None:
+        """Test that a second _ensure_group call for the same stream key is a no-op."""
+        channel = object.__new__(Channel)
+        channel._ensured_groups = set()
+        channel.ResponseError = _client_exceptions.ResponseError
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        channel._ensure_group("stream:my_queue:0")
+        channel._ensure_group("stream:my_queue:0")
+
+        assert mock_client.xgroup_create.call_count == 1
+
+    def test_ensure_group_ignores_busygroup_and_caches(self) -> None:
+        """Test that a BUSYGROUP error (group already exists) is swallowed and the key is cached."""
+        channel = object.__new__(Channel)
+        channel._ensured_groups = set()
+        channel.ResponseError = _client_exceptions.ResponseError
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        mock_client = MagicMock()
+        mock_client.xgroup_create.side_effect = _client_exceptions.ResponseError(
+            "BUSYGROUP Consumer Group name already exists",
+        )
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        channel._ensure_group("stream:my_queue:0")
+
+        assert "stream:my_queue:0" in channel._ensured_groups
+
+    def test_ensure_group_reraises_other_response_errors(self) -> None:
+        """Test that non-BUSYGROUP response errors propagate and the key is NOT cached."""
+        channel = object.__new__(Channel)
+        channel._ensured_groups = set()
+        channel.ResponseError = _client_exceptions.ResponseError
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        mock_client = MagicMock()
+        mock_client.xgroup_create.side_effect = _client_exceptions.ResponseError(
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        )
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with pytest.raises(_client_exceptions.ResponseError, match="WRONGTYPE"):
+            channel._ensure_group("stream:my_queue:0")
+
+        assert "stream:my_queue:0" not in channel._ensured_groups

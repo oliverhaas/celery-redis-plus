@@ -452,6 +452,26 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         """Get all priority-level stream keys for a queue, highest level first."""
         return [self._stream_key(queue, level) for level in reversed(self.priority_steps)]
 
+    def _ensure_group(self, stream_key: str) -> None:
+        """Create the consumer group on a stream if not already ensured.
+
+        Uses XGROUP CREATE with MKSTREAM so the stream is created together
+        with the group, starting at id 0 so every entry already in the
+        stream is deliverable. BUSYGROUP errors (group already exists) are
+        ignored. Ensured stream keys are cached per channel to avoid a
+        round-trip on every publish.
+        """
+        if stream_key in self._ensured_groups:
+            return
+        with self.conn_or_acquire() as client:
+            try:
+                # Transport-owned streams: "0" equals "$" at first creation, but makes re-created streams' pre-existing entries deliverable
+                client.xgroup_create(stream_key, self.consumer_group, id="0", mkstream=True)
+            except self.ResponseError as exc:
+                if "BUSYGROUP" not in str(exc):
+                    raise
+        self._ensured_groups.add(stream_key)
+
     @property
     def priority_steps(self) -> list[int]:
         """Priority buckets in 0-255 space, sorted ascending."""
