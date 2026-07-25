@@ -34,6 +34,7 @@ from celery_redis_plus.constants import (
 from celery_redis_plus.streams import (
     _STREAMS_ACK_LUA,
     _STREAMS_CONSUME_LUA,
+    DEFAULT_REQUEUE_CHECK_INTERVAL,
     Channel,
     MultiChannelPoller,
     QoS,
@@ -2207,3 +2208,61 @@ class TestStreamsMoveDelayed:
             call("stream:my_queue:6"),
             call("stream:my_queue:9"),
         ]
+
+    def test_maybe_enqueue_due_messages_calls_move_delayed_per_channel_queue(self) -> None:
+        """Test that the periodic pump calls _move_delayed for every channel and active queue."""
+        poller = MultiChannelPoller()
+        channel_a = MagicMock()
+        channel_a._queue_cycle = ["q1", "q2"]
+        channel_a._move_delayed.side_effect = [2, 3]
+        # Forward compatibility with Task 9: that task rewrites this pump to also call
+        # channel._reclaim_and_deliver(queue, budget) and to subtract its return value
+        # from an integer budget that is then compared with `if budget <= 0:`. An
+        # unconfigured MagicMock return value would turn the budget into a MagicMock and
+        # raise TypeError on that comparison, so pin it to a real int. This task's pump
+        # body never reads the attribute, so the stub is inert until Task 9 lands.
+        channel_a._reclaim_and_deliver.return_value = 0
+        channel_b = MagicMock()
+        channel_b._queue_cycle = ["q3"]
+        channel_b._move_delayed.return_value = 5
+        channel_b._reclaim_and_deliver.return_value = 0
+        poller._channels = {channel_a, channel_b}
+
+        total = poller.maybe_enqueue_due_messages()
+
+        assert total == 10
+        assert channel_a._move_delayed.call_args_list == [call("q1"), call("q2")]
+        channel_b._move_delayed.assert_called_once_with("q3")
+
+    def test_maybe_enqueue_due_messages_survives_channel_errors(self) -> None:
+        """Test that a failing queue is skipped with a warning and the pump continues."""
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        channel._queue_cycle = ["q1", "q2"]
+        channel._move_delayed.side_effect = [ConnectionError("boom"), 4]
+        # Same forward compatibility with Task 9's shared-budget rewrite as above:
+        # without a real int here, `total` becomes a MagicMock and `assert total == 4`
+        # silently fails once Task 9 wires reclaim into this pump.
+        channel._reclaim_and_deliver.return_value = 0
+        poller._channels = {channel}
+
+        total = poller.maybe_enqueue_due_messages()
+
+        assert total == 4
+        assert channel._move_delayed.call_count == 2
+
+    def test_requeue_timer_wired_to_maybe_enqueue_due_messages(self) -> None:
+        """Test that register_with_event_loop registers the periodic delayed pump timer."""
+        transport = object.__new__(Transport)
+        cycle = MagicMock()
+        transport.cycle = cycle
+        loop = MagicMock()
+        connection = MagicMock()
+        connection.client.transport_options = {}
+
+        transport.register_with_event_loop(connection, loop)
+
+        # DEFAULT_REQUEUE_CHECK_INTERVAL is the streams module binding (patched to 2 in conftest),
+        # the same value register_with_event_loop reads at call time
+        intervals = {c.args[0]: c.args[1] for c in loop.call_repeatedly.call_args_list}
+        assert intervals[DEFAULT_REQUEUE_CHECK_INTERVAL] is cycle.maybe_enqueue_due_messages

@@ -378,15 +378,28 @@ class MultiChannelPoller:
         return self._fd_to_chan
 
     def maybe_enqueue_due_messages(self) -> int:
-        """Move due delayed messages and reclaim timed-out deliveries.
+        """Move due delayed messages into their priority streams.
 
-        Placeholder: filled in with the delayed pump and reclaim; the periodic
-        timer can already call it safely.
+        Walks every channel's active queues and pumps each queue's delayed
+        zset via the streams_move_delayed Lua script. Failures are logged and
+        retried on the next cycle so the periodic timer survives connection
+        errors.
 
         Returns:
             Total number of messages moved across all channels.
         """
-        return 0
+        total_moved = 0
+        for channel in self._channels:
+            for queue in channel._queue_cycle:
+                try:
+                    total_moved += channel._move_delayed(queue)
+                except Exception:
+                    logger.warning(
+                        "Failed to move delayed messages for queue %s, will retry next cycle",
+                        queue,
+                        exc_info=True,
+                    )
+        return total_moved
 
     def maybe_heartbeat(self) -> None:
         """Send XCLAIM JUSTID heartbeats for in-flight messages.
