@@ -753,7 +753,184 @@ class MultiChannelPoller:
         return self._fd_to_chan
 
 
-class Channel(virtual.Channel):
+class FanoutStreamsMixin:
+    """Fanout exchange support using Redis Streams (XADD + blocking XREAD), shared by all transports.
+
+    Host classes must be virtual.Channel subclasses providing the collaborators declared below.
+    """
+
+    supports_fanout = True
+    keyprefix_queue = "_kombu.binding.%s"
+    keyprefix_fanout = "/{db}."
+    sep = "\x06\x16"
+    _in_fanout_poll = None
+
+    # Streams configuration
+    stream_maxlen = DEFAULT_STREAM_MAXLEN
+
+    # Fanout settings
+    fanout_prefix: bool | str = True
+    fanout_patterns = True
+
+    # Collaborators provided by the host Channel (declared for type checking)
+    connection: Transport
+    connection_errors: tuple[type[BaseException], ...]
+    global_keyprefix: str
+    active_fanout_queues: set[str]
+    _fanout_queues: dict[str, tuple[str, str]]
+    _stream_offsets: dict[str, str]
+    subclient: Any
+    qos: Any
+    conn_or_acquire: Any
+    typeof: Any
+    _next_delivery_tag: Any
+
+    def _fanout_stream_key(self, exchange: str) -> str:
+        """Get stream key for fanout exchange.
+
+        Fanout exchanges use a single stream per exchange (routing key is ignored).
+        This is correct because fanout semantics deliver every message to every consumer,
+        and XREAD does not support wildcard stream names.
+        """
+        return f"{self.keyprefix_fanout}{exchange}"
+
+    def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
+        """Deliver fanout message using Redis Streams."""
+        stream_key = self._fanout_stream_key(exchange)
+
+        with self.conn_or_acquire() as client:
+            client.xadd(
+                name=stream_key,
+                fields={"payload": dumps(message)},
+                id="*",
+                maxlen=self.stream_maxlen,
+                approximate=True,
+            )
+
+    def _xread_start(self, timeout: float | None = None) -> None:
+        """Start XREAD for fanout streams (true broadcast - every consumer gets every message)."""
+        if timeout is None:
+            timeout = self.connection.polling_interval or 1
+
+        streams: dict[str, str] = {}
+
+        for queue in self.active_fanout_queues:
+            if queue in self._fanout_queues:
+                exchange, _routing_key = self._fanout_queues[queue]
+                stream_key = self._fanout_stream_key(exchange)
+                # Use stored offset or "$" for only new messages
+                offset = self._stream_offsets.get(stream_key, "$")
+                streams[stream_key] = offset
+
+        if not streams:
+            return
+
+        self._in_fanout_poll = self.subclient.connection
+
+        # Build XREAD command
+        stream_keys = list(streams.keys())
+        stream_ids = [streams[k] for k in stream_keys]
+
+        command_args: list[Any] = [
+            "XREAD",
+            "COUNT",
+            "1",
+            "BLOCK",
+            str(int(timeout * 1000)),
+            "STREAMS",
+            *stream_keys,
+            *stream_ids,
+        ]
+
+        if self.global_keyprefix:
+            command_args = self.subclient._prefix_args(command_args)
+
+        self.subclient.connection.send_command(*command_args)
+
+    def _xread_read(self, **options: Any) -> bool:
+        """Read messages from XREAD (fanout broadcast)."""
+        try:
+            try:
+                messages = self.subclient.parse_response(self.subclient.connection, "XREAD", **options)
+            except self.connection_errors:
+                self.subclient.connection.disconnect()
+                raise
+
+            if not messages:
+                raise Empty
+
+            for stream, message_list in messages:
+                stream_str = bytes_to_str(stream) if isinstance(stream, bytes) else stream
+                for message_id, fields in message_list:
+                    message_id_str = bytes_to_str(message_id) if isinstance(message_id, bytes) else message_id
+
+                    # Update offset for this stream
+                    # Strip prefix if present for storing offset
+                    offset_key = stream_str
+                    prefix = self.global_keyprefix
+                    if prefix and stream_str.startswith(prefix):
+                        offset_key = stream_str[len(prefix) :]
+                    self._stream_offsets[offset_key] = message_id_str
+
+                    # Find which queue this stream belongs to
+                    queue_name = None
+                    for queue, (exchange, _routing_key) in self._fanout_queues.items():
+                        if offset_key == self._fanout_stream_key(exchange):
+                            queue_name = queue
+                            break
+
+                    if not queue_name:
+                        continue
+
+                    # Parse payload
+                    payload_field = fields.get(b"payload") or fields.get("payload")
+                    if not payload_field:
+                        continue
+                    payload = loads(bytes_to_str(payload_field))
+
+                    # Set delivery tag
+                    delivery_tag = self._next_delivery_tag()
+                    payload["properties"]["delivery_tag"] = delivery_tag
+
+                    # Mark as fanout message (no ack needed)
+                    if self.qos is not None:
+                        cast("QoS", self.qos)._fanout_tags.add(delivery_tag)
+
+                    # Deliver message
+                    self.connection._deliver(payload, queue_name)
+                    return True
+
+            raise Empty
+        finally:
+            self._in_fanout_poll = None
+
+    def _queue_bind(self, exchange: str, routing_key: str, pattern: str, queue: str) -> None:
+        if self.typeof(exchange).type == "fanout":
+            self._fanout_queues[queue] = (exchange, routing_key.replace("#", "*"))
+        with self.conn_or_acquire() as client:
+            client.sadd(
+                self.keyprefix_queue % (exchange,),
+                self.sep.join([routing_key or "", pattern or "", queue or ""]),
+            )
+
+    def get_table(self, exchange: str) -> list[tuple[str, str, str]]:
+        key = self.keyprefix_queue % exchange
+        with self.conn_or_acquire() as client:
+            values = client.smembers(key)
+            if not values:
+                return []
+            result: list[tuple[str, str, str]] = []
+            binding_parts_count = 3  # routing_key, pattern, queue
+            for val in values:
+                parts = bytes_to_str(val).split(self.sep)
+                # Ensure exactly 3 parts (routing_key, pattern, queue)
+                while len(parts) < binding_parts_count:
+                    parts.append("")
+                result.append((parts[0], parts[1], parts[2]))
+            return result
+
+
+class Channel(FanoutStreamsMixin, virtual.Channel):
     """Redis Channel with BZMPOP priority queues and Streams fanout.
 
     Uses:
@@ -767,12 +944,7 @@ class Channel(virtual.Channel):
     connection: Transport  # Narrow type from base class for our custom Transport
 
     _client: Any = None
-    supports_fanout = True
-    keyprefix_queue = "_kombu.binding.%s"
-    keyprefix_fanout = "/{db}."
-    sep = "\x06\x16"
     _in_poll = None
-    _in_fanout_poll = None
     _warned_expires_clamp = False
     max_priority = MAX_PRIORITY  # Override kombu's default of 9 to enable full 0-255 range
 
@@ -792,9 +964,6 @@ class Channel(virtual.Channel):
     health_check_interval = DEFAULT_HEALTH_CHECK_INTERVAL
     client_name: str | None = None
 
-    # Streams configuration
-    stream_maxlen = DEFAULT_STREAM_MAXLEN
-
     # Global key prefix
     global_keyprefix = ""
 
@@ -803,10 +972,6 @@ class Channel(virtual.Channel):
 
     # Max restore count (None = no limit)
     max_restore_count: int | None = DEFAULT_MAX_RESTORE_COUNT
-
-    # Fanout settings
-    fanout_prefix: bool | str = True
-    fanout_patterns = True
 
     _async_pool: Any = None
     _pool: Any = None
@@ -1153,114 +1318,6 @@ class Channel(virtual.Channel):
         finally:
             self._in_poll = None
 
-    # --- XREAD (Streams) methods for fanout ---
-
-    def _fanout_stream_key(self, exchange: str) -> str:
-        """Get stream key for fanout exchange.
-
-        Fanout exchanges use a single stream per exchange (routing key is ignored).
-        This is correct because fanout semantics deliver every message to every consumer,
-        and XREAD does not support wildcard stream names.
-        """
-        return f"{self.keyprefix_fanout}{exchange}"
-
-    def _xread_start(self, timeout: float | None = None) -> None:
-        """Start XREAD for fanout streams (true broadcast - every consumer gets every message)."""
-        if timeout is None:
-            timeout = self.connection.polling_interval or 1
-
-        streams: dict[str, str] = {}
-
-        for queue in self.active_fanout_queues:
-            if queue in self._fanout_queues:
-                exchange, _routing_key = self._fanout_queues[queue]
-                stream_key = self._fanout_stream_key(exchange)
-                # Use stored offset or "$" for only new messages
-                offset = self._stream_offsets.get(stream_key, "$")
-                streams[stream_key] = offset
-
-        if not streams:
-            return
-
-        self._in_fanout_poll = self.subclient.connection
-
-        # Build XREAD command
-        stream_keys = list(streams.keys())
-        stream_ids = [streams[k] for k in stream_keys]
-
-        command_args: list[Any] = [
-            "XREAD",
-            "COUNT",
-            "1",
-            "BLOCK",
-            str(int(timeout * 1000)),
-            "STREAMS",
-            *stream_keys,
-            *stream_ids,
-        ]
-
-        if self.global_keyprefix:
-            command_args = self.subclient._prefix_args(command_args)
-
-        self.subclient.connection.send_command(*command_args)
-
-    def _xread_read(self, **options: Any) -> bool:
-        """Read messages from XREAD (fanout broadcast)."""
-        try:
-            try:
-                messages = self.subclient.parse_response(self.subclient.connection, "XREAD", **options)
-            except self.connection_errors:
-                self.subclient.connection.disconnect()
-                raise
-
-            if not messages:
-                raise Empty
-
-            for stream, message_list in messages:
-                stream_str = bytes_to_str(stream) if isinstance(stream, bytes) else stream
-                for message_id, fields in message_list:
-                    message_id_str = bytes_to_str(message_id) if isinstance(message_id, bytes) else message_id
-
-                    # Update offset for this stream
-                    # Strip prefix if present for storing offset
-                    offset_key = stream_str
-                    prefix = self.global_keyprefix
-                    if prefix and stream_str.startswith(prefix):
-                        offset_key = stream_str[len(prefix) :]
-                    self._stream_offsets[offset_key] = message_id_str
-
-                    # Find which queue this stream belongs to
-                    queue_name = None
-                    for queue, (exchange, _routing_key) in self._fanout_queues.items():
-                        if offset_key == self._fanout_stream_key(exchange):
-                            queue_name = queue
-                            break
-
-                    if not queue_name:
-                        continue
-
-                    # Parse payload
-                    payload_field = fields.get(b"payload") or fields.get("payload")
-                    if not payload_field:
-                        continue
-                    payload = loads(bytes_to_str(payload_field))
-
-                    # Set delivery tag
-                    delivery_tag = self._next_delivery_tag()
-                    payload["properties"]["delivery_tag"] = delivery_tag
-
-                    # Mark as fanout message (no ack needed)
-                    if self.qos is not None:
-                        cast("QoS", self.qos)._fanout_tags.add(delivery_tag)
-
-                    # Deliver message
-                    self.connection._deliver(payload, queue_name)
-                    return True
-
-            raise Empty
-        finally:
-            self._in_fanout_poll = None
-
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
         if cmd_type == "XREAD":
             client = self.subclient
@@ -1480,19 +1537,6 @@ class Channel(virtual.Channel):
                 pipe.pexpire(self._messages_index_key(queue), ttl_ms)
             pipe.execute()
 
-    def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
-        """Deliver fanout message using Redis Streams."""
-        stream_key = self._fanout_stream_key(exchange)
-
-        with self.conn_or_acquire() as client:
-            client.xadd(
-                name=stream_key,
-                fields={"payload": dumps(message)},
-                id="*",
-                maxlen=self.stream_maxlen,
-                approximate=True,
-            )
-
     def prepare_queue_arguments(self, arguments: dict[str, Any] | None, **kwargs: Any) -> dict[str, Any] | None:
         return to_rabbitmq_queue_arguments(arguments, **kwargs)
 
@@ -1518,15 +1562,6 @@ class Channel(virtual.Channel):
         x_message_ttl = arguments.get("x-message-ttl")
         if x_message_ttl is not None and queue not in self._message_ttls:
             self._message_ttls[queue] = int(x_message_ttl)
-
-    def _queue_bind(self, exchange: str, routing_key: str, pattern: str, queue: str) -> None:
-        if self.typeof(exchange).type == "fanout":
-            self._fanout_queues[queue] = (exchange, routing_key.replace("#", "*"))
-        with self.conn_or_acquire() as client:
-            client.sadd(
-                self.keyprefix_queue % (exchange,),
-                self.sep.join([routing_key or "", pattern or "", queue or ""]),
-            )
 
     def _delete(self, queue: str, *args: Any, **kwargs: Any) -> None:
         # kombu calls: _delete(queue, exchange, routing_key, pattern)
@@ -1571,22 +1606,6 @@ class Channel(virtual.Channel):
     def _has_queue(self, queue: str, **kwargs: Any) -> bool:
         with self.conn_or_acquire() as client:
             return bool(client.exists(self._queue_key(queue)))
-
-    def get_table(self, exchange: str) -> list[tuple[str, str, str]]:
-        key = self.keyprefix_queue % exchange
-        with self.conn_or_acquire() as client:
-            values = client.smembers(key)
-            if not values:
-                return []
-            result: list[tuple[str, str, str]] = []
-            binding_parts_count = 3  # routing_key, pattern, queue
-            for val in values:
-                parts = bytes_to_str(val).split(self.sep)
-                # Ensure exactly 3 parts (routing_key, pattern, queue)
-                while len(parts) < binding_parts_count:
-                    parts.append("")
-                result.append((parts[0], parts[1], parts[2]))
-            return result
 
     def _purge(self, queue: str) -> int:
         with self.conn_or_acquire() as client:
