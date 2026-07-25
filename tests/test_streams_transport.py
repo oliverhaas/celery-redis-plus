@@ -26,6 +26,7 @@ from celery_redis_plus.constants import (
     DEFAULT_CONSUMER_GROUP,
     DEFAULT_PRIORITY_STEPS,
     DEFAULT_REQUEUE_BATCH_LIMIT,
+    DEFAULT_VISIBILITY_TIMEOUT,
     DELAYED_KEY_PREFIX,
     HEARTBEAT_INTERVAL_DIVISOR,
     SHUTDOWN_IDLE_MS,
@@ -2266,3 +2267,960 @@ class TestStreamsMoveDelayed:
         # the same value register_with_event_loop reads at call time
         intervals = {c.args[0]: c.args[1] for c in loop.call_repeatedly.call_args_list}
         assert intervals[DEFAULT_REQUEUE_CHECK_INTERVAL] is cycle.maybe_enqueue_due_messages
+
+
+@pytest.mark.unit
+class TestStreamsReclaim:
+    """Unit tests for Channel._reclaim_and_deliver (XAUTOCLAIM recovery)."""
+
+    def test_reclaim_empty_stream_terminates_on_zero_cursor(self, global_keyprefix: str) -> None:
+        """A stream with nothing to claim returns 0 after a single XAUTOCLAIM call."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        mock_client = MagicMock()
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [b"0-0", [], []]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 0
+        mock_client.xautoclaim.assert_called_once_with(
+            "stream:celery:0",
+            "celery",
+            "worker1:123",
+            min_idle_time=DEFAULT_VISIBILITY_TIMEOUT * 1000,
+            start_id="0-0",
+            count=100,
+        )
+        channel.connection._deliver.assert_not_called()
+        mock_ack_script.assert_not_called()
+
+    def test_reclaim_delivers_claimed_message_with_restore_count_header(self, global_keyprefix: str) -> None:
+        """A claimed entry is delivered locally with x-restore-count = times_delivered - 1."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-reclaim-1",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+            [],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 2,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        delivered_message, delivered_queue = channel.connection._deliver.call_args[0]
+        assert delivered_queue == "celery"
+        assert delivered_message["properties"]["headers"]["x-restore-count"] == 1
+        assert channel._qos._in_flight["tag-reclaim-1"] == ("stream:celery:0", "1700000000000-0")
+        mock_ack_script.assert_not_called()
+
+    def test_reclaim_no_header_on_first_delivery(self, global_keyprefix: str) -> None:
+        """times_delivered = 1 means restore_count 0: no x-restore-count header is injected."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-fresh",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.register_script.return_value = MagicMock()
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+            [],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 1,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        delivered_message, _delivered_queue = channel.connection._deliver.call_args[0]
+        assert "x-restore-count" not in delivered_message["properties"]["headers"]
+        assert channel._qos._in_flight["tag-fresh"] == ("stream:celery:0", "1700000000000-0")
+
+    def test_reclaim_cursor_loop_continues_until_zero_cursor(self, global_keyprefix: str) -> None:
+        """The XAUTOCLAIM cursor loop feeds the returned cursor back until it is 0-0."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json_1 = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-a",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        payload_json_2 = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-b",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.register_script.return_value = MagicMock()
+        mock_client.xautoclaim.side_effect = [
+            [b"1700000000005-0", [(b"1700000000001-0", {b"payload": payload_json_1.encode()})], []],
+            [b"0-0", [(b"1700000000006-0", {b"payload": payload_json_2.encode()})], []],
+        ]
+        mock_client.xpending_range.side_effect = [
+            [
+                {
+                    "message_id": b"1700000000001-0",
+                    "consumer": b"worker1:123",
+                    "time_since_delivered": 400000,
+                    "times_delivered": 2,
+                },
+            ],
+            [
+                {
+                    "message_id": b"1700000000006-0",
+                    "consumer": b"worker1:123",
+                    "time_since_delivered": 400000,
+                    "times_delivered": 2,
+                },
+            ],
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 2
+        assert mock_client.xautoclaim.call_count == 2
+        assert mock_client.xautoclaim.call_args_list[0].kwargs["start_id"] == "0-0"
+        assert mock_client.xautoclaim.call_args_list[1].kwargs["start_id"] == "1700000000005-0"
+        assert channel.connection._deliver.call_count == 2
+
+    def test_reclaim_fetches_delivery_counts_via_xpending_range(self, global_keyprefix: str) -> None:
+        """Delivery counts come from XPENDING bounded to the claimed ID range and map per entry id."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json_1 = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-first",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        payload_json_2 = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-second",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.register_script.return_value = MagicMock()
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [
+                (b"1700000000001-0", {b"payload": payload_json_1.encode()}),
+                (b"1700000000002-0", {b"payload": payload_json_2.encode()}),
+            ],
+            [],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000001-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 1,
+            },
+            {
+                "message_id": b"1700000000002-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 3,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 2
+        args, kwargs = mock_client.xpending_range.call_args
+        assert args == ("stream:celery:0", "celery")
+        assert kwargs == {
+            "min": "1700000000001-0",
+            "max": "1700000000002-0",
+            "count": 1002,
+            "consumername": "worker1:123",
+        }
+        first_message = channel.connection._deliver.call_args_list[0].args[0]
+        second_message = channel.connection._deliver.call_args_list[1].args[0]
+        assert "x-restore-count" not in first_message["properties"]["headers"]
+        assert second_message["properties"]["headers"]["x-restore-count"] == 2
+
+    def test_reclaim_bounds_xpending_to_claimed_id_range(self, global_keyprefix: str) -> None:
+        """Own lower-ID in-flight PEL entries must not displace claimed entries from XPENDING.
+
+        Emulates real PEL semantics with a side_effect: this consumer already
+        holds two in-flight entries (running tasks) with stream IDs BELOW the
+        claimed range. An unbounded min="-"/max="+" window truncated at
+        count=len(claimed) would return only those own entries, silently
+        zeroing the claimed entries' restore counts (defeating both the
+        max_restore_count cap and the x-restore-count header). The query must
+        instead be bounded to min=first claimed ID, max=last claimed ID with
+        count headroom, and the delivered messages must carry the true counts.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json_1 = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-claimed-a",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        payload_json_2 = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-claimed-b",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+
+        # This consumer's full PEL, ascending by ID: two own in-flight entries
+        # (lower IDs, tasks currently running) plus the two entries about to be
+        # claimed from a dead peer (higher IDs, elevated delivery counts).
+        pel = [
+            {
+                "message_id": b"1700000000001-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 1000,
+                "times_delivered": 1,
+            },
+            {
+                "message_id": b"1700000000002-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 1000,
+                "times_delivered": 1,
+            },
+            {
+                "message_id": b"1700000000003-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 3,
+            },
+            {
+                "message_id": b"1700000000004-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 2,
+            },
+        ]
+
+        def fake_xpending_range(name: str, groupname: str, **kwargs: object) -> list[dict[str, object]]:
+            """Emulate XPENDING range semantics: ID-range filter, ascending, truncated at count.
+
+            Takes min/max/count/consumername via **kwargs because min and max would
+            shadow builtins as named parameters (ruff A002).
+            """
+            lo = "0-0" if kwargs["min"] == "-" else kwargs["min"]
+            hi = "9999999999999-9" if kwargs["max"] == "+" else kwargs["max"]
+            # Lexicographic comparison is valid here: all test IDs share one width
+            matching = [entry for entry in pel if lo <= entry["message_id"].decode() <= hi]
+            return matching[: kwargs["count"]]
+
+        mock_client = MagicMock()
+        mock_client.register_script.return_value = MagicMock()
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [
+                (b"1700000000003-0", {b"payload": payload_json_1.encode()}),
+                (b"1700000000004-0", {b"payload": payload_json_2.encode()}),
+            ],
+            [],
+        ]
+        mock_client.xpending_range.side_effect = fake_xpending_range
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 2
+        args, kwargs = mock_client.xpending_range.call_args
+        assert args == ("stream:celery:0", "celery")
+        assert kwargs == {
+            "min": "1700000000003-0",
+            "max": "1700000000004-0",
+            "count": 1002,
+            "consumername": "worker1:123",
+        }
+        first_message = channel.connection._deliver.call_args_list[0].args[0]
+        second_message = channel.connection._deliver.call_args_list[1].args[0]
+        assert first_message["properties"]["headers"]["x-restore-count"] == 2
+        assert second_message["properties"]["headers"]["x-restore-count"] == 1
+
+    def test_reclaim_ignores_deleted_ids_element(
+        self,
+        global_keyprefix: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The third XAUTOCLAIM reply element (deleted ids) is logged but never treated as work."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-live",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+            [b"1600000000000-0", b"1600000000001-0"],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 2,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with caplog.at_level(logging.WARNING, logger="celery_redis_plus.streams"):
+            result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        channel.connection._deliver.assert_called_once()
+        # Deleted ids are never delivered or acked, only logged
+        mock_ack_script.assert_not_called()
+        assert any("deleted" in record.getMessage() for record in caplog.records)
+
+    def test_reclaim_respects_budget(self, global_keyprefix: str) -> None:
+        """Processing stops at the budget even when the cursor and stream list have more to scan."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:9", "stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-budget",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.register_script.return_value = MagicMock()
+        mock_client.xautoclaim.return_value = [
+            b"1700000000009-0",
+            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+            [],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 2,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 1)
+
+        assert result == 1
+        mock_client.xautoclaim.assert_called_once()
+        assert mock_client.xautoclaim.call_args.args[0] == "stream:celery:9"
+        assert mock_client.xautoclaim.call_args.kwargs["count"] == 1
+        channel.connection._deliver.assert_called_once()
+
+    def test_reclaim_scans_all_level_streams(self, global_keyprefix: str) -> None:
+        """All priority level streams are scanned, highest level first."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:9", "stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-level0",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.register_script.return_value = MagicMock()
+        mock_client.xautoclaim.side_effect = [
+            [b"0-0", [], []],
+            [b"0-0", [(b"1700000000000-0", {b"payload": payload_json.encode()})], []],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 2,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        scanned = [c.args[0] for c in mock_client.xautoclaim.call_args_list]
+        assert scanned == ["stream:celery:9", "stream:celery:0"]
+        channel.connection._deliver.assert_called_once()
+
+    def test_reclaim_drops_expired_message(self, global_keyprefix: str) -> None:
+        """Claimed entries older than the effective x-message-ttl are acked and skipped."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {"celery": 60_000}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-expired",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        expired_id = f"{int(time.time() * 1000) - 120_000}-0"
+        mock_client = MagicMock()
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(expired_id.encode(), {b"payload": payload_json.encode()})],
+            [],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": expired_id.encode(),
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 2,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        channel.connection._deliver.assert_not_called()
+        mock_ack_script.assert_called_once_with(
+            keys=[f"{global_keyprefix}stream:celery:0"],
+            args=["celery", expired_id, ""],
+        )
+
+    def test_reclaim_nogroup_reensures_and_retries_once(self, global_keyprefix: str) -> None:
+        """A NOGROUP from XAUTOCLAIM (stream deleted out of band) re-ensures groups and retries once."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel._ensured_groups = {"stream:celery:0"}
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-nogroup",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.register_script.return_value = MagicMock()
+        # First call: NOGROUP (the stream and its group were deleted out of
+        # band, e.g. cross-process purge or x-expires expiry, while this
+        # channel's _ensured_groups cache was warm). Second call: a claim.
+        mock_client.xautoclaim.side_effect = [
+            _client_exceptions.ResponseError(
+                "NOGROUP No such key 'stream:celery:0' or consumer group 'celery'",
+            ),
+            [
+                b"0-0",
+                [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+                [],
+            ],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 1,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        assert mock_client.xautoclaim.call_count == 2
+        # _invalidate_group discarded the stale cache entry, then the queue's
+        # groups were re-ensured (_ensure_group is mocked, so nothing re-adds)
+        assert channel._ensured_groups == set()
+        channel._ensure_group.assert_called_once_with("stream:celery:0")
+        channel.connection._deliver.assert_called_once()
+
+
+@pytest.mark.unit
+class TestStreamsPoison:
+    """Unit tests for poison message handling in Channel._reclaim_and_deliver."""
+
+    def test_poison_message_dropped_when_exceeding_max_restore_count(
+        self,
+        global_keyprefix: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """restore_count above max_restore_count acks the entry away instead of delivering it."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = 2
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-poison",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+            [],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 4,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with caplog.at_level(logging.WARNING, logger="celery_redis_plus.streams"):
+            result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        channel.connection._deliver.assert_not_called()
+        mock_client.xadd.assert_not_called()
+        mock_ack_script.assert_called_once_with(
+            keys=[f"{global_keyprefix}stream:celery:0"],
+            args=["celery", "1700000000000-0", ""],
+        )
+        assert any("max restore count" in record.getMessage() for record in caplog.records)
+
+    def test_poison_message_copied_to_dead_letter_stream(self, global_keyprefix: str) -> None:
+        """With dead_letter_stream set, the poisoned payload is XADDed there before the ack."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = 1
+        channel.dead_letter_stream = "dead-letters"
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-dlq",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+            [],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 5,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        channel.connection._deliver.assert_not_called()
+        mock_client.xadd.assert_called_once_with(
+            name="dead-letters",
+            fields={"payload": payload_json.encode()},
+            id="*",
+            maxlen=10000,
+            approximate=True,
+        )
+        mock_ack_script.assert_called_once_with(
+            keys=[f"{global_keyprefix}stream:celery:0"],
+            args=["celery", "1700000000000-0", ""],
+        )
+
+    def test_message_at_max_restore_count_still_delivered(self, global_keyprefix: str) -> None:
+        """restore_count equal to max_restore_count is NOT poisoned (drop only when strictly above)."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = 3
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-at-max",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+            [],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 4,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        delivered_message, _delivered_queue = channel.connection._deliver.call_args[0]
+        assert delivered_message["properties"]["headers"]["x-restore-count"] == 3
+        mock_ack_script.assert_not_called()
+
+    def test_no_poison_check_when_max_restore_count_none(self, global_keyprefix: str) -> None:
+        """max_restore_count None means unlimited restores: always delivered with the header."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-unlimited",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+            [],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 100,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        delivered_message, _delivered_queue = channel.connection._deliver.call_args[0]
+        assert delivered_message["properties"]["headers"]["x-restore-count"] == 99
+        mock_ack_script.assert_not_called()

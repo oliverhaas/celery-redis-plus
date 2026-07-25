@@ -777,6 +777,175 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             )
         return moved
 
+    def _reclaim_and_deliver(self, queue: str, budget: int) -> int:  # noqa: PLR0912, PLR0915
+        """Reclaim messages idle past the visibility timeout and deliver them locally.
+
+        Runs an XAUTOCLAIM cursor loop over each of the queue's priority level
+        streams (highest level first). Claimed entries carry their payloads, so
+        they are delivered directly to this channel. The XAUTOCLAIM reply has no
+        delivery counts, so counts are fetched after claiming via an XPENDING
+        query bounded to the claimed ID range (an unbounded window truncates at
+        its count and this worker's own lower-ID in-flight entries would displace
+        the claimed ones); restore_count = times_delivered - 1 (the first
+        delivery is not a restore).
+
+        Messages exceeding max_restore_count are dropped, optionally copied to
+        dead_letter_stream first. Messages older than the effective x-message-ttl
+        are acked and skipped.
+
+        A NOGROUP from XAUTOCLAIM means the stream (and with it its consumer
+        group) was deleted out of band while this channel's _ensured_groups
+        cache was warm; the cache is invalidated, the queue's groups are
+        re-created, and the call is retried once. A second NOGROUP propagates
+        to maybe_enqueue_due_messages, which logs and retries next cycle.
+
+        Args:
+            queue: Queue name to reclaim messages for.
+            budget: Maximum number of claimed entries to process.
+
+        Returns:
+            Number of claimed entries processed (delivered or dropped).
+        """
+        if budget <= 0:
+            return 0
+
+        min_idle_ms = int(self.visibility_timeout * 1000)
+        now_ms = int(time() * 1000)
+
+        # Effective message TTL in ms (0 = no TTL): channel option min per-queue x-message-ttl
+        ttl_ms = 0
+        if self.message_ttl is not None:
+            ttl_ms = int(self.message_ttl * 1000)
+        queue_ttl_ms = self._message_ttls.get(queue)
+        if queue_ttl_ms is not None:
+            ttl_ms = queue_ttl_ms if ttl_ms <= 0 else min(ttl_ms, queue_ttl_ms)
+
+        processed = 0
+        with self.conn_or_acquire() as client:
+            ack_script = client.register_script(_STREAMS_ACK_LUA)
+            for stream_key in self._stream_keys_for_queue(queue):
+                cursor = "0-0"
+                while processed < budget:
+                    xautoclaim_kwargs: dict[str, Any] = {
+                        "min_idle_time": min_idle_ms,
+                        "start_id": cursor,
+                        "count": min(budget - processed, 100),
+                    }
+                    try:
+                        result = client.xautoclaim(
+                            stream_key,
+                            self.consumer_group,
+                            self.consumer_name,
+                            **xautoclaim_kwargs,
+                        )
+                    except self.ResponseError as exc:
+                        if "NOGROUP" not in str(exc):
+                            raise
+                        # Stream deleted out of band (cross-process purge,
+                        # queue delete, x-expires expiry): drop the stale
+                        # cache, recreate the queue's groups, retry once.
+                        # A second NOGROUP propagates to the caller.
+                        self._invalidate_group(queue)
+                        for level_key in self._stream_keys_for_queue(queue):
+                            self._ensure_group(level_key)
+                        result = client.xautoclaim(
+                            stream_key,
+                            self.consumer_group,
+                            self.consumer_name,
+                            **xautoclaim_kwargs,
+                        )
+                    cursor = bytes_to_str(result[0])
+                    claimed = result[1]
+                    # Redis 7.0+ adds a third reply element: ids deleted from the stream
+                    # while still pending. They carry no payload; never treat them as work.
+                    deleted_ids = result[2] if len(result) > 2 else []  # noqa: PLR2004
+                    if deleted_ids:
+                        logger.warning(
+                            "Stream %s: ignoring %d pending entries whose stream entries were deleted.",
+                            stream_key,
+                            len(deleted_ids),
+                        )
+                    if not claimed:
+                        if cursor == "0-0":
+                            break
+                        continue
+
+                    # XAUTOCLAIM replies carry no delivery counts, so fetch them via
+                    # XPENDING bounded to the claimed ID range (XAUTOCLAIM returns
+                    # entries in ascending ID order). An unbounded min="-"/max="+"
+                    # window truncates at its count, and this worker's own in-flight
+                    # PEL entries with lower IDs would displace claimed entries,
+                    # silently zeroing their restore counts.
+                    pending = client.xpending_range(
+                        stream_key,
+                        self.consumer_group,
+                        min=bytes_to_str(claimed[0][0]),
+                        max=bytes_to_str(claimed[-1][0]),
+                        # Generous headroom: own in-flight entries can still interleave
+                        # inside the claimed range, and per-call claims are capped at 100
+                        count=len(claimed) + 1000,
+                        consumername=self.consumer_name,
+                    )
+                    times_delivered = {
+                        bytes_to_str(entry["message_id"]): int(entry["times_delivered"]) for entry in pending
+                    }
+
+                    # Prefix key since EVALSHA doesn't auto-prefix KEYS
+                    prefixed_stream = f"{self.global_keyprefix}{stream_key}"
+                    for message_id, fields in claimed:
+                        message_id_str = bytes_to_str(message_id)
+                        processed += 1
+                        payload_field = fields.get(b"payload") or fields.get("payload")
+                        if payload_field is None:
+                            # Foreign or corrupt entry: ack it away so it cannot loop forever
+                            ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id_str, ""])
+                            continue
+                        # Lazy x-message-ttl drop: entry ids encode their creation time in ms
+                        if ttl_ms > 0 and int(message_id_str.split("-")[0]) < now_ms - ttl_ms:
+                            ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id_str, ""])
+                            continue
+                        # The bounded XPENDING query above covers every claimed id, so a
+                        # miss should be unreachable; fall back defensively, do not crash
+                        if message_id_str not in times_delivered:
+                            logger.warning(
+                                "Stream %s: claimed entry %s missing from bounded XPENDING reply; "
+                                "assuming first delivery.",
+                                stream_key,
+                                message_id_str,
+                            )
+                        restore_count = times_delivered.get(message_id_str, 1) - 1
+                        if self.max_restore_count is not None and restore_count > self.max_restore_count:
+                            if self.dead_letter_stream is not None:
+                                # Copy to the dead-letter stream before dropping (approximate cap)
+                                client.xadd(
+                                    name=self.dead_letter_stream,
+                                    fields={"payload": payload_field},
+                                    id="*",
+                                    maxlen=10000,
+                                    approximate=True,
+                                )
+                            ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id_str, ""])
+                            logger.warning(
+                                "Queue %s: dropped message %s after exceeding max restore count of %d.",
+                                queue,
+                                message_id_str,
+                                self.max_restore_count,
+                            )
+                            continue
+                        message: dict[str, Any] = loads(bytes_to_str(payload_field))
+                        if restore_count > 0:
+                            headers = message.setdefault("properties", {}).setdefault("headers", {})
+                            headers["x-restore-count"] = restore_count
+                        delivery_tag = message["properties"]["delivery_tag"]
+                        if self.qos is not None:
+                            cast("QoS", self.qos)._in_flight[delivery_tag] = (stream_key, message_id_str)
+                        self.connection._deliver(message, queue)
+                    if cursor == "0-0":
+                        break
+                if processed >= budget:
+                    break
+        return processed
+
     @property
     def priority_steps(self) -> list[int]:
         """Priority buckets in 0-255 space, sorted ascending."""
