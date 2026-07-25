@@ -39,7 +39,7 @@ from celery_redis_plus.streams import (
     client_lib,
     priority_to_level,
 )
-from celery_redis_plus.transport import PrefixedStrictRedis, _client_exceptions
+from celery_redis_plus.transport import PrefixedStrictRedis, _client_exceptions, _connection_errors
 
 
 @pytest.mark.unit
@@ -1478,3 +1478,226 @@ class TestStreamsQoSReject:
         )
         assert "tag1" not in qos._in_flight
         qos._quick_ack.assert_called_once_with("tag1")
+
+
+@pytest.mark.unit
+class TestStreamsXReadGroup:
+    """Unit tests for blocking XREADGROUP start/read and poll error routing."""
+
+    def test_xreadgroup_start_sends_blocking_command(self, global_keyprefix: str) -> None:
+        """Test _xreadgroup_start sends XREADGROUP BLOCK COUNT 1 over all watched level streams."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._queue_cycle = ["q1"]
+        channel._in_poll = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:q1:9", "stream:q1:0"])
+        channel.connection = MagicMock()
+        channel.connection.polling_interval = 3
+
+        mock_client = MagicMock()
+        mock_client._prefix_args.side_effect = lambda args: args
+        channel.client = mock_client
+
+        channel._xreadgroup_start()
+
+        sent_args = mock_client.connection.send_command.call_args[0]
+        assert list(sent_args) == [
+            "XREADGROUP",
+            "GROUP",
+            "celery",
+            "host:42",
+            "BLOCK",
+            "3000",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "stream:q1:9",
+            "stream:q1:0",
+            ">",
+            ">",
+        ]
+        assert channel._in_poll is mock_client.connection
+        assert channel._ensure_group.call_count == 2
+        if global_keyprefix:
+            mock_client._prefix_args.assert_called_once()
+        else:
+            mock_client._prefix_args.assert_not_called()
+
+    def test_xreadgroup_start_without_queues_sends_nothing(self) -> None:
+        """Test _xreadgroup_start is a no-op when no queues are watched."""
+        channel = object.__new__(Channel)
+        channel._queue_cycle = []
+        channel._in_poll = None
+        channel.connection = MagicMock()
+        channel.connection.polling_interval = 3
+        mock_client = MagicMock()
+        channel.client = mock_client
+
+        channel._xreadgroup_start()
+
+        mock_client.connection.send_command.assert_not_called()
+        assert channel._in_poll is None
+
+    def test_xreadgroup_read_delivers_entry(self, global_keyprefix: str) -> None:
+        """Test _xreadgroup_read delivers an entry and records _in_flight with unprefixed key."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel.connection_errors = _connection_errors
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        mock_client = MagicMock()
+        channel.client = mock_client
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        stream_name = f"{global_keyprefix}stream:q1:9".encode()
+        payload = b'{"body": "test", "properties": {"delivery_tag": "tagA"}}'
+        mock_client.parse_response.return_value = [(stream_name, [(b"1111-0", {b"payload": payload})])]
+
+        result = channel._xreadgroup_read()
+
+        assert result is True
+        assert channel._in_poll is None
+        assert mock_qos._in_flight == {"tagA": ("stream:q1:9", "1111-0")}
+        mock_connection._deliver.assert_called_once_with(
+            {"body": "test", "properties": {"delivery_tag": "tagA"}},
+            "q1",
+        )
+
+    def test_xreadgroup_read_delivers_all_entries(self) -> None:
+        """Test _xreadgroup_read delivers every returned entry (all are PEL-registered)."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._in_poll = True
+        channel.connection_errors = _connection_errors
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        mock_client = MagicMock()
+        channel.client = mock_client
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        mock_client.parse_response.return_value = [
+            (b"stream:q1:9", [(b"1-0", {b"payload": b'{"body": "a", "properties": {"delivery_tag": "tagA"}}'})]),
+            (b"stream:q2:0", [(b"2-0", {b"payload": b'{"body": "b", "properties": {"delivery_tag": "tagB"}}'})]),
+        ]
+
+        result = channel._xreadgroup_read()
+
+        assert result is True
+        assert mock_qos._in_flight == {"tagA": ("stream:q1:9", "1-0"), "tagB": ("stream:q2:0", "2-0")}
+        assert mock_connection._deliver.call_count == 2
+        delivered_queues = [call.args[1] for call in mock_connection._deliver.call_args_list]
+        assert delivered_queues == ["q1", "q2"]
+        assert channel._in_poll is None
+
+    def test_xreadgroup_read_empty_reply_raises_empty(self) -> None:
+        """Test _xreadgroup_read raises Empty on a nil reply (BLOCK timeout) and clears _in_poll."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._in_poll = True
+        channel.connection_errors = _connection_errors
+        mock_client = MagicMock()
+        channel.client = mock_client
+        mock_client.parse_response.return_value = None
+
+        with pytest.raises(Empty):
+            channel._xreadgroup_read()
+
+        assert channel._in_poll is None
+
+    def test_xreadgroup_read_connection_error_disconnects(self) -> None:
+        """Test _xreadgroup_read disconnects the raw connection on connection errors."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._in_poll = True
+        channel.connection_errors = _connection_errors
+        mock_client = MagicMock()
+        channel.client = mock_client
+        mock_client.parse_response.side_effect = _client_exceptions.ConnectionError("connection lost")
+
+        with pytest.raises(_client_exceptions.ConnectionError):
+            channel._xreadgroup_read()
+
+        mock_client.connection.disconnect.assert_called_once()
+        assert channel._in_poll is None
+
+    def test_xreadgroup_read_nogroup_invalidates_cache_and_raises_empty(self) -> None:
+        """Test a NOGROUP reply (stream deleted out of band) clears the ensured-group cache and raises Empty."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._in_poll = True
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel._ensured_groups = {"stream:q1:9", "stream:q1:0"}
+        mock_client = MagicMock()
+        channel.client = mock_client
+        mock_client.parse_response.side_effect = _client_exceptions.ResponseError(
+            "NOGROUP No such key 'stream:q1:9' or consumer group 'celery' in XREADGROUP with GROUP option",
+        )
+
+        with pytest.raises(Empty):
+            channel._xreadgroup_read()
+
+        # The next non-blocking pass re-runs _ensure_group per queue before
+        # touching the streams, re-creating the groups
+        assert channel._ensured_groups == set()
+        assert channel._in_poll is None
+
+    def test_poll_error_xread_uses_subclient(self) -> None:
+        """Test _poll_error routes XREAD errors to the fanout subclient."""
+        channel = object.__new__(Channel)
+        channel._in_poll = None
+        mock_subclient = MagicMock()
+        channel.subclient = mock_subclient
+
+        channel._poll_error("XREAD")
+
+        mock_subclient.parse_response.assert_called_once_with(mock_subclient.connection, "XREAD")
+
+    def test_poll_error_blocking_read_uses_xreadgroup(self) -> None:
+        """Test _poll_error parses as XREADGROUP while a blocking read is pending."""
+        channel = object.__new__(Channel)
+        mock_client = MagicMock()
+        channel.client = mock_client
+        channel._in_poll = mock_client.connection
+
+        channel._poll_error("XREADGROUP")
+
+        mock_client.parse_response.assert_called_once_with(mock_client.connection, "XREADGROUP")
+
+    def test_poll_error_without_blocking_read_uses_evalsha(self) -> None:
+        """Test _poll_error parses as EVALSHA when no blocking read is pending (non-blocking pass)."""
+        channel = object.__new__(Channel)
+        mock_client = MagicMock()
+        channel.client = mock_client
+        channel._in_poll = None
+
+        channel._poll_error("XREADGROUP")
+
+        mock_client.parse_response.assert_called_once_with(mock_client.connection, "EVALSHA")
+
+    def test_poll_error_nogroup_invalidates_cache_and_raises_empty(self) -> None:
+        """Test _poll_error on a NOGROUP reply clears the ensured-group cache and raises Empty."""
+        channel = object.__new__(Channel)
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel._ensured_groups = {"stream:q1:9", "stream:q1:0"}
+        mock_client = MagicMock()
+        channel.client = mock_client
+        channel._in_poll = mock_client.connection
+        mock_client.parse_response.side_effect = _client_exceptions.ResponseError(
+            "NOGROUP No such key 'stream:q1:9' or consumer group 'celery' in XREADGROUP with GROUP option",
+        )
+
+        with pytest.raises(Empty):
+            channel._poll_error("XREADGROUP")
+
+        # The next non-blocking pass re-runs _ensure_group per queue,
+        # re-creating the groups
+        assert channel._ensured_groups == set()

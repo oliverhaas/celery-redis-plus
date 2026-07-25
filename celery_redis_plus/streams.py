@@ -732,18 +732,121 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         self._update_queue_cycle()
         return ret
 
-    def _xreadgroup_read(self, **options: Any) -> bool:
-        """Parse a blocking XREADGROUP reply and deliver entries.
+    def _xreadgroup_start(self, timeout: float | None = None) -> None:
+        """Send a blocking XREADGROUP over all watched level streams.
 
-        Placeholder: the consume cycle is not wired up yet, so no queue poll is
-        ever started and this handler only signals "nothing available".
+        Called when the non-blocking pass found every queue empty. Data on
+        any stream wakes the poller fd; strict priority order is restored on
+        the next non-blocking pass.
         """
-        raise Empty
+        if timeout is None:
+            timeout = self.connection.polling_interval or 1
+        if not self._queue_cycle:
+            return
+
+        stream_keys: list[str] = []
+        for queue in self._queue_cycle:
+            for stream_key in self._stream_keys_for_queue(queue):
+                self._ensure_group(stream_key)
+                stream_keys.append(stream_key)
+
+        command_args: list[Any] = [
+            "XREADGROUP",
+            "GROUP",
+            self.consumer_group,
+            self.consumer_name,
+            "BLOCK",
+            str(int(timeout * 1000)),
+            "COUNT",
+            "1",
+            "STREAMS",
+            *stream_keys,
+            *([">"] * len(stream_keys)),
+        ]
+
+        if self.global_keyprefix:
+            command_args = self.client._prefix_args(command_args)
+
+        self.client.connection.send_command(*command_args)
+        self._in_poll = self.client.connection
+
+    def _xreadgroup_read(self, **options: Any) -> bool:
+        """Parse the blocking XREADGROUP reply and deliver its entries.
+
+        Every returned entry is already registered in this consumer's PEL
+        (deliver + register was atomic inside Redis), so each one is
+        delivered and recorded in QoS._in_flight; dropping any would strand
+        it until reclaim.
+
+        A NOGROUP reply means a watched stream (and its consumer group)
+        was deleted out of band while the blocking read was armed; the
+        whole ensured-group cache is invalidated and Empty is raised, so
+        the next non-blocking pass re-creates the groups before touching
+        the streams.
+        """
+        try:
+            try:
+                messages = self.client.parse_response(self.client.connection, "XREADGROUP", **options)
+            except self.connection_errors:
+                self.client.connection.disconnect()
+                raise
+            except self.ResponseError as exc:
+                if "NOGROUP" not in str(exc):
+                    raise
+                # The failing stream cannot be singled out from the error,
+                # so drop the whole cache; _ensure_group re-creates lazily
+                self._invalidate_group()
+                raise Empty from None
+
+            if not messages:
+                raise Empty
+
+            delivered = False
+            for stream, message_list in messages:
+                stream_str = bytes_to_str(stream) if isinstance(stream, bytes) else stream
+                # Reply stream names carry the global key prefix; strip so
+                # _in_flight always stores unprefixed keys
+                prefix = self.global_keyprefix
+                if prefix and stream_str.startswith(prefix):
+                    stream_str = stream_str[len(prefix) :]
+                # stream:{queue}:{level} -> logical queue name
+                queue_name = stream_str[len(STREAM_KEY_PREFIX) :].rsplit(":", 1)[0]
+                for message_id, fields in message_list:
+                    message_id_str = bytes_to_str(message_id) if isinstance(message_id, bytes) else message_id
+                    payload_field = fields.get(b"payload") or fields.get("payload")
+                    if not payload_field:
+                        continue
+                    message: dict[str, Any] = loads(bytes_to_str(payload_field))
+                    delivery_tag = message["properties"]["delivery_tag"]
+                    if self.qos is not None:
+                        cast("QoS", self.qos)._in_flight[delivery_tag] = (stream_str, message_id_str)
+                    self.connection._deliver(message, queue_name)
+                    delivered = True
+
+            if not delivered:
+                raise Empty
+            return True
+        finally:
+            self._in_poll = None
 
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
-        """Consume the pending reply for a command after a poll error."""
-        client = self.subclient if cmd_type == "XREAD" else self.client
-        return client.parse_response(client.connection, cmd_type)
+        if cmd_type == "XREAD":
+            client = self.subclient
+        else:
+            client = self.client
+            # Without a pending blocking read the last command on this socket
+            # was the non-blocking EVALSHA consume pass
+            if not self._in_poll:
+                cmd_type = "EVALSHA"
+        try:
+            return client.parse_response(client.connection, cmd_type)
+        except self.ResponseError as exc:
+            if "NOGROUP" not in str(exc):
+                raise
+            # A watched stream (and its consumer group) was deleted out of
+            # band; clear the cache so the next pass re-ensures the groups
+            self._invalidate_group()
+            raise Empty from None
 
     def close(self) -> None:
         if self._in_poll:
