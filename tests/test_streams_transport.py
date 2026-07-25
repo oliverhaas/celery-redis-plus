@@ -4402,6 +4402,48 @@ class TestStreamsHeartbeat:
         mock_logger.warning.assert_called_once()
         assert mock_logger.warning.call_args.kwargs.get("exc_info") is True
 
+    def test_heartbeat_malformed_reply_does_not_abort_other_streams(self) -> None:
+        """Test that an unusable XCLAIM reply for one stream still lets the rest heartbeat.
+
+        The reply-processing step is inside the per-stream try, not after
+        it: a client returning something non-iterable must be contained the
+        same way a raising xclaim call is, or it reintroduces the
+        abort-every-remaining-stream failure one step later.
+        """
+        channel = object.__new__(Channel)
+        channel.ResponseError = _client_exceptions.ResponseError
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {
+            "tag1": ("stream:celery:9", "1111-0"),
+            "tag2": ("stream:celery:0", "2222-0"),
+        }
+        channel._qos = mock_qos
+
+        mock_client = MagicMock()
+
+        def _xclaim(stream_key: str, *args: object, **kwargs: object) -> object:
+            if stream_key == "stream:celery:9":
+                return None  # Not iterable: blows up building refreshed_ids
+            return [b"2222-0"]
+
+        mock_client.xclaim.side_effect = _xclaim
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+            patch("celery_redis_plus.streams.logger") as mock_logger,
+        ):
+            channel._heartbeat()  # Must not raise
+
+        assert mock_client.xclaim.call_count == 2
+        mock_client.xclaim.assert_any_call("stream:celery:0", "celery", "worker-1", 0, ["2222-0"], justid=True)
+        mock_logger.warning.assert_called_once()
+        assert mock_logger.warning.call_args.kwargs.get("exc_info") is True
+
     def test_heartbeat_logs_ids_no_longer_pending_without_pruning_in_flight(self) -> None:
         """Test that ids missing from the XCLAIM JUSTID reply are logged, not pruned.
 
@@ -4666,12 +4708,7 @@ class TestStreamsHeartbeat:
         mock_logger.warning.assert_called_once()
 
     def test_register_with_event_loop_clamps_heartbeat_interval_nan(self) -> None:
-        """Test that a non-finite heartbeat_interval (NaN) falls back to the default.
-
-        Every comparison with NaN is False, so the chained
-        `0 < heartbeat_interval <= max_safe_heartbeat_interval` check
-        rejects it naturally without a separate math.isfinite check.
-        """
+        """Test that a non-finite heartbeat_interval (NaN) falls back to the default."""
         transport = object.__new__(Transport)
         transport.cycle = MagicMock()
         mock_loop = MagicMock()
@@ -4715,6 +4752,50 @@ class TestStreamsHeartbeat:
         mock_loop = MagicMock()
         mock_connection = MagicMock()
         mock_connection.client.transport_options = {"visibility_timeout": -10}
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == DEFAULT_VISIBILITY_TIMEOUT / HEARTBEAT_INTERVAL_DIVISOR
+        mock_logger.warning.assert_called_once()
+
+    def test_register_with_event_loop_clamps_heartbeat_interval_infinite(self) -> None:
+        """Test that an infinite heartbeat_interval falls back to the default.
+
+        Unlike NaN, float("inf") satisfies `0 < value` and would only be
+        rejected by the upper bound, so a configuration pairing it with an
+        infinite visibility_timeout needs the explicit finiteness check.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {
+            "visibility_timeout": 100,
+            "heartbeat_interval": float("inf"),
+        }
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        call = self._heartbeat_timer_call(mock_loop, transport)
+        assert call.args[0] == 20.0
+        mock_logger.warning.assert_called_once()
+
+    def test_register_with_event_loop_visibility_timeout_infinite_falls_back_to_default(self) -> None:
+        """Test that an infinite visibility_timeout falls back to the default.
+
+        float("inf") passes `isinstance(x, numbers.Real)` and `x > 0`, so
+        without a finiteness check it would be honored and derive an
+        infinite heartbeat_interval, registering a timer that never fires
+        and leaving every in-flight entry to be reclaimed by peers.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": float("inf")}
 
         with patch("celery_redis_plus.streams.logger") as mock_logger:
             transport.register_with_event_loop(mock_connection, mock_loop)

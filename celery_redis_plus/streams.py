@@ -42,10 +42,10 @@ Transport Options
 * ``visibility_timeout``: Seconds of heartbeat silence before in-flight messages are
   reclaimed from a dead worker (default: 300)
 * ``heartbeat_interval``: XCLAIM JUSTID heartbeat cadence in seconds
-  (default: ``visibility_timeout / 5``). Must be a positive number no greater
-  than half of ``visibility_timeout``; an out-of-range value (including a
-  non-positive or non-numeric ``visibility_timeout``) is overridden back to
-  the derived default and a warning is logged
+  (default: ``visibility_timeout / 5``). Must be a positive finite number no
+  greater than half of ``visibility_timeout``; an out-of-range value (including
+  a non-positive, non-finite, or non-numeric ``visibility_timeout``) is
+  overridden back to the derived default and a warning is logged
 * ``max_restore_count``: Delivery-count cap before poisoned messages are dropped or
   dead-lettered (default: None = no limit)
 * ``dead_letter_stream``: Stream to copy poisoned messages to (default: None)
@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 import numbers
 import os
 import socket as socket_module
@@ -147,6 +148,13 @@ def priority_to_level(priority: int, steps: Sequence[int]) -> int:
     return level
 
 
+def _is_finite_positive(value: Any) -> bool:
+    """Return True when value is a real, finite, strictly positive number."""
+    # numbers.Real admits float("inf"), which passes every ordinary comparison a
+    # timer interval is validated with and yields a timer that never fires.
+    return isinstance(value, numbers.Real) and math.isfinite(value) and value > 0
+
+
 def _after_fork_cleanup_channel(channel: Channel) -> None:
     channel._after_fork()
 
@@ -217,9 +225,8 @@ class QoS(virtual.QoS):
         requeue_payload = ""
         if requeue:
             if self._delivered is not None and delivery_tag in self._delivered:
-                # Serialize the locally held message so the XADD copy, XACK,
-                # and XDEL run in ONE atomic script. Never re-read the entry
-                # from the stream: a re-read races against peer claims.
+                # Serialize the local copy so XADD, XACK, and XDEL run in one
+                # script; re-reading the entry would race against peer claims.
                 requeue_payload = dumps(self._delivered[delivery_tag]._raw)
             else:
                 logger.critical(
@@ -787,9 +794,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         """
         steps = sorted(self.priority_steps)
 
-        # Ensure consumer groups exist before the pump XADDs entries so
-        # consumers can read them right away (groups are created at id "0",
-        # so even a later re-create keeps existing entries deliverable)
+        # Groups must exist before the XADD or consumers cannot read the entries
         for level in steps:
             self._ensure_group(self._stream_key(queue, level))
 
@@ -879,6 +884,18 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             message_ids,
                             justid=True,
                         )
+                        # Log missing ids, never prune them: _in_flight is what the ack
+                        # path resolves a delivery tag through, and the task may still run.
+                        refreshed_ids = {bytes_to_str(entry_id) for entry_id in refreshed}
+                        missing = [message_id for message_id in message_ids if message_id not in refreshed_ids]
+                        if missing:
+                            logger.warning(
+                                "Heartbeat found %d of %d in-flight ids no longer pending on stream %s "
+                                "(already acked elsewhere, or the stream entry was deleted)",
+                                len(missing),
+                                len(message_ids),
+                                stream_key,
+                            )
                     except self.ResponseError as exc:
                         if "NOGROUP" in str(exc):
                             # Stream deleted out of band: drop the cached ensure
@@ -900,20 +917,6 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             exc_info=True,
                         )
                         continue
-
-                    # An id absent from the justid reply is no longer in the PEL. Log only:
-                    # _in_flight is what the ack path resolves a delivery tag through, and a
-                    # "missing" id may still be executing locally, so pruning breaks its ack.
-                    refreshed_ids = {bytes_to_str(entry_id) for entry_id in refreshed}
-                    missing = [message_id for message_id in message_ids if message_id not in refreshed_ids]
-                    if missing:
-                        logger.warning(
-                            "Heartbeat found %d of %d in-flight ids no longer pending on stream %s "
-                            "(already acked elsewhere, or the stream entry was deleted)",
-                            len(missing),
-                            len(message_ids),
-                            stream_key,
-                        )
         except Exception:
             logger.warning("Failed to heartbeat in-flight messages, will retry next cycle", exc_info=True)
 
@@ -1047,10 +1050,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         with self.conn_or_acquire() as client:
             ack_script = client.register_script(_STREAMS_ACK_LUA)
             if ttl_ms > 0:
-                # Current time comes from the server (TIME), read once per
-                # call, never the caller's clock: a worker clock ahead of the
-                # server would otherwise delete un-expired messages every
-                # reclaim cycle. Only fetched when a TTL is actually in play.
+                # Server clock, not the caller's: a worker running ahead of the
+                # server would delete un-expired messages every reclaim cycle.
                 server_seconds, server_micros = client.time()
                 now_ms = int(server_seconds) * 1000 + int(server_micros) // 1000
             for stream_key in self._stream_keys_for_queue(queue):
@@ -1058,10 +1059,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 pages_walked = 0
                 while processed < budget and not prefetch_exhausted:
                     if pages_walked >= DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT:
-                        # A PEL dominated by filtered entries (own in-flight,
-                        # expired, or over prefetch capacity) would otherwise
-                        # make this walk the whole PEL every cycle for no
-                        # progress; stop early and let a later pass continue.
+                        # A PEL dominated by filtered entries would otherwise
+                        # walk in full every cycle for no progress.
                         logger.warning(
                             "Stream %s: reclaim discovery stopped after %d pages; more entries may be pending.",
                             stream_key,
@@ -1100,10 +1099,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                     # Prefix key since EVALSHA doesn't auto-prefix KEYS
                     prefixed_stream = f"{self.global_keyprefix}{stream_key}"
 
-                    # Own-in-flight ids are dropped before claiming so their delivery
-                    # counter is never bumped. Lazily-expired ids (x-message-ttl) are
-                    # acked away right here since XACK does not care which consumer
-                    # currently owns the entry, so there is no need to claim it first.
+                    # Filter before claiming: own in-flight ids must not have their
+                    # delivery counter bumped, and XACK works regardless of owner.
                     own_ids = self._own_in_flight_message_ids(stream_key)
                     survivor_ids: list[str] = []
                     for message_id in page_ids:
@@ -1116,10 +1113,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             continue
                         survivor_ids.append(message_id)
 
-                    # The remainder is capped to the smaller of the remaining budget and
-                    # prefetch capacity (an id we cannot deliver this pass should not look
-                    # delivered either). can_consume_max_estimate() is None when
-                    # prefetch_count is unbounded, so that axis is skipped entirely.
+                    # Never claim more than we can deliver this pass; a None estimate
+                    # means prefetch_count is unbounded.
                     capacity = qos.can_consume_max_estimate() if qos is not None else None
                     remaining_budget = budget - processed
                     take = remaining_budget if capacity is None else min(remaining_budget, capacity)
@@ -1130,10 +1125,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                         cursor = "(" + last_id
                         continue
 
-                    # Real min_idle_time (not 0): if a competing worker claimed one of
-                    # these ids between the XPENDING discovery above and this XCLAIM,
-                    # its idle time was just reset and this call correctly skips it,
-                    # making this pass race-safe against a competing reclaimer.
+                    # A real min_idle_time (not 0) is what makes this race-safe: a peer
+                    # that claimed an id since discovery reset its idle, so it is skipped.
                     claim_kwargs: dict[str, Any] = {
                         "min_idle_time": min_idle_ms,
                         "message_ids": survivor_ids,
@@ -1185,10 +1178,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             continue
 
                         processed += 1
-                        # times_delivered was read in step 1, before this pass's own
-                        # XCLAIM above; every id in `claimed` came from survivor_ids,
-                        # itself built from this same page, so a miss here should be
-                        # unreachable. Fall back defensively rather than crash.
+                        # Unreachable: every claimed id came from this page's discovery.
+                        # Fall back defensively rather than crash.
                         if message_id_str not in times_delivered:
                             logger.warning(
                                 "Stream %s: claimed entry %s missing from XPENDING discovery reply; "
@@ -1795,13 +1786,12 @@ class Transport(virtual.Transport):
         loop.call_repeatedly(DEFAULT_REQUEUE_CHECK_INTERVAL, cycle.maybe_enqueue_due_messages)
 
         # Heartbeat keeps in-flight PEL entries alive while tasks are running.
-        # visibility_timeout must be a positive real: it is also the denominator
-        # deriving heartbeat_interval below, so an invalid value poisons both.
+        # visibility_timeout is validated first: it is the denominator below.
         transport_options = connection.client.transport_options  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         visibility_timeout = transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)
-        if not (isinstance(visibility_timeout, numbers.Real) and visibility_timeout > 0):
+        if not _is_finite_positive(visibility_timeout):
             logger.warning(
-                "visibility_timeout %r is not a positive number; falling back to the default of %s",
+                "visibility_timeout %r is not a positive finite number; falling back to the default of %s",
                 visibility_timeout,
                 DEFAULT_VISIBILITY_TIMEOUT,
             )
@@ -1811,9 +1801,9 @@ class Transport(virtual.Transport):
         # so require at least 2 per visibility_timeout window (the default gives 5).
         max_safe_heartbeat_interval = visibility_timeout / 2
         heartbeat_interval = transport_options.get("heartbeat_interval", default_heartbeat_interval)
-        if not (isinstance(heartbeat_interval, numbers.Real) and 0 < heartbeat_interval <= max_safe_heartbeat_interval):
+        if not (_is_finite_positive(heartbeat_interval) and heartbeat_interval <= max_safe_heartbeat_interval):
             logger.warning(
-                "heartbeat_interval %r must be a positive number no greater than half of "
+                "heartbeat_interval %r must be a positive finite number no greater than half of "
                 "visibility_timeout %s to leave headroom against spurious reclaims of this "
                 "worker's own live messages; falling back to the default of %s instead of "
                 "honoring it",

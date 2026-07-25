@@ -271,9 +271,7 @@ class GlobalKeyPrefixMixin:
         "XCLAIM",
         "XRANGE",
         "XTRIM",
-        # redis-py sends each XGROUP/XINFO subcommand as a single fused
-        # command name (e.g. "XGROUP CREATE"), not "XGROUP" plus a token,
-        # with the stream key always the first following arg.
+        # redis-py sends these as one fused command name, not two tokens
         "XGROUP CREATE",
         "XGROUP SETID",
         "XGROUP DESTROY",
