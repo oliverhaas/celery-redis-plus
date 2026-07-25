@@ -4476,3 +4476,96 @@ class TestStreamsHeartbeat:
 
         mock_loop.call_repeatedly.assert_any_call(20.0, transport.cycle.maybe_heartbeat)
         mock_logger.warning.assert_called_once()
+
+
+@pytest.mark.integration
+class TestStreamsHeartbeatIntegration:
+    """Integration tests for Channel._heartbeat against real Redis/Valkey.
+
+    Exercises the real client returned by Channel._get_client(), which is a
+    plain redis-py/valkey-py client when global_keyprefix is falsy and a
+    PrefixedStrictRedis when it is truthy (via the parametrized
+    global_keyprefix fixture), so both XCLAIM prefixing paths actually run.
+    """
+
+    def test_heartbeat_keeps_in_flight_message_alive_past_visibility_timeout(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """A message held by a live worker survives repeated reclaim attempts
+        as long as that worker keeps heartbeating it, even though the total
+        elapsed time is well past visibility_timeout.
+
+        Sequence: publish and consume via one channel ("producer-worker",
+        simulating a long-running task that has not acked yet), call
+        _heartbeat() on that channel every half of a short visibility_timeout
+        so the PEL idle clock never crosses the timeout, then have a second
+        channel with a different consumer identity ("reclaimer-worker") try
+        to reclaim it. The reclaim must find nothing: the heartbeat resets
+        the idle clock before it ever qualifies as abandoned.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "heartbeat-integration-queue"
+        visibility_timeout = 0.3
+
+        producer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "producer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        reclaimer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "reclaimer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        try:
+            producer_channel = cast("Channel", producer_conn.channel())
+
+            message = {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-integration-heartbeat",
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                },
+            }
+            producer_channel._put(queue, message)
+
+            # Consume into the PEL as "producer-worker" and hold it, standing
+            # in for a task that is still running (never acked).
+            consumed = producer_channel._get(queue)
+            assert consumed["properties"]["delivery_tag"] == "tag-integration-heartbeat"
+
+            # Heartbeat well past visibility_timeout, resetting idle every
+            # half-period so it never crosses the timeout.
+            for _ in range(6):
+                time.sleep(visibility_timeout / 2)
+                producer_channel._heartbeat()
+
+            reclaimer_channel = cast("Channel", reclaimer_conn.channel())
+            delivered: list[Any] = []
+            reclaimer_channel.basic_consume(
+                queue,
+                no_ack=False,
+                callback=delivered.append,
+                consumer_tag="reclaimer-ctag",
+            )
+
+            processed = reclaimer_channel._reclaim_and_deliver(queue, budget=10)
+        finally:
+            producer_conn.close()
+            reclaimer_conn.close()
+
+        assert processed == 0
+        assert delivered == []
