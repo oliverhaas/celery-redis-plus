@@ -245,6 +245,12 @@ class MultiChannelPoller:
         self._loop: Any = None
         self._expires_timer_entry: Any = None
         self._expires_timer_interval: float | None = None
+        # Per-channel rotation offset into channel._queue_cycle for the requeue
+        # cycle (see maybe_enqueue_due_messages): keyed directly by the Channel
+        # instance, which is already hashable by identity (channels live in the
+        # _channels set above), so no id() reuse hazard once a channel is
+        # garbage collected after discard().
+        self._requeue_offsets: dict[Channel, int] = {}
 
     def close(self) -> None:
         for fd in self._chan_to_sock.values():
@@ -253,12 +259,14 @@ class MultiChannelPoller:
         self._channels.clear()
         self._fd_to_chan.clear()
         self._chan_to_sock.clear()
+        self._requeue_offsets.clear()
 
     def add(self, channel: Channel) -> None:
         self._channels.add(channel)
 
     def discard(self, channel: Channel) -> None:
         self._channels.discard(channel)
+        self._requeue_offsets.pop(channel, None)
 
     def _on_connection_disconnect(self, connection: Any) -> None:
         with suppress(AttributeError, TypeError):
@@ -382,9 +390,22 @@ class MultiChannelPoller:
 
         For each channel's watched queues this first moves due delayed messages
         into their priority streams, then reclaims messages whose consumer has
-        been idle past the visibility timeout. A single budget of
-        DEFAULT_REQUEUE_BATCH_LIMIT is shared across both passes per channel so
-        one busy queue cannot starve the cycle.
+        been idle past the visibility timeout (skipped when the channel is
+        already at its QoS prefetch_count limit, since reclaim delivers
+        directly into the channel and must respect the same limit as any
+        other delivery path).
+
+        A single budget of DEFAULT_REQUEUE_BATCH_LIMIT is shared per channel
+        per cycle: it starts at the constant, the delayed pump for each queue
+        is called with whatever budget remains as its own limit (rather than
+        always spending the full constant), and reclaim then spends what the
+        pump left over. This means the budget is genuinely shared, but a
+        single busy queue processed first can still spend it all before later
+        queues in the same cycle are served. To keep that from starving a
+        queue permanently, the per-channel queue order rotates by one position
+        every cycle (tracked in self._requeue_offsets): a queue that starts a
+        cycle at the back moves one place forward each time, so it eventually
+        leads and gets first claim on the budget.
 
         Returns:
             Total number of messages moved or reclaimed across all channels.
@@ -394,8 +415,13 @@ class MultiChannelPoller:
             qos = channel.qos
             if qos is None or not channel.active_queues:
                 continue
+            queues = channel._queue_cycle
+            if not queues:
+                continue
+            offset = self._requeue_offsets.get(channel, 0) % len(queues)
+            rotated_queues = queues[offset:] + queues[:offset]
             budget = DEFAULT_REQUEUE_BATCH_LIMIT
-            for queue in channel._queue_cycle:
+            for queue in rotated_queues:
                 if budget <= 0:
                     logger.warning(
                         "Requeue cycle hit batch limit of %d. There may be more messages waiting.",
@@ -403,10 +429,10 @@ class MultiChannelPoller:
                     )
                     break
                 try:
-                    moved = channel._move_delayed(queue)
+                    moved = channel._move_delayed(queue, limit=budget)
                     budget -= moved
                     total += moved
-                    if budget > 0:
+                    if budget > 0 and qos.can_consume():
                         reclaimed = channel._reclaim_and_deliver(queue, budget)
                         budget -= reclaimed
                         total += reclaimed
@@ -416,6 +442,7 @@ class MultiChannelPoller:
                         queue,
                         exc_info=True,
                     )
+            self._requeue_offsets[channel] = (offset + 1) % len(queues)
         return total
 
     def maybe_heartbeat(self) -> None:
@@ -735,7 +762,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             cast("QoS", self.qos)._in_flight[delivery_tag] = (hit_key, entry_id)
             return message
 
-    def _move_delayed(self, queue: str) -> int:
+    def _move_delayed(self, queue: str, limit: int = DEFAULT_REQUEUE_BATCH_LIMIT) -> int:
         """Move due delayed messages into their priority streams.
 
         Runs the streams_move_delayed Lua script: members of ``delayed:{queue}``
@@ -748,6 +775,11 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
 
         Args:
             queue: Queue name whose delayed zset is pumped.
+            limit: Maximum number of messages to move in this call. Defaults
+                to DEFAULT_REQUEUE_BATCH_LIMIT; the requeue cycle instead
+                passes its remaining shared budget here, so this queue's pump
+                cannot alone spend more than what is left of the cycle's
+                budget.
 
         Returns:
             Number of messages moved into streams.
@@ -779,18 +811,18 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 move_script(
                     keys=[delayed_key, *stream_keys],
                     args=[
-                        DEFAULT_REQUEUE_BATCH_LIMIT,
+                        limit,
                         message_ttl_ms,
                         ",".join(str(step) for step in steps),
                     ],
                 ),
             )
 
-        if moved >= DEFAULT_REQUEUE_BATCH_LIMIT:
+        if moved >= limit:
             logger.warning(
                 "Queue %s hit delayed move batch limit of %d. There may be more messages waiting.",
                 queue,
-                DEFAULT_REQUEUE_BATCH_LIMIT,
+                limit,
             )
         return moved
 
@@ -806,9 +838,29 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         the claimed ones); restore_count = times_delivered - 1 (the first
         delivery is not a restore).
 
+        A claimed entry whose delivery tag is already in this channel's QoS
+        in-flight table is this process's OWN live message (e.g. a task still
+        running past visibility_timeout on this same, healthy worker, whose
+        idle time crossed the threshold only because Task 10's heartbeat had
+        not refreshed it in time). Such an entry is skipped entirely: not
+        acked, not redelivered, not counted against budget. It stays in this
+        worker's PEL, owned by this worker either way after XAUTOCLAIM, and
+        the in-process consumer that already holds it finishes normally.
+
         Messages exceeding max_restore_count are dropped, optionally copied to
-        dead_letter_stream first. Messages older than the effective x-message-ttl
-        are acked and skipped.
+        dead_letter_stream first. Messages older than the effective
+        x-message-ttl are acked and skipped; the cutoff is computed from the
+        server's clock (read once per call via TIME), never the caller's,
+        so a worker clock running ahead of the server cannot delete
+        un-expired messages.
+
+        Actual deliveries respect the channel's QoS prefetch_count: once
+        qos.can_consume() goes false (checked right after each delivery) the
+        pass stops immediately, leaving any remaining claimed entries in this
+        worker's own PEL for a later reclaim pass instead of flooding the
+        channel past its limit. Callers are expected to skip invoking this
+        method at all when qos.can_consume() is already false (see
+        MultiChannelPoller.maybe_enqueue_due_messages).
 
         A NOGROUP from XAUTOCLAIM means the stream (and with it its consumer
         group) was deleted out of band while this channel's _ensured_groups
@@ -821,13 +873,15 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             budget: Maximum number of claimed entries to process.
 
         Returns:
-            Number of claimed entries processed (delivered or dropped).
+            Number of claimed entries processed (delivered or dropped); a
+            claimed entry recognized as this worker's own in-flight message
+            is not counted.
         """
         if budget <= 0:
             return 0
 
         min_idle_ms = int(self.visibility_timeout * 1000)
-        now_ms = int(time() * 1000)
+        qos = cast("QoS", self.qos) if self.qos is not None else None
 
         # Effective message TTL in ms (0 = no TTL): channel option min per-queue x-message-ttl
         ttl_ms = 0
@@ -838,11 +892,17 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             ttl_ms = queue_ttl_ms if ttl_ms <= 0 else min(ttl_ms, queue_ttl_ms)
 
         processed = 0
+        prefetch_exhausted = False
         with self.conn_or_acquire() as client:
             ack_script = client.register_script(_STREAMS_ACK_LUA)
+            # Current time comes from the server (TIME), read once per call,
+            # never the caller's clock: a worker clock ahead of the server
+            # would otherwise delete un-expired messages every reclaim cycle.
+            server_seconds, server_micros = client.time()
+            now_ms = int(server_seconds) * 1000 + int(server_micros) // 1000
             for stream_key in self._stream_keys_for_queue(queue):
                 cursor = "0-0"
-                while processed < budget:
+                while processed < budget and not prefetch_exhausted:
                     xautoclaim_kwargs: dict[str, Any] = {
                         "min_idle_time": min_idle_ms,
                         "start_id": cursor,
@@ -910,13 +970,24 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                     # Prefix key since EVALSHA doesn't auto-prefix KEYS
                     prefixed_stream = f"{self.global_keyprefix}{stream_key}"
                     for message_id, fields in claimed:
+                        if prefetch_exhausted:
+                            break
                         message_id_str = bytes_to_str(message_id)
-                        processed += 1
                         payload_field = fields.get(b"payload") or fields.get("payload")
                         if payload_field is None:
                             # Foreign or corrupt entry: ack it away so it cannot loop forever
+                            processed += 1
                             ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id_str, ""])
                             continue
+
+                        message: dict[str, Any] = loads(bytes_to_str(payload_field))
+                        delivery_tag = message["properties"]["delivery_tag"]
+                        if qos is not None and delivery_tag in qos._in_flight:
+                            # This process's own live message (see docstring): leave the
+                            # PEL entry untouched, do not count it against the budget.
+                            continue
+
+                        processed += 1
                         # Lazy x-message-ttl drop: entry ids encode their creation time in ms
                         if ttl_ms > 0 and int(message_id_str.split("-")[0]) < now_ms - ttl_ms:
                             ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id_str, ""])
@@ -949,17 +1020,17 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                                 self.max_restore_count,
                             )
                             continue
-                        message: dict[str, Any] = loads(bytes_to_str(payload_field))
                         if restore_count > 0:
                             headers = message.setdefault("properties", {}).setdefault("headers", {})
                             headers["x-restore-count"] = restore_count
-                        delivery_tag = message["properties"]["delivery_tag"]
-                        if self.qos is not None:
-                            cast("QoS", self.qos)._in_flight[delivery_tag] = (stream_key, message_id_str)
+                        if qos is not None:
+                            qos._in_flight[delivery_tag] = (stream_key, message_id_str)
                         self.connection._deliver(message, queue)
-                    if cursor == "0-0":
+                        if qos is not None and not qos.can_consume():
+                            prefetch_exhausted = True
+                    if cursor == "0-0" or prefetch_exhausted:
                         break
-                if processed >= budget:
+                if processed >= budget or prefetch_exhausted:
                     break
         return processed
 

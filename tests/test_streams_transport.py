@@ -2197,6 +2197,19 @@ class TestStreamsMoveDelayed:
 
         assert channel._move_delayed("my_queue") == 7
 
+    def test_move_delayed_passes_custom_limit_to_argv(self) -> None:
+        """A custom limit kwarg is passed through as the Lua script's batch_limit ARGV slot.
+
+        The requeue cycle passes its remaining shared budget here (Fix round 1,
+        FIX4a) instead of always spending the full DEFAULT_REQUEUE_BATCH_LIMIT
+        constant, so the value actually reaching Lua must reflect the argument.
+        """
+        channel, _mock_client, mock_script = self._make_channel()
+
+        channel._move_delayed("my_queue", limit=42)
+
+        assert mock_script.call_args.kwargs["args"][0] == 42
+
     def test_move_delayed_ensures_groups_for_all_levels(self) -> None:
         """Test that consumer groups are ensured (unprefixed keys) before the pump XADDs entries."""
         channel, _mock_client, _mock_script = self._make_channel()
@@ -2232,8 +2245,11 @@ class TestStreamsMoveDelayed:
         total = poller.maybe_enqueue_due_messages()
 
         assert total == 10
-        assert channel_a._move_delayed.call_args_list == [call("q1"), call("q2")]
-        channel_b._move_delayed.assert_called_once_with("q3")
+        assert channel_a._move_delayed.call_args_list == [
+            call("q1", limit=DEFAULT_REQUEUE_BATCH_LIMIT),
+            call("q2", limit=DEFAULT_REQUEUE_BATCH_LIMIT - 2),
+        ]
+        channel_b._move_delayed.assert_called_once_with("q3", limit=DEFAULT_REQUEUE_BATCH_LIMIT)
 
     def test_maybe_enqueue_due_messages_survives_channel_errors(self) -> None:
         """Test that a failing queue is skipped with a warning and the pump continues."""
@@ -2290,6 +2306,7 @@ class TestStreamsReclaim:
         channel.connection = MagicMock()
 
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
         mock_client.xautoclaim.return_value = [b"0-0", [], []]
@@ -2339,6 +2356,7 @@ class TestStreamsReclaim:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
         mock_client.xautoclaim.return_value = [
@@ -2395,6 +2413,7 @@ class TestStreamsReclaim:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
         mock_client.xautoclaim.return_value = [
             b"0-0",
@@ -2458,6 +2477,7 @@ class TestStreamsReclaim:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
         mock_client.xautoclaim.side_effect = [
             [b"1700000000005-0", [(b"1700000000001-0", {b"payload": payload_json_1.encode()})], []],
@@ -2531,6 +2551,7 @@ class TestStreamsReclaim:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
         mock_client.xautoclaim.return_value = [
             b"0-0",
@@ -2665,6 +2686,7 @@ class TestStreamsReclaim:
             return matching[: kwargs["count"]]
 
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
         mock_client.xautoclaim.return_value = [
             b"0-0",
@@ -2727,6 +2749,7 @@ class TestStreamsReclaim:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
         mock_client.xautoclaim.return_value = [
@@ -2783,6 +2806,7 @@ class TestStreamsReclaim:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
         mock_client.xautoclaim.return_value = [
             b"1700000000009-0",
@@ -2837,6 +2861,7 @@ class TestStreamsReclaim:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
         mock_client.xautoclaim.side_effect = [
             [b"0-0", [], []],
@@ -2888,8 +2913,12 @@ class TestStreamsReclaim:
                 },
             },
         )
-        expired_id = f"{int(time.time() * 1000) - 120_000}-0"
+        # Server time is now mocked via client.time(), so the expiry cutoff is computed
+        # from that fixed mock value instead of the real wall clock.
+        mock_now_ms = 1_700_000_100_000
+        expired_id = f"{mock_now_ms - 120_000}-0"
         mock_client = MagicMock()
+        mock_client.time.return_value = (mock_now_ms // 1000, (mock_now_ms % 1000) * 1000)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
         mock_client.xautoclaim.return_value = [
@@ -2949,6 +2978,7 @@ class TestStreamsReclaim:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
         # First call: NOGROUP (the stream and its group were deleted out of
         # band, e.g. cross-process purge or x-expires expiry, while this
@@ -2986,6 +3016,188 @@ class TestStreamsReclaim:
         channel._ensure_group.assert_called_once_with("stream:celery:0")
         channel.connection._deliver.assert_called_once()
 
+    def test_reclaim_skips_own_in_flight_message(self, global_keyprefix: str) -> None:
+        """A claimed entry already in this channel's QoS in-flight table is skipped entirely.
+
+        It is this worker's own live message (e.g. a task still running past
+        visibility_timeout on this same, healthy worker). It must not be acked,
+        not redelivered, and not counted against the budget: it stays in the PEL,
+        already owned by this worker after XAUTOCLAIM (Fix round 1, FIX2).
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {"tag-own": ("stream:celery:0", "1700000000000-0")}
+        channel.connection = MagicMock()
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-own",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+            [],
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 0
+        channel.connection._deliver.assert_not_called()
+        mock_ack_script.assert_not_called()
+
+    def test_reclaim_stops_delivering_once_prefetch_exhausted(self, global_keyprefix: str) -> None:
+        """Delivering stops mid claimed-batch as soon as qos.can_consume() goes false.
+
+        The remaining claimed entries are left untouched in this worker's own PEL
+        (XAUTOCLAIM already reassigned them there) for a later reclaim pass, instead
+        of flooding the channel past its prefetch_count (Fix round 1, FIX3).
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel._qos.can_consume.side_effect = [False]
+        channel.connection = MagicMock()
+
+        payload_json_1 = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-first",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        payload_json_2 = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-second",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
+        mock_client.register_script.return_value = MagicMock()
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [
+                (b"1700000000001-0", {b"payload": payload_json_1.encode()}),
+                (b"1700000000002-0", {b"payload": payload_json_2.encode()}),
+            ],
+            [],
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000001-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 1,
+            },
+            {
+                "message_id": b"1700000000002-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 1,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        channel.connection._deliver.assert_called_once()
+        delivered_message = channel.connection._deliver.call_args[0][0]
+        assert delivered_message["properties"]["delivery_tag"] == "tag-first"
+        assert channel._qos.can_consume.call_count == 1
+
+    def test_reclaim_missing_payload_acks_and_skips(self, global_keyprefix: str) -> None:
+        """A claimed entry with no payload field (foreign or corrupt) is acked away, never delivered."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel.connection = MagicMock()
+
+        mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"1700000000000-0", {b"some-other-field": b"whatever"})],
+            [],
+        ]
+        mock_client.xpending_range.return_value = []
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        channel.connection._deliver.assert_not_called()
+        mock_ack_script.assert_called_once_with(
+            keys=[f"{global_keyprefix}stream:celery:0"],
+            args=["celery", "1700000000000-0", ""],
+        )
+
+    def test_reclaim_returns_immediately_when_budget_not_positive(self) -> None:
+        """budget <= 0 returns 0 immediately without acquiring a connection at all."""
+        channel = object.__new__(Channel)
+        channel.conn_or_acquire = MagicMock()
+
+        result = channel._reclaim_and_deliver("celery", 0)
+
+        assert result == 0
+        channel.conn_or_acquire.assert_not_called()
+
     def test_maybe_enqueue_due_messages_pumps_and_reclaims_with_shared_budget(self) -> None:
         """The requeue cycle runs the delayed pump then reclaim per queue, sharing one budget."""
         poller = MultiChannelPoller()
@@ -3000,7 +3212,10 @@ class TestStreamsReclaim:
         total = poller.maybe_enqueue_due_messages()
 
         assert total == 14
-        assert channel._move_delayed.call_args_list == [call("q1"), call("q2")]
+        assert channel._move_delayed.call_args_list == [
+            call("q1", limit=DEFAULT_REQUEUE_BATCH_LIMIT),
+            call("q2", limit=DEFAULT_REQUEUE_BATCH_LIMIT - 3 - 2),
+        ]
         assert channel._reclaim_and_deliver.call_args_list == [
             call("q1", DEFAULT_REQUEUE_BATCH_LIMIT - 3),
             call("q2", DEFAULT_REQUEUE_BATCH_LIMIT - 10),
@@ -3040,6 +3255,100 @@ class TestStreamsReclaim:
         no_qos_channel._move_delayed.assert_not_called()
         idle_channel._move_delayed.assert_not_called()
 
+    def test_maybe_enqueue_due_messages_skips_reclaim_when_cannot_consume(self) -> None:
+        """Reclaim is skipped entirely once the channel is already at its prefetch_count limit.
+
+        The delayed pump still runs (it does not deliver into the channel), but
+        _reclaim_and_deliver, which delivers directly into the channel, must not
+        be invoked at all while qos.can_consume() is already false (Fix round 1,
+        FIX3).
+        """
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        channel.qos = MagicMock()
+        channel.qos.can_consume.return_value = False
+        channel.active_queues = {"q1"}
+        channel._queue_cycle = ["q1"]
+        channel._move_delayed.return_value = 3
+        poller._channels.add(channel)
+
+        total = poller.maybe_enqueue_due_messages()
+
+        assert total == 3
+        channel._move_delayed.assert_called_once_with("q1", limit=DEFAULT_REQUEUE_BATCH_LIMIT)
+        channel._reclaim_and_deliver.assert_not_called()
+
+    def test_maybe_enqueue_due_messages_rotates_queue_order_each_cycle(self) -> None:
+        """The starting queue rotates by one position every cycle so no queue is permanently first.
+
+        Three successive cycles over the same three queues must start at q0, then
+        q1, then q2 in turn (Fix round 1, FIX4b). This fails against an un-rotated
+        implementation that always iterates _queue_cycle from index 0.
+        """
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        channel.qos = MagicMock()
+        channel.active_queues = {"q0", "q1", "q2"}
+        channel._queue_cycle = ["q0", "q1", "q2"]
+        channel._move_delayed.return_value = 0
+        channel._reclaim_and_deliver.return_value = 0
+        poller._channels.add(channel)
+
+        poller.maybe_enqueue_due_messages()
+        first_order = [c.args[0] for c in channel._move_delayed.call_args_list]
+        channel._move_delayed.reset_mock()
+
+        poller.maybe_enqueue_due_messages()
+        second_order = [c.args[0] for c in channel._move_delayed.call_args_list]
+        channel._move_delayed.reset_mock()
+
+        poller.maybe_enqueue_due_messages()
+        third_order = [c.args[0] for c in channel._move_delayed.call_args_list]
+
+        assert first_order == ["q0", "q1", "q2"]
+        assert second_order == ["q1", "q2", "q0"]
+        assert third_order == ["q2", "q0", "q1"]
+
+    def test_maybe_enqueue_due_messages_rotation_survives_queue_list_changes(self) -> None:
+        """Rotation degrades gracefully, without IndexError or a permanently skipped queue.
+
+        Simulates the queue list changing shape between cycles (basic_cancel then
+        basic_consume changing channel._queue_cycle), which the stored offset must
+        survive via modulo rather than crashing or being pinned to a stale index
+        (Fix round 1, FIX4b).
+        """
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        channel.qos = MagicMock()
+        channel.active_queues = {"q0", "q1", "q2"}
+        channel._queue_cycle = ["q0", "q1", "q2"]
+        channel._move_delayed.return_value = 0
+        channel._reclaim_and_deliver.return_value = 0
+        poller._channels.add(channel)
+
+        poller.maybe_enqueue_due_messages()  # offset 0 -> 1
+        poller.maybe_enqueue_due_messages()  # offset 1 -> 2
+
+        # The queue list shrinks to a single, entirely different queue: the
+        # stored offset (2) must not go out of range against the new length.
+        channel._queue_cycle = ["q3"]
+        channel._move_delayed.reset_mock()
+        poller.maybe_enqueue_due_messages()
+
+        assert channel._move_delayed.call_args_list == [call("q3", limit=DEFAULT_REQUEUE_BATCH_LIMIT)]
+
+        # A second queue is added back: both must get to lead in turn across
+        # cycles, proving neither is permanently skipped by the surviving offset.
+        channel._queue_cycle = ["q3", "q4"]
+        channel._move_delayed.reset_mock()
+        poller.maybe_enqueue_due_messages()
+        fourth_order = [c.args[0] for c in channel._move_delayed.call_args_list]
+        channel._move_delayed.reset_mock()
+        poller.maybe_enqueue_due_messages()
+        fifth_order = [c.args[0] for c in channel._move_delayed.call_args_list]
+
+        assert {fourth_order[0], fifth_order[0]} == {"q3", "q4"}
+
 
 @pytest.mark.unit
 class TestStreamsPoison:
@@ -3076,6 +3385,7 @@ class TestStreamsPoison:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
         mock_client.xautoclaim.return_value = [
@@ -3135,6 +3445,7 @@ class TestStreamsPoison:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
         mock_client.xautoclaim.return_value = [
@@ -3198,6 +3509,7 @@ class TestStreamsPoison:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
         mock_client.xautoclaim.return_value = [
@@ -3252,6 +3564,7 @@ class TestStreamsPoison:
             },
         )
         mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
         mock_client.xautoclaim.return_value = [
