@@ -46,3 +46,28 @@ DEFAULT_MAX_RESTORE_COUNT: int | None = None
 # Minimum allowed x-expires value in milliseconds (10 seconds)
 # Celery's control/reply queues use 10s by default
 MIN_QUEUE_EXPIRES = 10_000
+
+# Prefix for per-(queue, priority level) stream keys: stream:{queue}:{level}
+STREAM_KEY_PREFIX = "stream:"
+
+# Prefix for per-queue delayed message sorted sets: delayed:{queue}
+DELAYED_KEY_PREFIX = "delayed:"
+
+# Default priority steps for the streams transport (buckets in the 0-255
+# priority space, sorted ascending). A message goes to the highest step <= its
+# priority, or the lowest step if its priority is below all steps.
+DEFAULT_PRIORITY_STEPS = [0, 3, 6, 9]
+
+# Default consumer group name used on every queue stream
+DEFAULT_CONSUMER_GROUP = "celery"
+
+# Artificial idle time in ms set via XCLAIM on graceful shutdown (~24 days).
+# Far above any sane visibility timeout, so peers reclaim the entries instantly.
+SHUTDOWN_IDLE_MS = 2**31
+
+# Heartbeat cadence divisor: heartbeat_interval = visibility_timeout / divisor
+HEARTBEAT_INTERVAL_DIVISOR = 5
+
+# Idle consumers with no pending entries are removed via XGROUP DELCONSUMER
+# after this factor times the visibility timeout of idleness
+CONSUMER_IDLE_CLEANUP_FACTOR = 12
