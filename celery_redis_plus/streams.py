@@ -1807,12 +1807,8 @@ class Transport(virtual.Transport):
             )
             visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         default_heartbeat_interval = visibility_timeout / HEARTBEAT_INTERVAL_DIVISOR
-        # HEARTBEAT_INTERVAL_DIVISOR already picks a default cadence with
-        # headroom to spare (5 heartbeats per visibility_timeout window). A
-        # configured heartbeat_interval must not be allowed to erase that
-        # margin: require at least 2 heartbeats per window (interval <=
-        # visibility_timeout / 2), matching the same divide-for-headroom
-        # intent at a looser, still-safe bound.
+        # A configured interval must still leave headroom for a swallowed heartbeat,
+        # so require at least 2 per visibility_timeout window (the default gives 5).
         max_safe_heartbeat_interval = visibility_timeout / 2
         heartbeat_interval = transport_options.get("heartbeat_interval", default_heartbeat_interval)
         if not (isinstance(heartbeat_interval, numbers.Real) and 0 < heartbeat_interval <= max_safe_heartbeat_interval):
