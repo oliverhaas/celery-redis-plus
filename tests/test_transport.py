@@ -4669,6 +4669,64 @@ class TestAfterFork:
         mock_channel._disconnect_pools.assert_called_once()
 
 
+@pytest.mark.unit
+class TestTransportCollectVsClose:
+    """Connection.collect() (a lost-connection reconnect) must release broker
+
+    resources without running the QoS restore path; Connection.close() (a
+    genuine shutdown) still must run it. Both transports share the same
+    _collect/_collect_transport/_release_channel_on_collect implementation
+    in this module; this class exercises this module's own Transport/Channel
+    wiring specifically (see TestStreamsCollectVsClose for the streams
+    transport's equivalent).
+    """
+
+    def _make_bare_channel(self) -> tuple[Channel, MagicMock]:
+        channel = object.__new__(Channel)
+        channel._in_poll = None
+        channel._in_fanout_poll = None
+        channel.closed = False
+        channel._fanout_queues = []
+        channel._consumers = []
+        channel._cycle = None
+        channel._pool = None
+        channel._async_pool = None
+        channel.exchange_types = None
+        channel.connection = MagicMock()
+        channel.ResponseError = _client_exceptions.ResponseError
+        mock_qos = MagicMock()
+        channel._qos = mock_qos
+        return channel, mock_qos
+
+    def test_collect_releases_channels_without_restoring(self) -> None:
+        """Transport._collect releases channels without calling restore_unacked_once."""
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        channel, mock_qos = self._make_bare_channel()
+        transport._avail_channels = [channel]
+        transport.channels = []
+
+        transport._collect(connection=MagicMock())
+
+        mock_qos.restore_unacked_once.assert_not_called()
+        mock_qos._on_collect.cancel.assert_called_once()
+        assert channel.closed is True
+        transport.cycle.close.assert_called_once()
+
+    def test_close_channel_still_restores_unacked(self) -> None:
+        """A real Channel.close() (genuine shutdown) still calls restore_unacked_once.
+
+        Regression guard: proves the collect-time fix did not also make the
+        normal close path skip the restore.
+        """
+        channel, mock_qos = self._make_bare_channel()
+
+        channel.close()
+
+        mock_qos.restore_unacked_once.assert_called_once()
+        assert channel.closed is True
+
+
 @pytest.mark.integration
 class TestPoolDisconnect:
     """Tests for pool disconnection."""

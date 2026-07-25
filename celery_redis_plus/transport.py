@@ -220,6 +220,63 @@ def _drain_hub_callbacks(channel: Any) -> None:
             cb()
 
 
+def _release_channel_on_collect(channel: Any) -> None:
+    """Release a channel's broker resources without restoring in-flight messages.
+
+    Used by ``Transport._collect`` (the kombu escape hatch ``Connection.collect()``
+    calls instead of the normal ``close_connection``/``Channel.close`` path used by
+    a real ``Connection.close()``). A collect means the broker connection was lost
+    and celery is about to reconnect; it is not the application asking to shut
+    down. Peers still hold this worker's in-flight messages and will pick them up
+    on their own once the visibility timeout expires (the reclaim pass, for the
+    streams transport), so this must never call QoS.restore_unacked_once(), which
+    would kill the shared thread pool executor and, for the streams transport,
+    release PEL entries out from under still-running local tasks.
+
+    Sets ``channel.closed`` first so a later stray ``Channel.close()`` call on
+    this same (about-to-be-discarded) channel object is a no-op, and cancels the
+    QoS's collect-time Finalize so it cannot fire this same restore path again at
+    process exit.
+
+    Shared by this module's Transport and the streams transport's Transport.
+    """
+    if getattr(channel, "closed", False):
+        return
+    channel.closed = True
+
+    qos = getattr(channel, "_qos", None)
+    on_collect = getattr(qos, "_on_collect", None)
+    if on_collect is not None:
+        with suppress(Exception):
+            on_collect.cancel()
+
+    with suppress(Exception):
+        channel._disconnect_pools()
+    with suppress(Exception):
+        channel._close_clients()
+
+
+def _collect_transport(transport: Any) -> None:
+    """Release a transport's channels on a lost connection, without restoring.
+
+    Mirrors ``virtual.Transport.close_connection`` (stop the poller, release
+    every channel) but releases each channel via ``_release_channel_on_collect``
+    instead of ``Channel.close``, so no channel runs QoS.restore_unacked_once()
+    for what is a reconnect, not a shutdown.
+
+    Shared by this module's Transport and the streams transport's Transport.
+    """
+    with suppress(Exception):
+        transport.cycle.close()
+    for chan_list in (transport._avail_channels, transport.channels):
+        while chan_list:
+            try:
+                channel = chan_list.pop()
+            except LookupError:
+                break
+            _release_channel_on_collect(channel)
+
+
 def _queue_score(priority: int, timestamp: float | None = None) -> float:
     """Compute sorted set score for queue ordering.
 
@@ -1895,6 +1952,20 @@ class Transport(virtual.Transport):
 
     def driver_version(self) -> str:
         return client_lib.__version__
+
+    def _collect(self, connection: Connection) -> None:
+        """Release channels for a lost connection, without restoring in-flight messages.
+
+        kombu's ``Connection.collect()`` calls this instead of the normal
+        ``close_connection``/``Channel.close`` path (the one a real
+        ``Connection.close()`` uses) whenever a transport defines it. A collect
+        means the broker connection was lost and celery is about to reconnect,
+        not that the application asked to shut down, so this must never trigger
+        QoS.restore_unacked_once(): a still-unacked message is still owned by
+        this worker and will simply time out and be requeued/redelivered like
+        any other in-flight message if this process never comes back.
+        """
+        _collect_transport(self)
 
     def register_with_event_loop(self, connection: Connection, loop: Any) -> None:
         cycle = self.cycle
