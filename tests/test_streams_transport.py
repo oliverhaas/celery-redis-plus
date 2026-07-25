@@ -7,6 +7,7 @@ import socket
 import time
 import weakref
 from pathlib import Path
+from queue import Empty
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -1045,3 +1046,224 @@ class TestStreamsConsumeLua:
     def test_script_returns_false_when_all_streams_empty(self) -> None:
         """Test that the script falls through to `return false` (nil to redis-py) on total miss."""
         assert _STREAMS_CONSUME_LUA.rstrip().endswith("return false")
+
+
+@pytest.mark.unit
+class TestStreamsGet:
+    """Tests for the synchronous Channel._get consume path (streams_consume Lua script)."""
+
+    def test_get_calls_consume_script_with_level_keys_highest_first(self, global_keyprefix: str) -> None:
+        """Test _get passes prefixed level-stream KEYS (highest level first) and group/consumer/now/ttl ARGV."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(
+            return_value=["stream:my_queue:9", "stream:my_queue:6", "stream:my_queue:3", "stream:my_queue:0"],
+        )
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+
+        payload = {"body": "test", "properties": {"delivery_tag": "tag123"}}
+        mock_client = MagicMock()
+        mock_script = MagicMock()
+        # Lua script returns [stream_key, entry_id, payload]
+        mock_script.return_value = [
+            f"{global_keyprefix}stream:my_queue:9".encode(),
+            b"1700000000000-0",
+            json_dumps(payload).encode(),
+        ]
+        mock_client.register_script.return_value = mock_script
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        before_ms = int(time.time() * 1000)
+        with (
+            patch.object(Channel, "consumer_group", "celery", create=True),
+            patch.object(Channel, "consumer_name", "testhost:4242", create=True),
+        ):
+            message = channel._get("my_queue")
+        after_ms = int(time.time() * 1000)
+
+        assert message == payload
+        # Consumer groups are ensured for every level stream (avoids NOGROUP inside the script)
+        assert channel._ensure_group.call_count == 4
+        channel._ensure_group.assert_any_call("stream:my_queue:0")
+        # KEYS: manually prefixed (EVALSHA does not auto-prefix), highest level first
+        keys = mock_script.call_args.kwargs["keys"]
+        assert keys == [
+            f"{global_keyprefix}stream:my_queue:9",
+            f"{global_keyprefix}stream:my_queue:6",
+            f"{global_keyprefix}stream:my_queue:3",
+            f"{global_keyprefix}stream:my_queue:0",
+        ]
+        # ARGV: group, consumer, now_ms, message_ttl_ms (0 = no TTL)
+        args = mock_script.call_args.kwargs["args"]
+        assert args[0] == "celery"
+        assert args[1] == "testhost:4242"
+        assert before_ms <= int(args[2]) <= after_ms
+        assert int(args[3]) == 0
+
+    def test_get_raises_empty_on_nil(self) -> None:
+        """Test _get raises Empty and records no metadata when the script returns nil."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:my_queue:9", "stream:my_queue:0"])
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+
+        mock_client = MagicMock()
+        mock_script = MagicMock(return_value=None)
+        mock_client.register_script.return_value = mock_script
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with (
+            patch.object(Channel, "consumer_group", "celery", create=True),
+            patch.object(Channel, "consumer_name", "testhost:4242", create=True),
+            pytest.raises(Empty),
+        ):
+            channel._get("my_queue")
+
+        assert mock_qos._in_flight == {}
+
+    def test_get_records_in_flight_metadata_with_unprefixed_stream_key(self, global_keyprefix: str) -> None:
+        """Test _get stores (unprefixed stream key, entry id) in qos._in_flight before returning."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(
+            return_value=["stream:my_queue:9", "stream:my_queue:6", "stream:my_queue:3", "stream:my_queue:0"],
+        )
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+
+        payload = {"body": "test", "properties": {"delivery_tag": "tag123"}}
+        mock_client = MagicMock()
+        mock_script = MagicMock()
+        # Script reply carries the PREFIXED key; metadata must store the UNPREFIXED key
+        mock_script.return_value = [
+            f"{global_keyprefix}stream:my_queue:6".encode(),
+            b"1700000000123-5",
+            json_dumps(payload).encode(),
+        ]
+        mock_client.register_script.return_value = mock_script
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with (
+            patch.object(Channel, "consumer_group", "celery", create=True),
+            patch.object(Channel, "consumer_name", "testhost:4242", create=True),
+        ):
+            message = channel._get("my_queue")
+
+        assert message["properties"]["delivery_tag"] == "tag123"
+        assert mock_qos._in_flight == {"tag123": ("stream:my_queue:6", "1700000000123-5")}
+
+    @pytest.mark.parametrize(
+        ("message_ttl", "queue_ttl_ms", "expected_ttl_ms"),
+        [
+            (None, None, 0),
+            (60, None, 60000),
+            (None, 5000, 5000),
+            (60, 5000, 5000),
+            (2, 5000, 2000),
+        ],
+        ids=["no-ttl", "channel-only", "queue-only", "queue-smaller", "channel-smaller"],
+    )
+    def test_get_ttl_argv_min_rule(
+        self,
+        message_ttl: int | None,
+        queue_ttl_ms: int | None,
+        expected_ttl_ms: int,
+    ) -> None:
+        """Test the TTL ARGV: min of channel message_ttl (seconds) and per-queue x-message-ttl (ms)."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.message_ttl = message_ttl
+        channel._message_ttls = {} if queue_ttl_ms is None else {"my_queue": queue_ttl_ms}
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:my_queue:0"])
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+
+        mock_client = MagicMock()
+        mock_script = MagicMock(return_value=None)
+        mock_client.register_script.return_value = mock_script
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with (
+            patch.object(Channel, "consumer_group", "celery", create=True),
+            patch.object(Channel, "consumer_name", "testhost:4242", create=True),
+            pytest.raises(Empty),
+        ):
+            channel._get("my_queue")
+
+        args = mock_script.call_args.kwargs["args"]
+        assert int(args[3]) == expected_ttl_ms
+
+    def test_get_nogroup_invalidates_and_retries_once(self) -> None:
+        """Test _get self-heals NOGROUP (stream deleted out of band): invalidate, re-ensure, retry once."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel._ensured_groups = {"stream:my_queue:9", "stream:my_queue:0"}
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:my_queue:9", "stream:my_queue:0"])
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+
+        payload = {"body": "test", "properties": {"delivery_tag": "tag123"}}
+        mock_client = MagicMock()
+        mock_script = MagicMock()
+        # First call: NOGROUP (the stream and its group were deleted out of
+        # band, e.g. cross-process purge or x-expires expiry, while this
+        # channel's _ensured_groups cache was warm). Second call: a hit.
+        mock_script.side_effect = [
+            _client_exceptions.ResponseError(
+                "NOGROUP No such key 'stream:my_queue:9' or consumer group 'celery' in XREADGROUP with GROUP option",
+            ),
+            [b"stream:my_queue:9", b"1700000000000-0", json_dumps(payload).encode()],
+        ]
+        mock_client.register_script.return_value = mock_script
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with (
+            patch.object(Channel, "consumer_group", "celery", create=True),
+            patch.object(Channel, "consumer_name", "testhost:4242", create=True),
+        ):
+            message = channel._get("my_queue")
+
+        assert message == payload
+        assert mock_script.call_count == 2
+        # 2 upfront ensures + 2 re-ensures after the cache invalidation
+        assert channel._ensure_group.call_count == 4
+        # _invalidate_group discarded the stale cache entries (_ensure_group
+        # is mocked here, so nothing re-adds them)
+        assert channel._ensured_groups == set()
+        assert mock_qos._in_flight == {"tag123": ("stream:my_queue:9", "1700000000000-0")}

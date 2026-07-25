@@ -64,15 +64,16 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from queue import Empty
 from time import time
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from kombu.exceptions import VersionMismatch
 from kombu.transport import virtual
 from kombu.utils.compat import register_after_fork
+from kombu.utils.encoding import bytes_to_str
 from kombu.utils.eventio import ERR, READ, poll
 from kombu.utils.functional import accepts_argument
 from kombu.utils.imports import symbol_by_name
-from kombu.utils.json import dumps
+from kombu.utils.json import dumps, loads
 from kombu.utils.objects import cached_property
 from kombu.utils.url import _parse_url
 from vine import promise
@@ -536,6 +537,69 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             client.xadd(name=stream_key, fields={"payload": dumps(message)}, id="*")
             if queue in self._expires:
                 client.pexpire(stream_key, self._expires[queue])
+
+    def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:
+        """Get a single message from a queue (synchronous).
+
+        Uses the streams_consume Lua script: atomic XREADGROUP over the
+        queue's priority streams (highest level first) with lazy
+        message-TTL drop. The read registers the entry in the consumer
+        group's PEL, and the QoS in-flight metadata is recorded before
+        the message is returned so ack/reject can XACK+XDEL it.
+
+        A NOGROUP reply means a stream (and with it its consumer group)
+        was deleted out of band (cross-process purge, queue delete,
+        x-expires expiry) while this channel held a warm _ensured_groups
+        cache; the cache is invalidated, the groups are re-created, and
+        the script is retried once.
+        """
+        stream_keys = self._stream_keys_for_queue(queue)
+        # Ensure groups exist before the read. NOGROUP can still happen if
+        # a stream is deleted out of band; that case is self-healed below.
+        for stream_key in stream_keys:
+            self._ensure_group(stream_key)
+
+        # Effective message TTL in ms: min of channel-level message_ttl (seconds)
+        # and per-queue x-message-ttl (ms); 0 = no TTL
+        ttl_ms = 0 if self.message_ttl is None else int(self.message_ttl * 1000)
+        queue_ttl_ms = self._message_ttls.get(queue)
+        if queue_ttl_ms is not None:
+            ttl_ms = queue_ttl_ms if ttl_ms == 0 else min(ttl_ms, queue_ttl_ms)
+
+        with self.conn_or_acquire() as client:
+            consume_script = client.register_script(_STREAMS_CONSUME_LUA)
+            # Prefix keys manually since EVALSHA doesn't auto-prefix KEYS
+            keys = [f"{self.global_keyprefix}{stream_key}" for stream_key in stream_keys]
+            args = [
+                self.consumer_group,
+                self.consumer_name,
+                int(time() * 1000),
+                ttl_ms,
+            ]
+            try:
+                result = consume_script(keys=keys, args=args)
+            except self.ResponseError as exc:
+                if "NOGROUP" not in str(exc):
+                    raise
+                # Stream deleted out of band: drop the stale cache, recreate
+                # the groups, and retry once. A second NOGROUP propagates.
+                self._invalidate_group(queue)
+                for stream_key in stream_keys:
+                    self._ensure_group(stream_key)
+                result = consume_script(keys=keys, args=args)
+            if not result:
+                raise Empty
+            # Script returns [stream_key, entry_id, payload]; the key is prefixed
+            hit_key = bytes_to_str(result[0])
+            if self.global_keyprefix and hit_key.startswith(self.global_keyprefix):
+                hit_key = hit_key[len(self.global_keyprefix) :]
+            entry_id = bytes_to_str(result[1])
+            message: dict[str, Any] = loads(bytes_to_str(result[2]))
+            # Record PEL metadata (unprefixed stream key) before returning
+            # so QoS ack/reject can XACK+XDEL the entry
+            delivery_tag = message["properties"]["delivery_tag"]
+            cast("QoS", self.qos)._in_flight[delivery_tag] = (hit_key, entry_id)
+            return message
 
     @property
     def priority_steps(self) -> list[int]:
