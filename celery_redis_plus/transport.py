@@ -271,13 +271,9 @@ class GlobalKeyPrefixMixin:
         "XCLAIM",
         "XRANGE",
         "XTRIM",
-        # redis-py sends each XGROUP/XINFO subcommand as a single
-        # space-joined command name (e.g. "XGROUP CREATE", "XINFO STREAM")
-        # rather than "XGROUP" plus a separate subcommand token, and the
-        # stream key is always the first argument that follows. Simple
-        # prefixing of args[0] is therefore correct for every subcommand,
-        # unlike the two-token shape a fixed-position "XGROUP"/"XINFO"
-        # entry in PREFIXED_COMPLEX_COMMANDS would assume.
+        # redis-py sends each XGROUP/XINFO subcommand as a single fused
+        # command name (e.g. "XGROUP CREATE"), not "XGROUP" plus a token,
+        # with the stream key always the first following arg.
         "XGROUP CREATE",
         "XGROUP SETID",
         "XGROUP DESTROY",

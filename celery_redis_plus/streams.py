@@ -11,7 +11,8 @@ built on Redis Streams with consumer groups:
 4. Redis Streams for fanout exchanges - reliable broadcast via XREAD (shared with
    the sorted-set transport)
 
-Requires Redis 7.0+ (or Valkey) for consumer group and XAUTOCLAIM support.
+Requires Redis 6.2+ (or Valkey) for the XPENDING IDLE filter and exclusive
+stream ID ranges used by the reclaim pass.
 Supports both redis-py and valkey-py client libraries.
 
 Configuration
@@ -83,6 +84,7 @@ from .constants import (
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_MAX_RESTORE_COUNT,
     DEFAULT_PRIORITY_STEPS,
+    DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT,
     DEFAULT_REQUEUE_BATCH_LIMIT,
     DEFAULT_REQUEUE_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
@@ -868,7 +870,12 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
            exclusive cursor (next page's ``min`` is ``"(" + last_id``),
            terminating when a page returns fewer entries than requested
            (Redis only returns a short page once it has scanned to the end
-           of the pending list).
+           of the pending list). Capped at DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT
+           pages per stream per call, since a PEL dominated by entries this
+           pass ends up filtering out (own in-flight, expired, or over
+           prefetch capacity) would otherwise scan the whole PEL every cycle
+           for no progress; hitting the cap logs a warning and moves on, and
+           a later pass picks up from wherever this one stopped.
         2. The discovered ids are filtered: ids already in-flight somewhere
            in this process (see _own_in_flight_message_ids) are dropped, and
            ids older than the effective x-message-ttl are acked away right
@@ -958,7 +965,19 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 now_ms = int(server_seconds) * 1000 + int(server_micros) // 1000
             for stream_key in self._stream_keys_for_queue(queue):
                 cursor = "-"
+                pages_walked = 0
                 while processed < budget and not prefetch_exhausted:
+                    if pages_walked >= DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT:
+                        # A PEL dominated by filtered entries (own in-flight,
+                        # expired, or over prefetch capacity) would otherwise
+                        # make this walk the whole PEL every cycle for no
+                        # progress; stop early and let a later pass continue.
+                        logger.warning(
+                            "Stream %s: reclaim discovery stopped after %d pages; more entries may be pending.",
+                            stream_key,
+                            pages_walked,
+                        )
+                        break
                     page_count = min(budget - processed, 100)
                     pending_kwargs: dict[str, Any] = {
                         "min": cursor,
@@ -977,6 +996,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                         for level_key in self._stream_keys_for_queue(queue):
                             self._ensure_group(level_key)
                         pending = client.xpending_range(stream_key, self.consumer_group, **pending_kwargs)
+                    pages_walked += 1
                     if not pending:
                         break
 
@@ -1624,7 +1644,8 @@ class Transport(virtual.Transport):
     - Redis Streams for fanout (true broadcast via XREAD)
     - Native delayed delivery via a staging sorted set
 
-    Requires Redis 7.0+ (or Valkey) for consumer group and XAUTOCLAIM support.
+    Requires Redis 6.2+ (or Valkey) for the XPENDING IDLE filter and exclusive
+    stream ID ranges used by the reclaim pass.
     """
 
     Channel = Channel

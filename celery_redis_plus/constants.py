@@ -28,6 +28,11 @@ DEFAULT_REQUEUE_CHECK_INTERVAL = 60
 # Batch limit for requeue operations (max messages processed per queue per cycle)
 DEFAULT_REQUEUE_BATCH_LIMIT = 1000
 
+# Max XPENDING discovery pages walked per stream per reclaim call; bounds Redis
+# round trips independent of budget when a PEL is dominated by entries the pass
+# ends up filtering out (own in-flight, expired, or over prefetch capacity)
+DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT = 50
+
 # Default TTL for per-message hashes in seconds
 # -1 means no TTL (messages persist until acked or deleted)
 # Set to a positive value (e.g., 259200 for 3 days) to auto-expire orphaned messages

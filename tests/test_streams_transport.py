@@ -26,6 +26,7 @@ from celery_redis_plus.constants import (
     CONSUMER_IDLE_CLEANUP_FACTOR,
     DEFAULT_CONSUMER_GROUP,
     DEFAULT_PRIORITY_STEPS,
+    DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT,
     DEFAULT_REQUEUE_BATCH_LIMIT,
     DEFAULT_VISIBILITY_TIMEOUT,
     DELAYED_KEY_PREFIX,
@@ -2324,8 +2325,13 @@ class TestStreamsMoveDelayed:
 class TestStreamsReclaim:
     """Unit tests for Channel._reclaim_and_deliver (XPENDING-IDLE discovery + XCLAIM)."""
 
-    def test_reclaim_empty_stream_terminates_on_zero_cursor(self, global_keyprefix: str) -> None:
-        """A stream with nothing pending returns 0 after a single XPENDING call."""
+    def test_reclaim_terminates_when_xpending_page_is_empty(self, global_keyprefix: str) -> None:
+        """A stream with nothing pending returns 0 after a single XPENDING call.
+
+        An empty page (no entries idle past visibility_timeout) ends the loop
+        immediately: no XCLAIM, no delivery, no ack, and no further XPENDING
+        call for this stream.
+        """
         channel = object.__new__(Channel)
         channel.global_keyprefix = global_keyprefix
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
@@ -2661,6 +2667,194 @@ class TestStreamsReclaim:
         assert mock_client.xpending_range.call_args_list[0].kwargs["min"] == "-"
         assert mock_client.xpending_range.call_args_list[1].kwargs["min"] == "(1700000000002-0"
         assert channel.connection._deliver.call_count == 2
+
+    def test_reclaim_advances_cursor_when_page_is_fully_own_in_flight(self, global_keyprefix: str) -> None:
+        """A full page filtered down to zero survivors still advances the cursor rather than spinning.
+
+        Every id on page 1 belongs to this process's own in-flight table, so
+        the filter loop empties survivor_ids without ever consulting `take`.
+        The page is full (len == count), so the loop must not treat this like
+        a short page: it has to advance the cursor to "(" + last_id and issue
+        a second XPENDING call rather than looping the same page forever. An
+        implementation that forgets to advance the cursor here either spins
+        on page 1 indefinitely or wrongly breaks out early; this test's mocked
+        second call returns nothing further to claim, only reachable by
+        actually advancing.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        own_ids = [f"170000000000{i}-0" for i in range(5)]
+        channel._qos._in_flight = {
+            f"tag-own-{i}": ("stream:celery:0", message_id) for i, message_id in enumerate(own_ids)
+        }
+        channel._qos.can_consume_max_estimate.return_value = None
+        channel.connection = MagicMock()
+        channel.connection.cycle = None
+
+        mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xpending_range.side_effect = [
+            [
+                {
+                    "message_id": message_id.encode(),
+                    "consumer": b"worker1:123",
+                    "time_since_delivered": 400000,
+                    "times_delivered": 1,
+                }
+                for message_id in own_ids
+            ],
+            [],
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 5)
+
+        assert result == 0
+        assert mock_client.xpending_range.call_count == 2
+        assert mock_client.xpending_range.call_args_list[0].kwargs["min"] == "-"
+        assert mock_client.xpending_range.call_args_list[1].kwargs["min"] == f"({own_ids[-1]}"
+        mock_client.xclaim.assert_not_called()
+        channel.connection._deliver.assert_not_called()
+        mock_ack_script.assert_not_called()
+
+    def test_reclaim_truncates_survivors_to_zero_when_prefetch_capacity_exhausted(
+        self,
+        global_keyprefix: str,
+    ) -> None:
+        """`take == 0` (no remaining prefetch capacity) drops genuine survivors without claiming them.
+
+        Unlike the own-in-flight filter above, this entry is a real survivor
+        of the per-id filter loop: it is not own in-flight and not expired.
+        It is still discarded by the `survivor_ids[: max(take, 0)]` truncation
+        because `qos.can_consume_max_estimate()` reports zero remaining
+        capacity, so XCLAIM must never be called for it and it must not be
+        counted against budget. The page is short, so the pass ends here
+        rather than looping.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = 0
+        channel.connection = MagicMock()
+        channel.connection.cycle = None
+
+        mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker2:999",
+                "time_since_delivered": 400000,
+                "times_delivered": 1,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 0
+        mock_client.xpending_range.assert_called_once()
+        mock_client.xclaim.assert_not_called()
+        channel.connection._deliver.assert_not_called()
+        mock_ack_script.assert_not_called()
+
+    def test_reclaim_discovery_page_cap_stops_endless_pel_walk(
+        self,
+        global_keyprefix: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A PEL where every page is fully filtered out stops after DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT pages.
+
+        The realistic worst case: this worker's own long-running in-flight
+        messages dominate the PEL, so every discovery page comes back full
+        but every entry on it is filtered out as own in-flight. Without a
+        page cap this would walk the entire PEL, page by page, every single
+        reclaim call, doing unbounded Redis work while processing nothing.
+        The cap stops the walk at a fixed page count and logs a warning
+        instead of continuing forever.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
+        channel.connection = MagicMock()
+        channel.connection.cycle = None
+
+        class _EverythingIsOwn:
+            """A set stand-in reporting every id as already in-flight in this process."""
+
+            def __contains__(self, item: object) -> bool:
+                return True
+
+        channel._own_in_flight_message_ids = MagicMock(return_value=_EverythingIsOwn())
+
+        def _full_page(*_args: object, **kwargs: Any) -> list[dict[str, object]]:
+            count: int = kwargs["count"]
+            return [
+                {
+                    "message_id": f"170000000{i:04d}-0".encode(),
+                    "consumer": b"worker1:123",
+                    "time_since_delivered": 400000,
+                    "times_delivered": 1,
+                }
+                for i in range(count)
+            ]
+
+        mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xpending_range.side_effect = _full_page
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with caplog.at_level(logging.WARNING, logger="celery_redis_plus.streams"):
+            result = channel._reclaim_and_deliver("celery", 100_000)
+
+        assert result == 0
+        assert mock_client.xpending_range.call_count == DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT
+        mock_client.xclaim.assert_not_called()
+        channel.connection._deliver.assert_not_called()
+        assert any("discovery stopped" in record.getMessage() for record in caplog.records)
 
     def test_reclaim_own_in_flight_entry_does_not_corrupt_others_restore_count(self, global_keyprefix: str) -> None:
         """An own in-flight entry sharing a discovery page cannot corrupt a survivor's times_delivered.
@@ -3182,15 +3376,15 @@ class TestStreamsReclaim:
         channel.connection._deliver.assert_called_once()
 
     def test_reclaim_skips_own_in_flight_message(self, global_keyprefix: str) -> None:
-        """A claimed id already in this channel's QoS in-flight table is dropped before XCLAIM.
+        """An id already in this channel's QoS in-flight table is dropped before XCLAIM.
 
         It is this worker's own live message (e.g. a task still running past
-        visibility_timeout on this same, healthy worker). The JUSTID claim above
-        already reassigned it to this worker's PEL without touching its delivery
-        count; since it is filtered out before the counting XCLAIM, that count is
-        never bumped either. It must not be acked, not redelivered, and not
-        counted against the budget (Fix round 1 FIX2, tightened in Fix round 2 R1
-        so the skip also happens before the count-bumping claim).
+        visibility_timeout on this same, healthy worker). XPENDING discovery
+        finds it idle, but it is filtered out before the counting XCLAIM ever
+        runs, so it is never claimed and its delivery count is never bumped.
+        It must not be acked, not redelivered, and not counted against the
+        budget (Fix round 1 FIX2, tightened in Fix round 2 R1, then carried
+        into Fix round 3's XPENDING-discovery redesign).
         """
         channel = object.__new__(Channel)
         channel.global_keyprefix = global_keyprefix
@@ -4004,7 +4198,7 @@ class TestStreamsReclaimIntegration:
             broker_url,
             transport="celery_redis_plus.streams:Transport",
             transport_options={
-                "visibility_timeout": 1,
+                "visibility_timeout": 0.3,
                 "consumer_name": "producer-worker",
                 "global_keyprefix": global_keyprefix,
             },
@@ -4013,7 +4207,7 @@ class TestStreamsReclaimIntegration:
             broker_url,
             transport="celery_redis_plus.streams:Transport",
             transport_options={
-                "visibility_timeout": 1,
+                "visibility_timeout": 0.3,
                 "consumer_name": "reclaimer-worker",
                 "global_keyprefix": global_keyprefix,
             },
@@ -4036,8 +4230,10 @@ class TestStreamsReclaimIntegration:
             consumed = producer_channel._get(queue)
             assert consumed["properties"]["delivery_tag"] == "tag-integration-reclaim"
 
-            # Let visibility_timeout (1s) elapse so the entry becomes reclaimable.
-            time.sleep(1.5)
+            # Let visibility_timeout (0.3s) elapse with a generous margin so the
+            # entry is reliably reclaimable even under a slow container start or
+            # a GC pause on a loaded CI host.
+            time.sleep(1.0)
 
             reclaimer_channel = cast("Channel", reclaimer_conn.channel())
             delivered: list[Any] = []
