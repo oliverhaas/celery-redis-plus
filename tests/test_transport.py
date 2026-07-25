@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
-from kombu import Exchange, Queue
+from kombu import Connection, Exchange, Queue
 from kombu.exceptions import OperationalError
 from kombu.utils.eventio import ERR
 from kombu.utils.json import dumps as json_dumps
@@ -39,6 +39,7 @@ from celery_redis_plus.transport import (
     _client_exceptions,
     _connection_errors,
     _queue_score,
+    _release_channel_on_collect,
     client_lib,
 )
 
@@ -1440,6 +1441,7 @@ class TestQoS:
     def test_ack_fanout_message(self) -> None:
         """Test ack for fanout message (no Redis cleanup needed)."""
         qos = object.__new__(QoS)
+        qos.channel = MagicMock(closed=False)
         qos._fanout_tags = {"tag1"}
         qos._delivered = {"tag1": MagicMock()}
         qos._dirty = set()
@@ -1453,6 +1455,7 @@ class TestQoS:
     def test_ack_regular_message(self) -> None:
         """Test ack for regular (non-fanout) message."""
         qos = object.__new__(QoS)
+        qos.channel = MagicMock(closed=False)
         qos._fanout_tags = set()
         qos._delivered = {"tag1": MagicMock()}
         qos._dirty = set()
@@ -1467,6 +1470,7 @@ class TestQoS:
     def test_reject_fanout_message(self) -> None:
         """Test reject for fanout message (requeue not supported)."""
         qos = object.__new__(QoS)
+        qos.channel = MagicMock(closed=False)
         qos._fanout_tags = {"tag1"}
         qos._delivered = {"tag1": MagicMock()}
         qos._dirty = set()
@@ -1481,6 +1485,7 @@ class TestQoS:
     def test_reject_regular_message_with_requeue(self) -> None:
         """Test reject with requeue for regular message."""
         qos = object.__new__(QoS)
+        qos.channel = MagicMock(closed=False)
         qos._fanout_tags = set()
         mock_message = MagicMock()
         mock_message.delivery_info = {"routing_key": "my_queue"}
@@ -1497,6 +1502,7 @@ class TestQoS:
     def test_reject_regular_message_without_requeue(self) -> None:
         """Test reject without requeue for regular message."""
         qos = object.__new__(QoS)
+        qos.channel = MagicMock(closed=False)
         qos._fanout_tags = set()
         qos._delivered = {"tag1": MagicMock()}
         qos._dirty = set()
@@ -1507,6 +1513,64 @@ class TestQoS:
         qos.reject("tag1", requeue=False)
 
         qos._remove_from_indices.assert_called_once_with("tag1")
+
+    def test_ack_after_channel_closed_does_not_raise(self) -> None:
+        """N1 regression: acking a released channel's delivered tag must not raise.
+
+        Simulates the state right after Transport._collect() has run: the
+        channel is marked closed, and kombu's Connection.collect() has
+        severed channel.connection.client to None (Connection.
+        _do_close_transport does this unconditionally after any collect).
+        Before the fix, this fell through to _remove_from_indices(), which
+        calls conn_or_acquire() -> the .pool property -> _get_pool() ->
+        _connparams(), and _connparams() raises TypeError when
+        self.connection.client is None. The message must stay delivered so a
+        peer reclaims it after the visibility timeout instead.
+        """
+        channel = object.__new__(Channel)
+        channel.connection = MagicMock()
+        channel.connection.client = None
+        channel.closed = True
+        channel._pool = None
+        channel._async_pool = None
+
+        qos = object.__new__(QoS)
+        qos.channel = channel
+        qos._fanout_tags = set()
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.ack("tag1")
+
+        qos._quick_ack.assert_called_once_with("tag1")
+        assert "tag1" in qos._delivered
+
+    def test_reject_after_channel_closed_does_not_raise(self) -> None:
+        """N1 regression: rejecting a released channel's delivered tag must not raise.
+
+        See test_ack_after_channel_closed_does_not_raise: same collected-
+        channel state, but through reject()'s _remove_from_indices()/
+        requeue_by_tag() branches instead of ack()'s.
+        """
+        channel = object.__new__(Channel)
+        channel.connection = MagicMock()
+        channel.connection.client = None
+        channel.closed = True
+        channel._pool = None
+        channel._async_pool = None
+
+        qos = object.__new__(QoS)
+        qos.channel = channel
+        qos._fanout_tags = set()
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+
+        qos.reject("tag1", requeue=True)
+
+        qos._quick_ack.assert_called_once_with("tag1")
+        assert "tag1" in qos._delivered
 
     def test_maybe_update_messages_index_empty_delivered(self) -> None:
         """Test maybe_update_messages_index returns early when no delivered messages."""
@@ -4725,6 +4789,190 @@ class TestTransportCollectVsClose:
 
         mock_qos.restore_unacked_once.assert_called_once()
         assert channel.closed is True
+
+    def test_collect_disconnects_pool_and_closes_clients(self) -> None:
+        """_release_channel_on_collect actually releases pool/client resources.
+
+        The other tests in this class use a channel with no cached pool or
+        client, so _disconnect_pools()/_close_clients() run as no-ops and
+        never prove any resource is actually released. This gives the channel
+        a real pool and client stand-in and asserts both are torn down.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        channel, _mock_qos = self._make_bare_channel()
+        mock_pool = MagicMock()
+        channel._pool = mock_pool
+        mock_client = MagicMock()
+        mock_client_connection = MagicMock()
+        mock_client.connection = mock_client_connection
+        channel.__dict__["client"] = mock_client
+        transport._avail_channels = [channel]
+        transport.channels = []
+
+        transport._collect(connection=MagicMock())
+
+        mock_pool.disconnect.assert_called_once()
+        assert channel._pool is None
+        mock_client_connection.disconnect.assert_called_once()
+        assert mock_client.connection is None
+
+    def test_collect_releases_channels_from_channels_list(self) -> None:
+        """Transport._collect also releases transport.channels, not just _avail_channels."""
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        channel, mock_qos = self._make_bare_channel()
+        transport._avail_channels = []
+        transport.channels = [channel]
+
+        transport._collect(connection=MagicMock())
+
+        mock_qos.restore_unacked_once.assert_not_called()
+        assert channel.closed is True
+
+    def test_release_channel_on_collect_already_closed_is_noop(self) -> None:
+        """A channel already closed (e.g. by a prior collect) is left untouched."""
+        channel, mock_qos = self._make_bare_channel()
+        channel.closed = True
+        channel._disconnect_pools = MagicMock()
+        channel._close_clients = MagicMock()
+
+        _release_channel_on_collect(channel)
+
+        mock_qos._on_collect.cancel.assert_not_called()
+        channel._disconnect_pools.assert_not_called()
+        channel._close_clients.assert_not_called()
+
+    def test_close_disconnects_a_pool_rebuilt_during_restore(self) -> None:
+        """A pool lazily rebuilt by restore_unacked_once() during close() must not leak.
+
+        N5 regression: _disconnect_pools()/_close_clients() now run AFTER
+        super().close() (which calls restore_unacked_once()) specifically so
+        that a pool conn_or_acquire() rebuilds mid-restore gets disconnected
+        too, instead of only whatever pool existed before restore ran.
+        """
+        channel, mock_qos = self._make_bare_channel()
+        rebuilt_pool = MagicMock()
+
+        def fake_restore(stderr: Any = None) -> None:
+            channel._pool = rebuilt_pool
+
+        mock_qos.restore_unacked_once.side_effect = fake_restore
+
+        channel.close()
+
+        mock_qos.restore_unacked_once.assert_called_once()
+        rebuilt_pool.disconnect.assert_called_once()
+        assert channel._pool is None
+
+
+@pytest.mark.integration
+class TestTransportCollectIntegration:
+    """Connection.collect() must not touch delivered messages or the executor.
+
+    Companion to TestTransportCollectVsClose (unit tests that drive
+    Transport._collect directly): this drives the real Connection.collect(),
+    proving kombu's dispatch actually finds and calls our _collect hook, the
+    same way TestStreamsShutdownRestoreIntegration's
+    test_connection_collect_does_not_release_pel_or_shutdown_executor proves
+    it for the streams transport.
+    """
+
+    def test_connection_collect_does_not_restore_delivered_or_shutdown_executor(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Connection.collect() must not touch delivered messages or the executor.
+
+        collect() is kombu's reconnect-cleanup escape hatch (celery calls it
+        from on_connection_error_after_connected after a lost broker
+        connection, not on a genuine shutdown), so this drives the real
+        Connection.collect(), not Transport._collect directly, to prove
+        kombu's dispatch actually finds and calls our _collect hook. A worker
+        pool is registered for this connection so a stray executor.shutdown()
+        would be observable; the delivered message must be left exactly as
+        consumed, for a peer to pick it up only after the visibility timeout
+        naturally elapses, same as any other unreleased in-flight message.
+
+        kombu's Connection.collect() severs the transport from its owning
+        Connection unconditionally (Connection._do_close_transport sets
+        transport.client = None even when a _collect hook handled the
+        channels), so producer_conn/producer_channel are unusable for
+        anything afterward, by kombu's own design, not because of a defect
+        here. The post-collect state is inspected through a separate,
+        independent connection instead, exactly as a peer reclaiming after a
+        real lost connection would.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "collect-integration-queue"
+        visibility_timeout = 20.0
+
+        producer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.transport:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        inspector_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.transport:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        try:
+            producer_channel = cast("Channel", producer_conn.channel())
+            inspector_channel = cast("Channel", inspector_conn.channel())
+
+            message = {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-integration-collect",
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                },
+            }
+            producer_channel._put(queue, message)
+            # basic_get (not the raw _get) is what populates QoS._delivered,
+            # exactly like the real drain_events -> basic_consume path does.
+            consumed = producer_channel.basic_get(queue, no_ack=False)
+            assert consumed is not None
+            assert consumed.delivery_tag == "tag-integration-collect"
+
+            producer_qos = cast("QoS", producer_channel.qos)
+            delivered_before = set(cast("dict[str, Any]", producer_qos._delivered))
+            assert "tag-integration-collect" in delivered_before
+
+            mock_executor = MagicMock()
+            mock_pool = MagicMock()
+            mock_pool.executor = mock_executor
+
+            with patch("celery_redis_plus.transport._get_worker_pool_for_channel", return_value=mock_pool):
+                producer_conn.collect()
+
+            mock_executor.shutdown.assert_not_called()
+            # The message is still owned by this worker: metadata untouched.
+            assert set(cast("dict[str, Any]", producer_qos._delivered)) == delivered_before
+
+            index_key = inspector_channel._messages_index_key(queue)
+            queue_key = inspector_channel._queue_key(queue)
+            with inspector_channel.conn_or_acquire() as client:
+                index_score = client.zscore(index_key, "tag-integration-collect")
+                queue_score = client.zscore(queue_key, "tag-integration-collect")
+            # Still tracked for visibility-timeout restoration...
+            assert index_score is not None
+            # ...but not restored: a restore would re-add it to the main
+            # queue (via ZADD NX) for immediate redelivery.
+            assert queue_score is None
+        finally:
+            producer_conn.close()
+            inspector_conn.close()
 
 
 @pytest.mark.integration
