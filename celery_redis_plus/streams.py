@@ -1795,11 +1795,8 @@ class Transport(virtual.Transport):
         loop.call_repeatedly(DEFAULT_REQUEUE_CHECK_INTERVAL, cycle.maybe_enqueue_due_messages)
 
         # Heartbeat keeps in-flight PEL entries alive while tasks are running.
-        # visibility_timeout must be a positive real number: besides being
-        # this transport's own reclaim window, it is the denominator used to
-        # derive a safe heartbeat_interval below, so an invalid value here
-        # would poison that derivation too. Treat anything else as invalid
-        # configuration and fall back to the transport default.
+        # visibility_timeout must be a positive real: it is also the denominator
+        # deriving heartbeat_interval below, so an invalid value poisons both.
         transport_options = connection.client.transport_options  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         visibility_timeout = transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)
         if not (isinstance(visibility_timeout, numbers.Real) and visibility_timeout > 0):
