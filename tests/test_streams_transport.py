@@ -4391,3 +4391,88 @@ class TestStreamsHeartbeat:
         # re-creates the group; the healthy stream was still heartbeated
         assert channel._ensured_groups == {"stream:celery:0"}
         assert mock_client.xclaim.call_count == 2
+
+    def test_maybe_heartbeat_calls_heartbeat_on_all_channels(self) -> None:
+        """Test that the poller heartbeats every registered channel."""
+        poller = MultiChannelPoller()
+        channel1 = MagicMock()
+        channel2 = MagicMock()
+        poller._channels = {channel1, channel2}  # type: ignore[assignment]
+
+        poller.maybe_heartbeat()
+
+        channel1._heartbeat.assert_called_once_with()
+        channel2._heartbeat.assert_called_once_with()
+
+    def test_register_with_event_loop_registers_heartbeat_timer(self) -> None:
+        """Test that the heartbeat timer defaults to visibility_timeout / HEARTBEAT_INTERVAL_DIVISOR."""
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+
+        transport.register_with_event_loop(mock_connection, mock_loop)
+
+        mock_loop.call_repeatedly.assert_any_call(
+            DEFAULT_VISIBILITY_TIMEOUT / HEARTBEAT_INTERVAL_DIVISOR,
+            transport.cycle.maybe_heartbeat,
+        )
+
+    def test_register_with_event_loop_heartbeat_derived_from_visibility_timeout(self) -> None:
+        """Test that a custom visibility_timeout scales the default heartbeat interval."""
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": 100}
+
+        transport.register_with_event_loop(mock_connection, mock_loop)
+
+        mock_loop.call_repeatedly.assert_any_call(20.0, transport.cycle.maybe_heartbeat)
+
+    def test_register_with_event_loop_heartbeat_interval_override(self) -> None:
+        """Test that the heartbeat_interval transport option overrides the derived default."""
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": 100, "heartbeat_interval": 7}
+
+        transport.register_with_event_loop(mock_connection, mock_loop)
+
+        mock_loop.call_repeatedly.assert_any_call(7, transport.cycle.maybe_heartbeat)
+
+    def test_register_with_event_loop_clamps_heartbeat_interval_equal_to_visibility_timeout(self) -> None:
+        """Test that heartbeat_interval == visibility_timeout is clamped rather than honored as-is.
+
+        Honoring it would guarantee spurious reclaims of a still-live worker's
+        messages (the heartbeat would tick no faster than entries go idle
+        enough to reclaim), so this falls back to the safe derived default and
+        logs a warning once instead of silently accepting a self-defeating value.
+        """
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": 100, "heartbeat_interval": 100}
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        mock_loop.call_repeatedly.assert_any_call(20.0, transport.cycle.maybe_heartbeat)
+        mock_logger.warning.assert_called_once()
+
+    def test_register_with_event_loop_clamps_heartbeat_interval_above_visibility_timeout(self) -> None:
+        """Test that heartbeat_interval > visibility_timeout is also clamped, not just the equal case."""
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        mock_loop = MagicMock()
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"visibility_timeout": 100, "heartbeat_interval": 500}
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            transport.register_with_event_loop(mock_connection, mock_loop)
+
+        mock_loop.call_repeatedly.assert_any_call(20.0, transport.cycle.maybe_heartbeat)
+        mock_logger.warning.assert_called_once()

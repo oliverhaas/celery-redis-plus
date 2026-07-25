@@ -90,6 +90,7 @@ from .constants import (
     DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
     DELAYED_KEY_PREFIX,
+    HEARTBEAT_INTERVAL_DIVISOR,
     MAX_PRIORITY,
     STREAM_KEY_PREFIX,
 )
@@ -445,11 +446,9 @@ class MultiChannelPoller:
         return total
 
     def maybe_heartbeat(self) -> None:
-        """Send XCLAIM JUSTID heartbeats for in-flight messages.
-
-        Placeholder: filled in with the heartbeat implementation; the periodic
-        timer can already call it safely.
-        """
+        """Reset PEL idle time on in-flight messages to keep them alive (XCLAIM JUSTID)."""
+        for channel in self._channels:
+            channel._heartbeat()
 
     def maybe_refresh_queue_expires(self) -> None:
         """Refresh PEXPIRE on stream keys with x-expires TTL.
@@ -1754,6 +1753,23 @@ class Transport(virtual.Transport):
 
         # Periodic pump: delayed messages, PEL reclaim, and consumer hygiene
         loop.call_repeatedly(DEFAULT_REQUEUE_CHECK_INTERVAL, cycle.maybe_enqueue_due_messages)
+
+        # Heartbeat keeps in-flight PEL entries alive while tasks are running
+        transport_options = connection.client.transport_options  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        visibility_timeout = transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)
+        default_heartbeat_interval = visibility_timeout / HEARTBEAT_INTERVAL_DIVISOR
+        heartbeat_interval = transport_options.get("heartbeat_interval", default_heartbeat_interval)
+        if heartbeat_interval >= visibility_timeout:
+            logger.warning(
+                "heartbeat_interval %s is >= visibility_timeout %s, which guarantees "
+                "spurious reclaims of this worker's own live messages; falling back "
+                "to the default of %s instead of honoring it",
+                heartbeat_interval,
+                visibility_timeout,
+                default_heartbeat_interval,
+            )
+            heartbeat_interval = default_heartbeat_interval
+        loop.call_repeatedly(heartbeat_interval, cycle.maybe_heartbeat)
 
         # Store loop for dynamic timer registration (queue TTL refresh)
         cycle._loop = loop
