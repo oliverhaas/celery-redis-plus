@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from kombu import Connection
+from kombu.transport import TRANSPORT_ALIASES, get_transport_cls
 
 from celery_redis_plus import signals
 from celery_redis_plus.constants import (
@@ -20,7 +22,14 @@ from celery_redis_plus.constants import (
     SHUTDOWN_IDLE_MS,
     STREAM_KEY_PREFIX,
 )
-from celery_redis_plus.streams import Channel, QoS, priority_to_level
+from celery_redis_plus.streams import (
+    Channel,
+    MultiChannelPoller,
+    QoS,
+    Transport,
+    client_lib,
+    priority_to_level,
+)
 from celery_redis_plus.transport import PrefixedStrictRedis
 
 
@@ -452,3 +461,103 @@ class TestStreamsConsumerName:
         registry[mock_connection.client.app] = "worker1@examplehost"
         with patch.object(signals, "_worker_nodenames", registry):
             assert channel.consumer_name == "worker-7"
+
+
+@pytest.mark.unit
+class TestStreamsTransportSetup:
+    """Tests for streams Transport setup and valkey-streams scheme registration."""
+
+    def test_transport_aliases_registered(self) -> None:
+        """Test that importing the package registers the streams transport aliases."""
+        # Importing celery_redis_plus.streams (top of this module) imports the
+        # package, which registers the aliases at import time.
+        assert TRANSPORT_ALIASES["valkey-streams"] == "celery_redis_plus.streams:Transport"
+        assert TRANSPORT_ALIASES["valkeys-streams"] == "celery_redis_plus.streams:Transport"
+        assert TRANSPORT_ALIASES["valkey+streams"] == "celery_redis_plus.streams:Transport"
+        assert TRANSPORT_ALIASES["valkeys+streams"] == "celery_redis_plus.streams:Transport"
+
+    def test_alias_resolves_to_streams_transport(self) -> None:
+        """Test that kombu resolves the streams aliases to our Transport class."""
+        assert get_transport_cls("valkey-streams") is Transport
+        assert get_transport_cls("valkeys-streams") is Transport
+        assert get_transport_cls("valkey+streams") is Transport
+        assert get_transport_cls("valkeys+streams") is Transport
+
+    def test_connection_with_streams_transport_name(self) -> None:
+        """Test transport selection the way Celery's broker_transport setting does it.
+
+        kombu splits scheme+rest:// URLs into (transport, sub-URL) before any
+        alias lookup, so the streams transport is selected via an explicit
+        transport name plus a plain broker URL.
+        """
+        conn = Connection("redis://somehost:6380/3", transport="valkey+streams")
+
+        assert conn.transport_cls == "valkey+streams"
+        assert conn.get_transport_cls() is Transport
+        assert conn.hostname == "somehost"
+        assert conn.port == 6380
+
+    def test_connection_with_streams_url_scheme(self) -> None:
+        """Test that a bare valkey-streams:// URL selects the streams transport.
+
+        kombu splits bare URL schemes at '+' before alias lookup, so only the
+        hyphen form works in a bare broker URL; the '+' aliases exist for
+        broker_transport users.
+        """
+        conn = Connection("valkey-streams://somehost:6380/3")
+
+        assert conn.transport_cls == "valkey-streams"
+        assert conn.get_transport_cls() is Transport
+        assert conn.hostname == "somehost"
+        assert conn.port == 6380
+        assert conn.virtual_host == "3"
+
+    def test_supports_native_delayed_delivery_flag(self) -> None:
+        """Test that the streams transport has the native delayed delivery flag."""
+        assert Transport.supports_native_delayed_delivery is True
+
+    def test_uses_streams_channel(self) -> None:
+        """Test that the transport uses the streams Channel class."""
+        assert Transport.Channel is Channel
+
+    def test_implements_async_and_exchanges(self) -> None:
+        """Test that transport implements async and all exchange types."""
+        assert Transport.implements.asynchronous is True
+        assert "direct" in Transport.implements.exchange_type
+        assert "topic" in Transport.implements.exchange_type
+        assert "fanout" in Transport.implements.exchange_type
+
+    def test_driver_version(self) -> None:
+        """Test that driver_version returns the client library version string."""
+        transport = MagicMock(spec=Transport)
+        transport.driver_version = Transport.driver_version
+        version = transport.driver_version(transport)
+        assert version == client_lib.__version__
+
+    def test_init_creates_streams_poller(self) -> None:
+        """Test that Transport.__init__ creates this module's MultiChannelPoller."""
+        mock_client = MagicMock()
+        mock_client.transport_options = {}
+        transport = Transport(mock_client)
+
+        assert isinstance(transport.cycle, MultiChannelPoller)
+
+    def test_poller_add_and_discard_channel(self) -> None:
+        """Test adding and removing channels from the poller."""
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+
+        poller.add(channel)
+        assert channel in poller._channels
+
+        poller.discard(channel)
+        assert channel not in poller._channels
+
+    def test_poller_periodic_placeholders_are_safe(self) -> None:
+        """Test that timer callbacks are callable before the consume cycle exists."""
+        poller = MultiChannelPoller()
+
+        assert poller.maybe_enqueue_due_messages() == 0
+        assert poller.maybe_heartbeat() is None
+        assert poller.maybe_refresh_queue_expires() is None
+        assert poller._update_expires_timer() is None
