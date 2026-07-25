@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import os
+import socket
+import weakref
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from celery_redis_plus import signals
 from celery_redis_plus.constants import (
     CONSUMER_IDLE_CLEANUP_FACTOR,
     DEFAULT_CONSUMER_GROUP,
@@ -15,7 +20,7 @@ from celery_redis_plus.constants import (
     SHUTDOWN_IDLE_MS,
     STREAM_KEY_PREFIX,
 )
-from celery_redis_plus.streams import priority_to_level
+from celery_redis_plus.streams import Channel, QoS, priority_to_level
 from celery_redis_plus.transport import PrefixedStrictRedis
 
 
@@ -233,3 +238,217 @@ class TestStreamsPrefixMixin:
 
         args = client._prefix_args(["XACK", "stream:celery:9", "celery", "1-0"])
         assert args == ["XACK", "stream:celery:9", "celery", "1-0"]
+
+
+@pytest.mark.unit
+class TestStreamsChannelSetup:
+    """Tests for streams Channel key helpers, configuration properties, and QoS setup."""
+
+    def test_stream_key_format(self) -> None:
+        """Test that _stream_key builds stream:{queue}:{level} keys."""
+        channel = object.__new__(Channel)
+
+        assert channel._stream_key("celery", 9) == "stream:celery:9"
+        assert channel._stream_key("other_queue", 0) == "stream:other_queue:0"
+
+    def test_delayed_key_format(self) -> None:
+        """Test that _delayed_key builds delayed:{queue} keys."""
+        channel = object.__new__(Channel)
+
+        assert channel._delayed_key("celery") == "delayed:celery"
+
+    def test_stream_keys_for_queue_highest_level_first(self) -> None:
+        """Test that _stream_keys_for_queue returns all level streams, highest level first."""
+        channel = object.__new__(Channel)
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        assert channel._stream_keys_for_queue("celery") == [
+            "stream:celery:9",
+            "stream:celery:6",
+            "stream:celery:3",
+            "stream:celery:0",
+        ]
+
+    def test_priority_steps_default(self) -> None:
+        """Test that priority_steps defaults to DEFAULT_PRIORITY_STEPS sorted ascending."""
+        channel = object.__new__(Channel)
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        assert channel.priority_steps == sorted(DEFAULT_PRIORITY_STEPS)
+        assert channel.priority_steps == [0, 3, 6, 9]
+
+    def test_priority_steps_transport_option_is_sorted(self) -> None:
+        """Test that a priority_steps transport option is normalized to ascending order."""
+        channel = object.__new__(Channel)
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"priority_steps": [9, 0, 5]}
+        channel.connection = mock_connection
+
+        assert channel.priority_steps == [0, 5, 9]
+
+    def test_consumer_group_default(self) -> None:
+        """Test that consumer_group defaults to the celery group name."""
+        channel = object.__new__(Channel)
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        assert channel.consumer_group == "celery"
+
+    def test_consumer_group_transport_option(self) -> None:
+        """Test that the consumer_group transport option overrides the default."""
+        channel = object.__new__(Channel)
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"consumer_group": "mygroup"}
+        channel.connection = mock_connection
+
+        assert channel.consumer_group == "mygroup"
+
+    @pytest.mark.parametrize("transport_cls", ["valkeys-streams", "valkeys+streams"])
+    def test_connparams_ssl_for_valkeys_streams(self, transport_cls: str) -> None:
+        """Test that valkeys-streams and the valkeys+streams alias enable the SSL connection class."""
+        channel = object.__new__(Channel)
+        channel.max_connections = 10
+        channel.socket_timeout = None
+        channel.socket_connect_timeout = None
+        channel.socket_keepalive = None
+        channel.socket_keepalive_options = None
+        channel.health_check_interval = 25
+        channel.retry_on_timeout = None
+        channel.client_name = None
+        channel.credential_provider = None
+
+        mock_connection = MagicMock()
+        mock_connection.client.hostname = "somehost"
+        mock_connection.client.port = 6379
+        mock_connection.client.virtual_host = "0"
+        mock_connection.client.userid = None
+        mock_connection.client.password = None
+        mock_connection.client.ssl = None
+        mock_connection.transport_cls = transport_cls
+        channel.connection = mock_connection
+
+        connparams = channel._connparams()
+
+        assert connparams["connection_class"] is Channel.connection_class_ssl
+
+    @pytest.mark.parametrize("transport_cls", ["valkey-streams", "valkey+streams"])
+    def test_connparams_no_ssl_for_plain_scheme(self, transport_cls: str) -> None:
+        """Test that valkey-streams and the valkey+streams alias keep the plain connection class."""
+        channel = object.__new__(Channel)
+        channel.max_connections = 10
+        channel.socket_timeout = None
+        channel.socket_connect_timeout = None
+        channel.socket_keepalive = None
+        channel.socket_keepalive_options = None
+        channel.health_check_interval = 25
+        channel.retry_on_timeout = None
+        channel.client_name = None
+        channel.credential_provider = None
+
+        mock_connection = MagicMock()
+        mock_connection.client.hostname = "somehost"
+        mock_connection.client.port = 6379
+        mock_connection.client.virtual_host = "0"
+        mock_connection.client.userid = None
+        mock_connection.client.password = None
+        mock_connection.client.ssl = None
+        mock_connection.client.transport_options = {}
+        mock_connection.transport_cls = transport_cls
+        channel.connection = mock_connection
+
+        connparams = channel._connparams()
+
+        assert connparams["connection_class"] is Channel.connection_class
+
+    def test_qos_tracks_in_flight_and_fanout_tags(self) -> None:
+        """Test that QoS initializes PEL in-flight and fanout tag tracking."""
+        qos = QoS(MagicMock())
+
+        assert qos._in_flight == {}
+        assert qos._fanout_tags == set()
+
+    def test_qos_visibility_timeout_from_channel(self) -> None:
+        """Test that QoS visibility_timeout mirrors the channel's."""
+        qos = object.__new__(QoS)
+        mock_channel = MagicMock()
+        mock_channel.visibility_timeout = 123.0
+        qos.channel = mock_channel
+
+        assert qos.visibility_timeout == 123.0
+
+
+@pytest.mark.unit
+class TestStreamsConsumerName:
+    """Tests for the stable per-worker consumer name."""
+
+    def test_consumer_name_falls_back_to_hostname_pid(self) -> None:
+        """Test that consumer_name defaults to hostname:pid when no nodename is registered."""
+        channel = object.__new__(Channel)
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        with patch.object(signals, "_worker_nodenames", weakref.WeakKeyDictionary()):
+            assert channel.consumer_name == f"{socket.gethostname()}:{os.getpid()}"
+
+    def test_consumer_name_is_stable_across_calls(self) -> None:
+        """Test that consumer_name does not change between calls (never uuid-per-boot)."""
+        channel = object.__new__(Channel)
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        assert channel.consumer_name == channel.consumer_name
+
+    def test_consumer_name_uses_registered_worker_nodename(self) -> None:
+        """Test that consumer_name resolves to the nodename recorded for the channel's app."""
+        channel = object.__new__(Channel)
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {}
+        channel.connection = mock_connection
+
+        registry = weakref.WeakKeyDictionary()
+        registry[mock_connection.client.app] = "worker1@examplehost"
+        with patch.object(signals, "_worker_nodenames", registry):
+            assert channel.consumer_name == "worker1@examplehost"
+
+    def test_consumer_name_falls_back_to_sole_registered_nodename(self) -> None:
+        """Test the single-app fallback when the connection chain exposes no app."""
+        channel = object.__new__(Channel)
+        # SimpleNamespace has no .app attribute, unlike MagicMock, so the
+        # registry lookup takes the AttributeError fallback path
+        channel.connection = SimpleNamespace(client=SimpleNamespace(transport_options={}))
+
+        # App stand-in must be weakref-able (SimpleNamespace is not); the local
+        # strong reference keeps the weak registry entry alive during the test
+        app = MagicMock()
+        registry = weakref.WeakKeyDictionary()
+        registry[app] = "worker1@examplehost"
+        with patch.object(signals, "_worker_nodenames", registry):
+            assert channel.consumer_name == "worker1@examplehost"
+
+    def test_consumer_name_transport_option_override(self) -> None:
+        """Test that the consumer_name transport option overrides the fallback."""
+        channel = object.__new__(Channel)
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"consumer_name": "worker-7"}
+        channel.connection = mock_connection
+
+        assert channel.consumer_name == "worker-7"
+
+    def test_consumer_name_transport_option_overrides_nodename(self) -> None:
+        """Test that the consumer_name transport option wins over a registered nodename."""
+        channel = object.__new__(Channel)
+        mock_connection = MagicMock()
+        mock_connection.client.transport_options = {"consumer_name": "worker-7"}
+        channel.connection = mock_connection
+
+        registry = weakref.WeakKeyDictionary()
+        registry[mock_connection.client.app] = "worker1@examplehost"
+        with patch.object(signals, "_worker_nodenames", registry):
+            assert channel.consumer_name == "worker-7"
