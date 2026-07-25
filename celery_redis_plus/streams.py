@@ -474,6 +474,22 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                     raise
         self._ensured_groups.add(stream_key)
 
+    def _invalidate_group(self, queue: str | None = None) -> None:
+        """Drop cached ensured-group state so _ensure_group re-creates groups.
+
+        Called when a NOGROUP error reveals that a stream (and with it its
+        consumer groups) was deleted out of band: a cross-process purge or
+        queue delete, or an x-expires TTL firing. With a queue given, only
+        that queue's level stream keys are discarded; with None the whole
+        cache is cleared (used when the failing stream cannot be singled
+        out, e.g. a blocking XREADGROUP armed across all watched queues).
+        """
+        if queue is None:
+            self._ensured_groups.clear()
+            return
+        for stream_key in self._stream_keys_for_queue(queue):
+            self._ensured_groups.discard(stream_key)
+
     def _put(self, queue: str, message: dict[str, Any], **kwargs: Any) -> None:
         """Publish a message to a queue's priority stream or the delayed zset.
 

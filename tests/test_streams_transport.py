@@ -979,3 +979,40 @@ class TestStreamsPut:
         channel._put("my_queue", message)
 
         mock_client.pexpire.assert_called_once_with("delayed:my_queue", 30_000)
+
+
+@pytest.mark.unit
+class TestStreamsInvalidateGroup:
+    """Unit tests for Channel._invalidate_group (NOGROUP self-healing cache invalidation)."""
+
+    def test_invalidate_group_discards_queue_stream_keys(self) -> None:
+        """Test that invalidating a queue discards only that queue's level stream keys."""
+        channel = object.__new__(Channel)
+        channel._ensured_groups = {"stream:my_queue:9", "stream:my_queue:0", "stream:other:0"}
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:my_queue:9", "stream:my_queue:0"])
+
+        channel._invalidate_group("my_queue")
+
+        assert channel._ensured_groups == {"stream:other:0"}
+        channel._stream_keys_for_queue.assert_called_once_with("my_queue")
+
+    def test_invalidate_group_tolerates_uncached_keys(self) -> None:
+        """Test that invalidating a queue with no cached keys is a harmless no-op."""
+        channel = object.__new__(Channel)
+        channel._ensured_groups = {"stream:other:0"}
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:my_queue:9", "stream:my_queue:0"])
+
+        channel._invalidate_group("my_queue")
+
+        assert channel._ensured_groups == {"stream:other:0"}
+
+    def test_invalidate_group_without_queue_clears_cache(self) -> None:
+        """Test that invalidating without a queue clears the whole ensured-group cache."""
+        channel = object.__new__(Channel)
+        channel._ensured_groups = {"stream:my_queue:0", "stream:other:0"}
+        channel._stream_keys_for_queue = MagicMock()
+
+        channel._invalidate_group()
+
+        assert channel._ensured_groups == set()
+        channel._stream_keys_for_queue.assert_not_called()
