@@ -353,6 +353,13 @@ class GlobalKeyPrefixMixin:
 
     def parse_response(self, connection: Any, command_name: str, **options: Any) -> Any:
         """Parse a response from the Redis server."""
+        if command_name == "XAUTOCLAIM" and options.get("parse_justid"):
+            # redis-py's parse_xautoclaim collapses a JUSTID reply down to just
+            # the claimed id list (dropping the cursor and deleted-id list
+            # entirely) instead of returning the (cursor, ids, deleted) triple
+            # the server actually sends. Read the raw reply ourselves so
+            # cursor-driven pagination keeps working for a JUSTID claim.
+            return connection.read_response()
         ret = super().parse_response(connection, command_name, **options)  # type: ignore[misc]  # ty: ignore[unresolved-attribute]
         if command_name == "BZMPOP" and ret:
             # BZMPOP returns (key, [(member, score), ...])

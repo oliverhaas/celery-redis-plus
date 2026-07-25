@@ -2303,7 +2303,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         mock_client = MagicMock()
         mock_client.time.return_value = (1700000100, 0)
@@ -2325,7 +2327,9 @@ class TestStreamsReclaim:
             min_idle_time=DEFAULT_VISIBILITY_TIMEOUT * 1000,
             start_id="0-0",
             count=100,
+            justid=True,
         )
+        mock_client.xclaim.assert_not_called()
         channel.connection._deliver.assert_not_called()
         mock_ack_script.assert_not_called()
 
@@ -2343,7 +2347,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -2359,11 +2365,8 @@ class TestStreamsReclaim:
         mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
-            [],
-        ]
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000000-0"], []]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": b"1700000000000-0",
@@ -2380,6 +2383,13 @@ class TestStreamsReclaim:
         result = channel._reclaim_and_deliver("celery", 100)
 
         assert result == 1
+        mock_client.xclaim.assert_called_once_with(
+            "stream:celery:0",
+            "celery",
+            "worker1:123",
+            min_idle_time=0,
+            message_ids=["1700000000000-0"],
+        )
         delivered_message, delivered_queue = channel.connection._deliver.call_args[0]
         assert delivered_queue == "celery"
         assert delivered_message["properties"]["headers"]["x-restore-count"] == 1
@@ -2400,7 +2410,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -2415,11 +2427,8 @@ class TestStreamsReclaim:
         mock_client = MagicMock()
         mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
-            [],
-        ]
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000000-0"], []]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": b"1700000000000-0",
@@ -2454,7 +2463,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json_1 = json_dumps(
             {
@@ -2480,8 +2491,12 @@ class TestStreamsReclaim:
         mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
         mock_client.xautoclaim.side_effect = [
-            [b"1700000000005-0", [(b"1700000000001-0", {b"payload": payload_json_1.encode()})], []],
-            [b"0-0", [(b"1700000000006-0", {b"payload": payload_json_2.encode()})], []],
+            [b"1700000000005-0", [b"1700000000001-0"], []],
+            [b"0-0", [b"1700000000006-0"], []],
+        ]
+        mock_client.xclaim.side_effect = [
+            [(b"1700000000001-0", {b"payload": payload_json_1.encode()})],
+            [(b"1700000000006-0", {b"payload": payload_json_2.encode()})],
         ]
         mock_client.xpending_range.side_effect = [
             [
@@ -2528,7 +2543,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json_1 = json_dumps(
             {
@@ -2553,13 +2570,10 @@ class TestStreamsReclaim:
         mock_client = MagicMock()
         mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [
-                (b"1700000000001-0", {b"payload": payload_json_1.encode()}),
-                (b"1700000000002-0", {b"payload": payload_json_2.encode()}),
-            ],
-            [],
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000001-0", b"1700000000002-0"], []]
+        mock_client.xclaim.return_value = [
+            (b"1700000000001-0", {b"payload": payload_json_1.encode()}),
+            (b"1700000000002-0", {b"payload": payload_json_2.encode()}),
         ]
         mock_client.xpending_range.return_value = [
             {
@@ -2620,7 +2634,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json_1 = json_dumps(
             {
@@ -2688,13 +2704,10 @@ class TestStreamsReclaim:
         mock_client = MagicMock()
         mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [
-                (b"1700000000003-0", {b"payload": payload_json_1.encode()}),
-                (b"1700000000004-0", {b"payload": payload_json_2.encode()}),
-            ],
-            [],
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000003-0", b"1700000000004-0"], []]
+        mock_client.xclaim.return_value = [
+            (b"1700000000003-0", {b"payload": payload_json_1.encode()}),
+            (b"1700000000004-0", {b"payload": payload_json_2.encode()}),
         ]
         mock_client.xpending_range.side_effect = fake_xpending_range
         mock_context = MagicMock()
@@ -2736,7 +2749,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -2754,9 +2769,10 @@ class TestStreamsReclaim:
         mock_client.register_script.return_value = mock_ack_script
         mock_client.xautoclaim.return_value = [
             b"0-0",
-            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
+            [b"1700000000000-0"],
             [b"1600000000000-0", b"1600000000001-0"],
         ]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": b"1700000000000-0",
@@ -2793,7 +2809,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:9", "stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -2808,11 +2826,8 @@ class TestStreamsReclaim:
         mock_client = MagicMock()
         mock_client.time.return_value = (1700000100, 0)
         mock_client.register_script.return_value = MagicMock()
-        mock_client.xautoclaim.return_value = [
-            b"1700000000009-0",
-            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
-            [],
-        ]
+        mock_client.xautoclaim.return_value = [b"1700000000009-0", [b"1700000000000-0"], []]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": b"1700000000000-0",
@@ -2848,7 +2863,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:9", "stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -2865,8 +2882,9 @@ class TestStreamsReclaim:
         mock_client.register_script.return_value = MagicMock()
         mock_client.xautoclaim.side_effect = [
             [b"0-0", [], []],
-            [b"0-0", [(b"1700000000000-0", {b"payload": payload_json.encode()})], []],
+            [b"0-0", [b"1700000000000-0"], []],
         ]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": b"1700000000000-0",
@@ -2901,7 +2919,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -2921,11 +2941,8 @@ class TestStreamsReclaim:
         mock_client.time.return_value = (mock_now_ms // 1000, (mock_now_ms % 1000) * 1000)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [(expired_id.encode(), {b"payload": payload_json.encode()})],
-            [],
-        ]
+        mock_client.xautoclaim.return_value = [b"0-0", [expired_id.encode()], []]
+        mock_client.xclaim.return_value = [(expired_id.encode(), {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": expired_id.encode(),
@@ -2948,6 +2965,80 @@ class TestStreamsReclaim:
             args=["celery", expired_id, ""],
         )
 
+    def test_reclaim_ttl_cutoff_uses_server_clock_not_worker_clock(self, global_keyprefix: str) -> None:
+        """The TTL cutoff is computed from the server's clock (TIME), never the worker's local clock.
+
+        The mocked server clock here is fixed at a point far behind the real
+        wall clock (this machine's real time() return value). The claimed
+        entry's id encodes a creation time that is recent relative to that
+        mocked server clock (well inside the 60s TTL) but ancient relative to
+        the worker's real clock (the gap between the mocked server time and
+        actual now dwarfs the TTL many times over). If the cutoff were ever
+        computed from time() instead of client.time(), this message would
+        look wildly expired and get acked away instead of delivered; this
+        test fails against that regression (Fix round 2, R2).
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {"celery": 60_000}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
+        channel.connection = MagicMock()
+        channel.connection.cycle = None
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-server-clock",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        # Fixed server clock, meaningfully behind the real wall clock (this
+        # test was written in 2026; a real time() call returns an epoch ms
+        # value far larger than this).
+        mock_server_now_ms = 1_700_000_100_000
+        # 30s before the mocked server clock: within the 60s TTL relative to
+        # that clock, but the entry id is a 2023 timestamp, hopelessly
+        # "expired" relative to any real-world time() call.
+        entry_id_ms = mock_server_now_ms - 30_000
+        entry_id = f"{entry_id_ms}-0"
+        assert entry_id_ms < int(time.time() * 1000) - 60_000, "test fixture must predate the real clock"
+        mock_client = MagicMock()
+        mock_client.time.return_value = (mock_server_now_ms // 1000, (mock_server_now_ms % 1000) * 1000)
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [b"0-0", [entry_id.encode()], []]
+        mock_client.xclaim.return_value = [(entry_id.encode(), {b"payload": payload_json.encode()})]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": entry_id.encode(),
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 2,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        channel.connection._deliver.assert_called_once()
+        mock_ack_script.assert_not_called()
+
     def test_reclaim_nogroup_reensures_and_retries_once(self, global_keyprefix: str) -> None:
         """A NOGROUP from XAUTOCLAIM (stream deleted out of band) re-ensures groups and retries once."""
         channel = object.__new__(Channel)
@@ -2965,7 +3056,9 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -2987,12 +3080,9 @@ class TestStreamsReclaim:
             _client_exceptions.ResponseError(
                 "NOGROUP No such key 'stream:celery:0' or consumer group 'celery'",
             ),
-            [
-                b"0-0",
-                [(b"1700000000000-0", {b"payload": payload_json.encode()})],
-                [],
-            ],
+            [b"0-0", [b"1700000000000-0"], []],
         ]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": b"1700000000000-0",
@@ -3017,12 +3107,15 @@ class TestStreamsReclaim:
         channel.connection._deliver.assert_called_once()
 
     def test_reclaim_skips_own_in_flight_message(self, global_keyprefix: str) -> None:
-        """A claimed entry already in this channel's QoS in-flight table is skipped entirely.
+        """A claimed id already in this channel's QoS in-flight table is dropped before XCLAIM.
 
         It is this worker's own live message (e.g. a task still running past
-        visibility_timeout on this same, healthy worker). It must not be acked,
-        not redelivered, and not counted against the budget: it stays in the PEL,
-        already owned by this worker after XAUTOCLAIM (Fix round 1, FIX2).
+        visibility_timeout on this same, healthy worker). The JUSTID claim above
+        already reassigned it to this worker's PEL without touching its delivery
+        count; since it is filtered out before the counting XCLAIM, that count is
+        never bumped either. It must not be acked, not redelivered, and not
+        counted against the budget (Fix round 1 FIX2, tightened in Fix round 2 R1
+        so the skip also happens before the count-bumping claim).
         """
         channel = object.__new__(Channel)
         channel.global_keyprefix = global_keyprefix
@@ -3036,27 +3129,15 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {"tag-own": ("stream:celery:0", "1700000000000-0")}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
-        payload_json = json_dumps(
-            {
-                "body": '{"task": "test"}',
-                "properties": {
-                    "delivery_tag": "tag-own",
-                    "delivery_info": {"exchange": "", "routing_key": "celery"},
-                    "headers": {},
-                },
-            },
-        )
         mock_client = MagicMock()
         mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
-            [],
-        ]
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000000-0"], []]
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
         mock_context.__exit__ = MagicMock(return_value=False)
@@ -3067,14 +3148,27 @@ class TestStreamsReclaim:
         assert result == 0
         channel.connection._deliver.assert_not_called()
         mock_ack_script.assert_not_called()
+        mock_client.xclaim.assert_not_called()
 
-    def test_reclaim_stops_delivering_once_prefetch_exhausted(self, global_keyprefix: str) -> None:
-        """Delivering stops mid claimed-batch as soon as qos.can_consume() goes false.
+    def test_reclaim_skips_in_flight_message_owned_by_sibling_channel(self, global_keyprefix: str) -> None:
+        """The own-in-flight skip covers every sibling channel sharing this process's consumer_name.
 
-        The remaining claimed entries are left untouched in this worker's own PEL
-        (XAUTOCLAIM already reassigned them there) for a later reclaim pass, instead
-        of flooding the channel past its prefetch_count (Fix round 1, FIX3).
+        consumer_name is one identity per worker process (see the module
+        docstring), so a second consuming channel in the same process is
+        still this same consumer as far as Redis is concerned. Its live
+        message must be just as protected from a sibling's reclaim pass as
+        one delivered on this very channel (Fix round 2, R7): reached via
+        ``self.connection.cycle`` (a ``MultiChannelPoller``), not just this
+        channel's own QoS table.
         """
+        poller = MultiChannelPoller()
+
+        sibling = object.__new__(Channel)
+        sibling.consumer_name = "worker1:123"
+        sibling._qos = MagicMock()
+        sibling._qos._in_flight = {"tag-sibling-own": ("stream:celery:0", "1700000000000-0")}
+        poller._channels.add(sibling)
+
         channel = object.__new__(Channel)
         channel.global_keyprefix = global_keyprefix
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
@@ -3087,24 +3181,71 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
-        channel._qos.can_consume.side_effect = [False]
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = poller
+        poller._channels.add(channel)
 
-        payload_json_1 = json_dumps(
+        mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000000-0"], []]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 0
+        channel.connection._deliver.assert_not_called()
+        mock_ack_script.assert_not_called()
+        mock_client.xclaim.assert_not_called()
+
+    def test_reclaim_does_not_skip_in_flight_message_owned_by_other_consumer(
+        self,
+        global_keyprefix: str,
+    ) -> None:
+        """A sibling channel's in-flight table is consulted only when it shares this consumer_name.
+
+        Guards the filter in _own_in_flight_message_ids itself: a channel
+        reachable through the same connection cycle but identifying as a
+        different Redis consumer (not expected in normal operation, since
+        consumer_name is derived per process, but the code checks it
+        explicitly) must not suppress delivery of an id that channel merely
+        happens to have recorded under the same stream key.
+        """
+        poller = MultiChannelPoller()
+
+        other_consumer = object.__new__(Channel)
+        other_consumer.consumer_name = "worker2:456"
+        other_consumer._qos = MagicMock()
+        other_consumer._qos._in_flight = {"tag-other": ("stream:celery:0", "1700000000000-0")}
+        poller._channels.add(other_consumer)
+
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
+        channel.connection = MagicMock()
+        channel.connection.cycle = poller
+        poller._channels.add(channel)
+
+        payload_json = json_dumps(
             {
                 "body": '{"task": "test"}',
                 "properties": {
-                    "delivery_tag": "tag-first",
-                    "delivery_info": {"exchange": "", "routing_key": "celery"},
-                    "headers": {},
-                },
-            },
-        )
-        payload_json_2 = json_dumps(
-            {
-                "body": '{"task": "test"}',
-                "properties": {
-                    "delivery_tag": "tag-second",
+                    "delivery_tag": "tag-not-owned",
                     "delivery_info": {"exchange": "", "routing_key": "celery"},
                     "headers": {},
                 },
@@ -3112,24 +3253,13 @@ class TestStreamsReclaim:
         )
         mock_client = MagicMock()
         mock_client.time.return_value = (1700000100, 0)
-        mock_client.register_script.return_value = MagicMock()
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [
-                (b"1700000000001-0", {b"payload": payload_json_1.encode()}),
-                (b"1700000000002-0", {b"payload": payload_json_2.encode()}),
-            ],
-            [],
-        ]
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000000-0"], []]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
-                "message_id": b"1700000000001-0",
-                "consumer": b"worker1:123",
-                "time_since_delivered": 400000,
-                "times_delivered": 1,
-            },
-            {
-                "message_id": b"1700000000002-0",
+                "message_id": b"1700000000000-0",
                 "consumer": b"worker1:123",
                 "time_since_delivered": 400000,
                 "times_delivered": 1,
@@ -3143,6 +3273,88 @@ class TestStreamsReclaim:
         result = channel._reclaim_and_deliver("celery", 100)
 
         assert result == 1
+        channel.connection._deliver.assert_called_once()
+        delivered_message = channel.connection._deliver.call_args[0][0]
+        assert delivered_message["properties"]["delivery_tag"] == "tag-not-owned"
+        mock_ack_script.assert_not_called()
+
+    def test_reclaim_stops_delivering_once_prefetch_exhausted(self, global_keyprefix: str) -> None:
+        """Delivering stops mid claimed-batch as soon as qos.can_consume() goes false.
+
+        The remaining claimed entries are left untouched in this worker's own PEL
+        (XAUTOCLAIM's JUSTID phase already reassigned them there, without bumping
+        their delivery counts) for a later reclaim pass, instead of flooding the
+        channel past its prefetch_count (Fix round 1, FIX3).
+
+        Two ids come back from the JUSTID claim, but qos.can_consume_max_estimate()
+        reports only 1 slot of remaining prefetch capacity. That truncates the
+        survivor list to the first id before the counting XCLAIM even runs, so
+        the second id is never claimed for real and its delivery count is never
+        bumped (Fix round 2, R1: the primary defense against phantom-bumping is
+        this pre-claim truncation). The per-entry qos.can_consume() check after
+        delivering the sole survivor is still exercised as the real-time backstop.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = 1
+        channel._qos.can_consume.side_effect = [False]
+        channel.connection = MagicMock()
+        channel.connection.cycle = None
+
+        payload_json_1 = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-first",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
+        mock_client.register_script.return_value = MagicMock()
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [b"1700000000001-0", b"1700000000002-0"],
+            [],
+        ]
+        mock_client.xclaim.return_value = [(b"1700000000001-0", {b"payload": payload_json_1.encode()})]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000001-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 1,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        assert result == 1
+        # Only the first id was claimed for real; the second never reached XCLAIM
+        # at all, so it was never counted or delivered.
+        mock_client.xclaim.assert_called_once_with(
+            "stream:celery:0",
+            "celery",
+            "worker1:123",
+            min_idle_time=0,
+            message_ids=["1700000000001-0"],
+        )
         channel.connection._deliver.assert_called_once()
         delivered_message = channel.connection._deliver.call_args[0][0]
         assert delivered_message["properties"]["delivery_tag"] == "tag-first"
@@ -3162,17 +3374,16 @@ class TestStreamsReclaim:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         mock_client = MagicMock()
         mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [(b"1700000000000-0", {b"some-other-field": b"whatever"})],
-            [],
-        ]
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000000-0"], []]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"some-other-field": b"whatever"})]
         mock_client.xpending_range.return_value = []
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
@@ -3187,6 +3398,83 @@ class TestStreamsReclaim:
             keys=[f"{global_keyprefix}stream:celery:0"],
             args=["celery", "1700000000000-0", ""],
         )
+
+    def test_reclaim_malformed_payload_acks_and_skips(self, global_keyprefix: str) -> None:
+        """A claimed entry whose payload field fails to parse is acked away, never delivered.
+
+        Distinct from the missing-payload branch above: the payload field is
+        present here, but its bytes are not valid JSON, so loads() raises. Fix
+        round 2, R4: an unparseable payload must not propagate an unhandled
+        exception up to the poller and abort the whole reclaim pass for this
+        queue forever; it is treated like a missing payload instead (logged,
+        acked away, counted against budget), and the pass continues on to
+        later entries in the same batch.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
+        channel.connection = MagicMock()
+        channel.connection.cycle = None
+
+        good_payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-good",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
+        mock_ack_script = MagicMock()
+        mock_client.register_script.return_value = mock_ack_script
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [b"1700000000000-0", b"1700000000001-0"],
+            [],
+        ]
+        mock_client.xclaim.return_value = [
+            (b"1700000000000-0", {b"payload": b"not-valid-json{{{"}),
+            (b"1700000000001-0", {b"payload": good_payload_json.encode()}),
+        ]
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000001-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 1,
+            },
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        result = channel._reclaim_and_deliver("celery", 100)
+
+        # Both entries count against budget: the malformed one acked away, the
+        # well-formed one right after it still delivered normally, proving the
+        # parse failure did not abort the rest of the batch.
+        assert result == 2
+        mock_ack_script.assert_called_once_with(
+            keys=[f"{global_keyprefix}stream:celery:0"],
+            args=["celery", "1700000000000-0", ""],
+        )
+        channel.connection._deliver.assert_called_once()
+        delivered_message = channel.connection._deliver.call_args[0][0]
+        assert delivered_message["properties"]["delivery_tag"] == "tag-good"
 
     def test_reclaim_returns_immediately_when_budget_not_positive(self) -> None:
         """budget <= 0 returns 0 immediately without acquiring a connection at all."""
@@ -3372,7 +3660,9 @@ class TestStreamsPoison:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -3388,11 +3678,8 @@ class TestStreamsPoison:
         mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
-            [],
-        ]
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000000-0"], []]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": b"1700000000000-0",
@@ -3432,7 +3719,9 @@ class TestStreamsPoison:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -3448,11 +3737,8 @@ class TestStreamsPoison:
         mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
-            [],
-        ]
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000000-0"], []]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": b"1700000000000-0",
@@ -3496,7 +3782,9 @@ class TestStreamsPoison:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -3512,11 +3800,8 @@ class TestStreamsPoison:
         mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
-            [],
-        ]
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000000-0"], []]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": b"1700000000000-0",
@@ -3551,7 +3836,9 @@ class TestStreamsPoison:
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
         channel._qos = MagicMock()
         channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
         channel.connection = MagicMock()
+        channel.connection.cycle = None
 
         payload_json = json_dumps(
             {
@@ -3567,11 +3854,8 @@ class TestStreamsPoison:
         mock_client.time.return_value = (1700000100, 0)
         mock_ack_script = MagicMock()
         mock_client.register_script.return_value = mock_ack_script
-        mock_client.xautoclaim.return_value = [
-            b"0-0",
-            [(b"1700000000000-0", {b"payload": payload_json.encode()})],
-            [],
-        ]
+        mock_client.xautoclaim.return_value = [b"0-0", [b"1700000000000-0"], []]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
         mock_client.xpending_range.return_value = [
             {
                 "message_id": b"1700000000000-0",

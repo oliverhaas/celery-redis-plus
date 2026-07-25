@@ -817,39 +817,83 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
 
         if moved >= limit:
             logger.warning(
-                "Queue %s hit delayed move batch limit of %d. There may be more messages waiting.",
+                "Queue %s moved the maximum of %d delayed messages allowed this pass "
+                "(the shared per-cycle requeue budget, or DEFAULT_REQUEUE_BATCH_LIMIT "
+                "when called outside the requeue cycle). There may be more messages waiting.",
                 queue,
                 limit,
             )
         return moved
 
+    def _own_in_flight_message_ids(self, stream_key: str) -> set[str]:
+        """Stream message ids already in-flight for stream_key, across this process.
+
+        consumer_name is derived per process (see the property's docstring),
+        so every consuming channel in this process shares one Redis consumer
+        identity even though each channel keeps its own QoS instance and its
+        own ``_in_flight`` table. Checking only this channel's table would let
+        channel A's reclaim pass steal and re-deliver channel B's live
+        message. This collects this channel's own in-flight ids plus those of
+        every sibling channel reachable through the connection's cycle
+        (MultiChannelPoller) that shares this channel's consumer_name, and
+        falls back to just this channel's own table when the cycle is
+        unreachable so a standalone channel still works.
+        """
+        cycle = getattr(self.connection, "cycle", None)
+        channels: list[Channel] = [self] if cycle is None else list(cycle._channels)
+        if self not in channels:
+            channels.append(self)
+        ids: set[str] = set()
+        for channel in channels:
+            if channel is not self and channel.consumer_name != self.consumer_name:
+                continue
+            channel_qos = cast("QoS", channel.qos) if channel.qos is not None else None
+            if channel_qos is None:
+                continue
+            ids.update(message_id for key, message_id in channel_qos._in_flight.values() if key == stream_key)
+        return ids
+
     def _reclaim_and_deliver(self, queue: str, budget: int) -> int:  # noqa: PLR0912, PLR0915
         """Reclaim messages idle past the visibility timeout and deliver them locally.
 
-        Runs an XAUTOCLAIM cursor loop over each of the queue's priority level
-        streams (highest level first). Claimed entries carry their payloads, so
-        they are delivered directly to this channel. The XAUTOCLAIM reply has no
-        delivery counts, so counts are fetched after claiming via an XPENDING
-        query bounded to the claimed ID range (an unbounded window truncates at
-        its count and this worker's own lower-ID in-flight entries would displace
-        the claimed ones); restore_count = times_delivered - 1 (the first
-        delivery is not a restore).
+        Runs a two-phase XAUTOCLAIM/XCLAIM cursor loop over each of the
+        queue's priority level streams (highest level first):
 
-        A claimed entry whose delivery tag is already in this channel's QoS
-        in-flight table is this process's OWN live message (e.g. a task still
-        running past visibility_timeout on this same, healthy worker, whose
-        idle time crossed the threshold only because Task 10's heartbeat had
-        not refreshed it in time). Such an entry is skipped entirely: not
-        acked, not redelivered, not counted against budget. It stays in this
-        worker's PEL, owned by this worker either way after XAUTOCLAIM, and
-        the in-process consumer that already holds it finishes normally.
+        1. ``XAUTOCLAIM ... JUSTID`` transfers ownership and resets idle time
+           for entries idle past visibility_timeout, without touching their
+           delivery count. This is safe to run over every idle entry: an id
+           this pass ends up not taking simply waits in this consumer's PEL
+           for a later pass.
+        2. The claimed ids are filtered: ids already in-flight somewhere in
+           this process (see _own_in_flight_message_ids) are dropped, then
+           the remainder is truncated to the smaller of the remaining budget
+           and the channel's remaining QoS prefetch capacity
+           (qos.can_consume_max_estimate(); unbounded prefetch skips this
+           axis). Only the survivors are claimed for real.
+        3. ``XCLAIM`` (min_idle_time=0, since JUSTID already reset idle to 0)
+           claims exactly the survivors, fetching their payloads and bumping
+           their delivery count exactly once each. An id can still vanish
+           from the stream between steps 1 and 3 (concurrent XDEL/trim);
+           XCLAIM simply omits it rather than returning a placeholder, so the
+           reply may legitimately be shorter than the survivor list.
+
+        This keeps delivery counts honest: an entry this pass skips or never
+        delivers (own in-flight, or filtered out for lack of budget/prefetch
+        capacity) never reaches XCLAIM, so its counter is never bumped.
+        Delivery counts themselves are fetched via an XPENDING query bounded
+        to the claimed ID range (an unbounded window truncates at its count
+        and this worker's own lower-ID in-flight entries would displace the
+        claimed ones); restore_count = times_delivered - 1 (the first
+        delivery is not a restore).
 
         Messages exceeding max_restore_count are dropped, optionally copied to
         dead_letter_stream first. Messages older than the effective
         x-message-ttl are acked and skipped; the cutoff is computed from the
-        server's clock (read once per call via TIME), never the caller's,
-        so a worker clock running ahead of the server cannot delete
-        un-expired messages.
+        server's clock (read once per call via TIME, and only when a TTL is
+        actually configured), never the caller's, so a worker clock running
+        ahead of the server cannot delete un-expired messages. A payload that
+        fails to parse is treated the same as a missing payload: logged,
+        acked away so it cannot loop forever, and counted against budget.
 
         Actual deliveries respect the channel's QoS prefetch_count: once
         qos.can_consume() goes false (checked right after each delivery) the
@@ -870,9 +914,10 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             budget: Maximum number of claimed entries to process.
 
         Returns:
-            Number of claimed entries processed (delivered or dropped); a
-            claimed entry recognized as this worker's own in-flight message
-            is not counted.
+            Number of claimed entries processed (delivered or dropped); an
+            entry recognized as already in-flight somewhere in this process,
+            or left unclaimed for lack of budget/prefetch capacity, is not
+            counted.
         """
         if budget <= 0:
             return 0
@@ -890,27 +935,31 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
 
         processed = 0
         prefetch_exhausted = False
+        now_ms = 0
         with self.conn_or_acquire() as client:
             ack_script = client.register_script(_STREAMS_ACK_LUA)
-            # Current time comes from the server (TIME), read once per call,
-            # never the caller's clock: a worker clock ahead of the server
-            # would otherwise delete un-expired messages every reclaim cycle.
-            server_seconds, server_micros = client.time()
-            now_ms = int(server_seconds) * 1000 + int(server_micros) // 1000
+            if ttl_ms > 0:
+                # Current time comes from the server (TIME), read once per
+                # call, never the caller's clock: a worker clock ahead of the
+                # server would otherwise delete un-expired messages every
+                # reclaim cycle. Only fetched when a TTL is actually in play.
+                server_seconds, server_micros = client.time()
+                now_ms = int(server_seconds) * 1000 + int(server_micros) // 1000
             for stream_key in self._stream_keys_for_queue(queue):
                 cursor = "0-0"
                 while processed < budget and not prefetch_exhausted:
-                    xautoclaim_kwargs: dict[str, Any] = {
+                    claim_kwargs: dict[str, Any] = {
                         "min_idle_time": min_idle_ms,
                         "start_id": cursor,
                         "count": min(budget - processed, 100),
+                        "justid": True,
                     }
                     try:
                         result = client.xautoclaim(
                             stream_key,
                             self.consumer_group,
                             self.consumer_name,
-                            **xautoclaim_kwargs,
+                            **claim_kwargs,
                         )
                     except self.ResponseError as exc:
                         if "NOGROUP" not in str(exc):
@@ -924,10 +973,10 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             stream_key,
                             self.consumer_group,
                             self.consumer_name,
-                            **xautoclaim_kwargs,
+                            **claim_kwargs,
                         )
                     cursor = bytes_to_str(result[0])
-                    claimed = result[1]
+                    claimed_ids = [bytes_to_str(message_id) for message_id in result[1]]
                     # Redis 7.0+ adds a third reply element: ids deleted from the stream
                     # while still pending. They carry no payload; never treat them as work.
                     deleted_ids = result[2] if len(result) > 2 else []  # noqa: PLR2004
@@ -937,30 +986,59 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             stream_key,
                             len(deleted_ids),
                         )
-                    if not claimed:
+                    if not claimed_ids:
                         if cursor == "0-0":
                             break
                         continue
 
+                    # Own-in-flight ids are dropped before the counting claim below so
+                    # their delivery counter is never bumped; the remainder is capped to
+                    # the smaller of the remaining budget and prefetch capacity for the
+                    # same reason (an id we cannot deliver this pass should not look
+                    # delivered either). can_consume_max_estimate() is None when
+                    # prefetch_count is unbounded, so that axis is skipped entirely.
+                    own_ids = self._own_in_flight_message_ids(stream_key)
+                    survivor_ids = [message_id for message_id in claimed_ids if message_id not in own_ids]
+                    capacity = qos.can_consume_max_estimate() if qos is not None else None
+                    remaining_budget = budget - processed
+                    take = remaining_budget if capacity is None else min(remaining_budget, capacity)
+                    survivor_ids = survivor_ids[: max(take, 0)]
+                    if not survivor_ids:
+                        if cursor == "0-0":
+                            break
+                        continue
+
+                    # Prefix key since EVALSHA doesn't auto-prefix KEYS
+                    prefixed_stream = f"{self.global_keyprefix}{stream_key}"
+                    # min_idle_time=0: JUSTID above already reset idle to 0 for these
+                    # ids, and this is the claim that counts, bumping times_delivered
+                    # exactly once for each survivor.
+                    claimed = client.xclaim(
+                        stream_key,
+                        self.consumer_group,
+                        self.consumer_name,
+                        min_idle_time=0,
+                        message_ids=survivor_ids,
+                    )
+
                     # Delivery counts come from XPENDING, bounded to the claimed ID range:
                     # an unbounded window truncates at its count, letting this worker's own
-                    # lower-ID entries displace the claimed ones and zero their restore counts.
+                    # lower-ID in-flight entries displace the claimed ones and zero their
+                    # restore counts.
                     pending = client.xpending_range(
                         stream_key,
                         self.consumer_group,
-                        min=bytes_to_str(claimed[0][0]),
-                        max=bytes_to_str(claimed[-1][0]),
+                        min=survivor_ids[0],
+                        max=survivor_ids[-1],
                         # Generous headroom: own in-flight entries can still interleave
                         # inside the claimed range, and per-call claims are capped at 100
-                        count=len(claimed) + 1000,
+                        count=len(survivor_ids) + 1000,
                         consumername=self.consumer_name,
                     )
                     times_delivered = {
                         bytes_to_str(entry["message_id"]): int(entry["times_delivered"]) for entry in pending
                     }
 
-                    # Prefix key since EVALSHA doesn't auto-prefix KEYS
-                    prefixed_stream = f"{self.global_keyprefix}{stream_key}"
                     for message_id, fields in claimed:
                         if prefetch_exhausted:
                             break
@@ -972,11 +1050,19 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id_str, ""])
                             continue
 
-                        message: dict[str, Any] = loads(bytes_to_str(payload_field))
-                        delivery_tag = message["properties"]["delivery_tag"]
-                        if qos is not None and delivery_tag in qos._in_flight:
-                            # This process's own live message (see docstring): leave the
-                            # PEL entry untouched, do not count it against the budget.
+                        try:
+                            message: dict[str, Any] = loads(bytes_to_str(payload_field))
+                            delivery_tag = message["properties"]["delivery_tag"]
+                        except (ValueError, TypeError, KeyError):
+                            # Unparseable payload: ack it away so one bad entry cannot
+                            # stall every reclaim pass for this queue forever
+                            logger.warning(
+                                "Stream %s: claimed entry %s has an unparseable payload; acking it away.",
+                                stream_key,
+                                message_id_str,
+                            )
+                            processed += 1
+                            ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id_str, ""])
                             continue
 
                         processed += 1
