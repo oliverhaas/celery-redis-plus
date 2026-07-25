@@ -901,15 +901,9 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                         )
                         continue
 
-                    # justid=True returns exactly the ids that were still
-                    # pending and had their idle clock reset. An id requested
-                    # but absent from the reply is no longer in the PEL
-                    # (already acked through another path, or its stream
-                    # entry was deleted): observability only, logged below.
-                    # Do NOT prune _in_flight from this reply: _in_flight is
-                    # what the ack path resolves a delivery tag through, and
-                    # the local task for a "missing" id may still be
-                    # executing, so dropping it here would break its ack.
+                    # An id absent from the justid reply is no longer in the PEL. Log only:
+                    # _in_flight is what the ack path resolves a delivery tag through, and a
+                    # "missing" id may still be executing locally, so pruning breaks its ack.
                     refreshed_ids = {bytes_to_str(entry_id) for entry_id in refreshed}
                     missing = [message_id for message_id in message_ids if message_id not in refreshed_ids]
                     if missing:
