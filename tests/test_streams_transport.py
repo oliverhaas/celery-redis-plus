@@ -5041,6 +5041,113 @@ class TestStreamsShutdownRestore:
 
         assert mock_client.xclaim.call_count == 1
 
+    def test_restore_unacked_once_contains_connection_acquire_failure(self) -> None:
+        """M1: a conn_or_acquire() failure must not escape restore_unacked_once.
+
+        restore_unacked_once runs inside Channel.close(), which has already
+        set self.closed = True; an uncaught exception here would abort the
+        rest of that close and leak any later channels in the same
+        close_connection loop. Since nothing could be released, _in_flight
+        must stay untouched (a peer will reclaim it after the visibility
+        timeout, same as any other unreleased in-flight message).
+        """
+        qos, mock_channel, _mock_client = self._make_qos()
+        qos._in_flight = {"tag1": ("stream:celery:0", "1111-0")}
+        mock_channel.conn_or_acquire.side_effect = RuntimeError("connection refused")
+
+        with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=None):
+            qos.restore_unacked_once()  # Must not raise
+
+        assert qos._in_flight == {"tag1": ("stream:celery:0", "1111-0")}
+        assert qos._delivered.restored is True
+
+    def test_restore_unacked_once_partial_xclaim_failure_keeps_failed_entries(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """M2/M3: one stream's XCLAIM failure does not block others, and only
+
+        the entries that were actually released are cleared from _in_flight;
+        the failed stream's entry survives for a later reclaim pass, and the
+        summary log reports the real success count, not the pre-failure total.
+        """
+        qos, _mock_channel, mock_client = self._make_qos()
+        qos._in_flight = {
+            "tag1": ("stream:celery:9", "1111-0"),
+            "tag2": ("stream:other:0", "2222-0"),
+        }
+        mock_client.xclaim.side_effect = [RuntimeError("boom"), None]
+
+        with (
+            patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=None),
+            caplog.at_level(logging.INFO, logger="celery_redis_plus.streams"),
+        ):
+            qos.restore_unacked_once()
+
+        assert mock_client.xclaim.call_count == 2
+        # stream:celery:9 failed and keeps its entry; stream:other:0 succeeded
+        # and is cleared.
+        assert qos._in_flight == {"tag1": ("stream:celery:9", "1111-0")}
+        assert "Released 1 in-flight message" in caplog.text
+        assert "Failed to release in-flight messages on stream:celery:9" in caplog.text
+
+
+@pytest.mark.unit
+class TestStreamsCollectVsClose:
+    """Connection.collect() (a lost-connection reconnect) must release broker
+
+    resources without running the QoS restore path; Connection.close() (a
+    genuine shutdown) still must run it. Both transports share the same
+    _collect/_collect_transport/_release_channel_on_collect implementation
+    in transport.py; this class exercises the streams Transport/Channel
+    wiring specifically.
+    """
+
+    def _make_bare_channel(self) -> tuple[Channel, MagicMock]:
+        channel = object.__new__(Channel)
+        channel._in_poll = None
+        channel._in_fanout_poll = None
+        channel.closed = False
+        channel._fanout_queues = []
+        channel._consumers = []
+        channel._cycle = None
+        channel._pool = None
+        channel._async_pool = None
+        channel.exchange_types = None
+        channel.connection = MagicMock()
+        channel.ResponseError = _client_exceptions.ResponseError
+        mock_qos = MagicMock()
+        channel._qos = mock_qos
+        return channel, mock_qos
+
+    def test_collect_releases_channels_without_restoring(self) -> None:
+        """Transport._collect releases channels without calling restore_unacked_once."""
+        transport = object.__new__(Transport)
+        transport.cycle = MagicMock()
+        channel, mock_qos = self._make_bare_channel()
+        transport._avail_channels = [channel]
+        transport.channels = []
+
+        transport._collect(connection=MagicMock())
+
+        mock_qos.restore_unacked_once.assert_not_called()
+        mock_qos._on_collect.cancel.assert_called_once()
+        assert channel.closed is True
+        transport.cycle.close.assert_called_once()
+
+    def test_close_channel_still_restores_unacked(self) -> None:
+        """A real Channel.close() (genuine shutdown) still calls restore_unacked_once.
+
+        Regression guard: proves the collect-time fix did not also make the
+        normal close path skip the restore.
+        """
+        channel, mock_qos = self._make_bare_channel()
+
+        channel.close()
+
+        mock_qos.restore_unacked_once.assert_called_once()
+        assert channel.closed is True
+
 
 @pytest.mark.integration
 class TestStreamsShutdownRestoreIntegration:
@@ -5061,9 +5168,14 @@ class TestStreamsShutdownRestoreIntegration:
         """The graceful shutdown release lets a peer reclaim the message immediately.
 
         Sequence: publish and consume via one channel ("producer-worker") so
-        the entry sits in its PEL, call restore_unacked_once() (no worker
-        pool registered for this connection, so it goes straight to the
-        XCLAIM IDLE release), then read XPENDING directly to confirm the
+        the entry sits in its PEL, then call the real producer_channel.close()
+        (the production path: a Consumer bootstep closing its channel while
+        the message is still in flight), not restore_unacked_once() directly.
+        close() runs _disconnect_pools()/_close_clients() (tearing down the
+        channel's pool, so channel._pool is None) before virtual.Channel.close()
+        reaches QoS.restore_unacked_once(), so this also proves
+        conn_or_acquire() lazily rebuilds a pool at release time rather than
+        assuming one is still live. Then read XPENDING directly to confirm the
         entry's idle time is now far above visibility_timeout while
         times_delivered is untouched by the release itself, then confirm a
         second channel's reclaim pass picks the entry up right away, well
@@ -5115,18 +5227,30 @@ class TestStreamsShutdownRestoreIntegration:
             producer_qos = cast("QoS", producer_channel.qos)
             stream_key, _message_id = producer_qos._in_flight["tag-integration-shutdown"]
 
+            reclaimer_channel = cast("Channel", reclaimer_conn.channel())
+            delivered: list[Any] = []
+            reclaimer_channel.basic_consume(
+                queue,
+                no_ack=False,
+                callback=delivered.append,
+                consumer_tag="reclaimer-ctag",
+            )
+
             # No real Celery worker pool is registered for this connection;
             # patching just skips the executor-wait branch (covered by unit
             # tests) so this test isolates the XCLAIM IDLE release itself.
+            # close(), not restore_unacked_once() directly: exercises the
+            # real production shutdown path (see docstring).
             with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=None):
-                producer_qos.restore_unacked_once()
+                producer_channel.close()
 
+            assert producer_channel.closed is True
             assert producer_qos._in_flight == {}
 
-            with producer_channel.conn_or_acquire() as client:
+            with reclaimer_channel.conn_or_acquire() as client:
                 pending_after = client.xpending_range(
                     stream_key,
-                    producer_channel.consumer_group,
+                    reclaimer_channel.consumer_group,
                     min="-",
                     max="+",
                     count=10,
@@ -5138,15 +5262,6 @@ class TestStreamsShutdownRestoreIntegration:
             # The release itself never bumps times_delivered: still 1, the
             # count from the original XREADGROUP delivery.
             assert int(entry["times_delivered"]) == 1
-
-            reclaimer_channel = cast("Channel", reclaimer_conn.channel())
-            delivered: list[Any] = []
-            reclaimer_channel.basic_consume(
-                queue,
-                no_ack=False,
-                callback=delivered.append,
-                consumer_tag="reclaimer-ctag",
-            )
 
             start = time.monotonic()
             processed = reclaimer_channel._reclaim_and_deliver(queue, budget=10)
@@ -5162,3 +5277,102 @@ class TestStreamsShutdownRestoreIntegration:
         # the pickup came from the artificial idle release, not from
         # visibility_timeout naturally elapsing.
         assert elapsed < visibility_timeout / 2
+
+    def test_connection_collect_does_not_release_pel_or_shutdown_executor(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Connection.collect() must not touch in-flight PEL entries or the executor.
+
+        collect() is kombu's reconnect-cleanup escape hatch (celery calls it from
+        on_connection_error_after_connected after a lost broker connection, not
+        on a genuine shutdown), so this drives the real Connection.collect(),
+        not Transport._collect directly, to prove kombu's dispatch actually
+        finds and calls our _collect hook. A worker pool is registered for
+        this connection so a stray executor.shutdown() would be observable;
+        the PEL entry must be left exactly as XREADGROUP delivered it, for a
+        peer to reclaim only after the visibility timeout naturally elapses,
+        same as any other unreleased in-flight message.
+
+        kombu's Connection.collect() severs the transport from its owning
+        Connection unconditionally (Connection._do_close_transport sets
+        transport.client = None even when a _collect hook handled the
+        channels), so producer_conn/producer_channel are unusable for
+        anything afterward, by kombu's own design, not because of a defect
+        here. The post-collect state is inspected through a separate,
+        independent connection instead, exactly as a peer reclaiming after a
+        real lost connection would.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "collect-integration-queue"
+        visibility_timeout = 20.0
+
+        producer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "producer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        inspector_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "inspector-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        try:
+            producer_channel = cast("Channel", producer_conn.channel())
+            inspector_channel = cast("Channel", inspector_conn.channel())
+
+            message = {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-integration-collect",
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                },
+            }
+            producer_channel._put(queue, message)
+            consumed = producer_channel._get(queue)
+            assert consumed["properties"]["delivery_tag"] == "tag-integration-collect"
+
+            producer_qos = cast("QoS", producer_channel.qos)
+            in_flight_before = dict(producer_qos._in_flight)
+            stream_key, _message_id = in_flight_before["tag-integration-collect"]
+
+            mock_executor = MagicMock()
+            mock_pool = MagicMock()
+            mock_pool.executor = mock_executor
+
+            with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=mock_pool):
+                producer_conn.collect()
+
+            mock_executor.shutdown.assert_not_called()
+            # The message is still owned by this worker: metadata untouched.
+            assert producer_qos._in_flight == in_flight_before
+
+            with inspector_channel.conn_or_acquire() as client:
+                pending_after = client.xpending_range(
+                    stream_key,
+                    inspector_channel.consumer_group,
+                    min="-",
+                    max="+",
+                    count=10,
+                )
+            assert len(pending_after) == 1
+            entry = pending_after[0]
+            # Idle time is small (a fraction of a second since XREADGROUP),
+            # nowhere near the artificial SHUTDOWN_IDLE_MS a release would set.
+            assert entry["time_since_delivered"] < SHUTDOWN_IDLE_MS
+            assert int(entry["times_delivered"]) == 1
+        finally:
+            producer_conn.close()
+            inspector_conn.close()

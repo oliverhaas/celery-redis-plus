@@ -109,6 +109,7 @@ from .transport import (
     _channel_errors,
     _client_exceptions,
     _client_lib_name,
+    _collect_transport,
     _connection_errors,
     _drain_hub_callbacks,
     _get_worker_pool_for_channel,
@@ -284,34 +285,56 @@ class QoS(virtual.QoS):
 
         try:
             if self._in_flight:
-                by_stream: dict[str, list[str]] = {}
-                for stream_key, message_id in self._in_flight.values():
-                    by_stream.setdefault(stream_key, []).append(message_id)
-                with self.channel.conn_or_acquire() as client:
-                    for stream_key, message_ids in by_stream.items():
-                        try:
-                            # Release only; the peer's reclaim redelivery bumps times_delivered by one.
-                            client.xclaim(
-                                stream_key,
-                                self.channel.consumer_group,
-                                self.channel.consumer_name,
-                                0,
-                                message_ids,
-                                idle=SHUTDOWN_IDLE_MS,
-                                justid=True,
-                            )
-                        except Exception:
-                            logger.warning(
-                                "Failed to release in-flight messages on %s for instant reclaim;"
-                                " peers will reclaim them after the visibility timeout",
-                                stream_key,
-                                exc_info=True,
-                            )
-                logger.info(
-                    "Released %d in-flight message(s) for instant reclaim by peers",
-                    len(self._in_flight),
-                )
-                self._in_flight.clear()
+                by_stream: dict[str, list[tuple[str, str]]] = {}
+                for delivery_tag, (stream_key, message_id) in self._in_flight.items():
+                    by_stream.setdefault(stream_key, []).append((delivery_tag, message_id))
+
+                released_tags: list[str] = []
+                try:
+                    with self.channel.conn_or_acquire() as client:
+                        for stream_key, entries in by_stream.items():
+                            message_ids = [message_id for _, message_id in entries]
+                            try:
+                                # Release only; the peer's reclaim redelivery bumps times_delivered by one.
+                                client.xclaim(
+                                    stream_key,
+                                    self.channel.consumer_group,
+                                    self.channel.consumer_name,
+                                    0,
+                                    message_ids,
+                                    idle=SHUTDOWN_IDLE_MS,
+                                    justid=True,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "Failed to release in-flight messages on %s for instant reclaim;"
+                                    " peers will reclaim them after the visibility timeout",
+                                    stream_key,
+                                    exc_info=True,
+                                )
+                            else:
+                                released_tags.extend(tag for tag, _ in entries)
+                except Exception:
+                    # Could not even acquire a connection (e.g. the pool this
+                    # channel just tore down during close() failed to
+                    # reconnect): nothing was released, so _in_flight must
+                    # stay untouched and this must not escape restore_unacked_once
+                    # (it runs inside Channel.close(), which has already set
+                    # self.closed = True; an exception here would abort the
+                    # rest of that close and any later channels' closing).
+                    logger.warning(
+                        "Could not acquire a connection to release in-flight messages for instant"
+                        " reclaim; peers will reclaim them after the visibility timeout",
+                        exc_info=True,
+                    )
+
+                if released_tags:
+                    logger.info(
+                        "Released %d in-flight message(s) for instant reclaim by peers",
+                        len(released_tags),
+                    )
+                    for tag in released_tags:
+                        del self._in_flight[tag]
         finally:
             state.restored = True  # type: ignore[attr-defined]  # ty: ignore[invalid-assignment]
 
@@ -1837,6 +1860,21 @@ class Transport(virtual.Transport):
 
     def driver_version(self) -> str:
         return client_lib.__version__
+
+    def _collect(self, connection: Connection) -> None:
+        """Release channels for a lost connection, without restoring in-flight messages.
+
+        kombu's ``Connection.collect()`` calls this instead of the normal
+        ``close_connection``/``Channel.close`` path (the one a real
+        ``Connection.close()`` uses) whenever a transport defines it. A collect
+        means the broker connection was lost and celery is about to reconnect,
+        not that the application asked to shut down, so this must never trigger
+        QoS.restore_unacked_once(): a still-in-flight PEL entry stays owned by
+        this worker and peers will pick it up on their own via the reclaim
+        pass once the visibility timeout expires, same as any other in-flight
+        message, if this process never reconnects.
+        """
+        _collect_transport(self)
 
     def register_with_event_loop(self, connection: Connection, loop: Any) -> None:
         cycle = self.cycle
