@@ -4256,3 +4256,138 @@ class TestStreamsReclaimIntegration:
         delivered_message = delivered[0]
         assert delivered_message.delivery_tag == "tag-integration-reclaim"
         assert delivered_message.properties["headers"]["x-restore-count"] == 1
+
+
+@pytest.mark.unit
+class TestStreamsHeartbeat:
+    """Unit tests for the XCLAIM JUSTID heartbeat that keeps in-flight messages alive."""
+
+    def test_heartbeat_batches_ids_per_stream(self) -> None:
+        """Test that _heartbeat groups in-flight message ids by stream, one XCLAIM per stream."""
+        channel = object.__new__(Channel)
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {
+            "tag1": ("stream:celery:9", "1111-0"),
+            "tag2": ("stream:celery:9", "2222-0"),
+            "tag3": ("stream:celery:0", "3333-0"),
+        }
+        channel._qos = mock_qos
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+        ):
+            channel._heartbeat()
+
+        assert mock_client.xclaim.call_count == 2
+        mock_client.xclaim.assert_any_call(
+            "stream:celery:9",
+            "celery",
+            "worker-1",
+            0,
+            ["1111-0", "2222-0"],
+            justid=True,
+        )
+        mock_client.xclaim.assert_any_call("stream:celery:0", "celery", "worker-1", 0, ["3333-0"], justid=True)
+
+    def test_heartbeat_uses_justid_and_zero_idle(self) -> None:
+        """Test that XCLAIM is issued with min_idle_time=0 and justid=True (no delivery-count bump)."""
+        channel = object.__new__(Channel)
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {"tag1": ("stream:celery:3", "1111-0")}
+        channel._qos = mock_qos
+
+        mock_client = MagicMock()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+        ):
+            channel._heartbeat()
+
+        mock_client.xclaim.assert_called_once_with("stream:celery:3", "celery", "worker-1", 0, ["1111-0"], justid=True)
+
+    def test_heartbeat_empty_in_flight_is_noop(self) -> None:
+        """Test that _heartbeat does not touch Redis when nothing is in flight."""
+        channel = object.__new__(Channel)
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        channel.conn_or_acquire = MagicMock()
+
+        channel._heartbeat()
+
+        channel.conn_or_acquire.assert_not_called()
+
+    def test_heartbeat_swallows_errors(self) -> None:
+        """Test that connection failures are logged and swallowed so the periodic timer survives."""
+        channel = object.__new__(Channel)
+        channel.ResponseError = _client_exceptions.ResponseError
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {"tag1": ("stream:celery:0", "1111-0")}
+        channel._qos = mock_qos
+
+        mock_client = MagicMock()
+        mock_client.xclaim.side_effect = ConnectionError("connection lost")
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+            patch("celery_redis_plus.streams.logger") as mock_logger,
+        ):
+            channel._heartbeat()  # Must not raise
+
+        mock_logger.warning.assert_called_once()
+
+    def test_heartbeat_nogroup_invalidates_stream_and_continues(self) -> None:
+        """Test a NOGROUP on one stream drops its cached ensure while other streams still heartbeat."""
+        channel = object.__new__(Channel)
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel._ensured_groups = {"stream:celery:9", "stream:celery:0"}
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {
+            "tag1": ("stream:celery:9", "1111-0"),
+            "tag2": ("stream:celery:0", "2222-0"),
+        }
+        channel._qos = mock_qos
+
+        mock_client = MagicMock()
+
+        def _xclaim(stream_key: str, *args: object, **kwargs: object) -> list[object]:
+            if stream_key == "stream:celery:9":
+                # The stream (and its group, PEL included) was deleted out of band
+                raise _client_exceptions.ResponseError(
+                    "NOGROUP No such key 'stream:celery:9' or consumer group 'celery'",
+                )
+            return []
+
+        mock_client.xclaim.side_effect = _xclaim
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+        ):
+            channel._heartbeat()  # Must not raise
+
+        # The dead stream's cache entry is dropped so the next consume pass
+        # re-creates the group; the healthy stream was still heartbeated
+        assert channel._ensured_groups == {"stream:celery:0"}
+        assert mock_client.xclaim.call_count == 2

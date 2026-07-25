@@ -827,6 +827,57 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             )
         return moved
 
+    def _heartbeat(self) -> None:
+        """Reset the PEL idle clock on all in-flight messages.
+
+        Groups the QoS in-flight map by stream and issues one XCLAIM per
+        stream with min_idle_time=0 and justid=True. JUSTID resets the idle
+        time without bumping the delivery count or transferring payloads, so
+        a long-running task never counts toward the poison cap and its entry
+        is never reclaimed by a peer while this worker is alive.
+
+        A NOGROUP on one stream means that stream (and its group, PEL
+        included) was deleted out of band; there is nothing left to keep
+        alive there, so its cached ensure is dropped (the next consume
+        pass re-creates the group) and the remaining streams are still
+        heartbeated. Other errors are logged and swallowed so the
+        periodic heartbeat timer survives transient connection failures.
+        """
+        qos = self.qos
+        if qos is None:
+            return
+        in_flight = cast("QoS", qos)._in_flight
+        if not in_flight:
+            return
+
+        # One XCLAIM per stream: batch all message ids belonging to it
+        ids_by_stream: dict[str, list[str]] = {}
+        for stream_key, message_id in in_flight.values():
+            ids_by_stream.setdefault(stream_key, []).append(message_id)
+
+        # Stream keys in _in_flight are unprefixed; the prefixed client handles
+        # global_keyprefix (XCLAIM is in PREFIXED_SIMPLE_COMMANDS).
+        try:
+            with self.conn_or_acquire() as client:
+                for stream_key, message_ids in ids_by_stream.items():
+                    try:
+                        client.xclaim(
+                            stream_key,
+                            self.consumer_group,
+                            self.consumer_name,
+                            0,
+                            message_ids,
+                            justid=True,
+                        )
+                    except self.ResponseError as exc:
+                        if "NOGROUP" not in str(exc):
+                            raise
+                        # Stream deleted out of band: drop the cached ensure
+                        # and keep heartbeating the other streams
+                        self._ensured_groups.discard(stream_key)
+        except Exception:
+            logger.warning("Failed to heartbeat in-flight messages, will retry next cycle", exc_info=True)
+
     def _own_in_flight_message_ids(self, stream_key: str) -> set[str]:
         """Stream message ids already in-flight for stream_key, across this process.
 
