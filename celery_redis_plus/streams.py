@@ -61,6 +61,7 @@ import numbers
 import os
 import socket as socket_module
 from contextlib import contextmanager, suppress
+from pathlib import Path
 from queue import Empty
 from time import time
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -108,6 +109,10 @@ if TYPE_CHECKING:
     from kombu import Connection
 
 logger = logging.getLogger(__name__)
+
+# Load Lua scripts at module init
+_PACKAGE_DIR = Path(__file__).parent
+_STREAMS_CONSUME_LUA = (_PACKAGE_DIR / "streams_consume.lua").read_text()
 
 
 def priority_to_level(priority: int, steps: Sequence[int]) -> int:

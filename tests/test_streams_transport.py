@@ -6,6 +6,7 @@ import os
 import socket
 import time
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,7 @@ from kombu.transport import TRANSPORT_ALIASES, get_transport_cls
 from kombu.utils.json import dumps as json_dumps
 from vine import promise
 
+import celery_redis_plus
 from celery_redis_plus import signals
 from celery_redis_plus.constants import (
     CONSUMER_IDLE_CLEANUP_FACTOR,
@@ -26,6 +28,7 @@ from celery_redis_plus.constants import (
     STREAM_KEY_PREFIX,
 )
 from celery_redis_plus.streams import (
+    _STREAMS_CONSUME_LUA,
     Channel,
     MultiChannelPoller,
     QoS,
@@ -1016,3 +1019,29 @@ class TestStreamsInvalidateGroup:
 
         assert channel._ensured_groups == set()
         channel._stream_keys_for_queue.assert_not_called()
+
+
+@pytest.mark.unit
+class TestStreamsConsumeLua:
+    """Tests for the streams_consume.lua script file and its module-level loading."""
+
+    def test_script_file_loaded_at_import(self) -> None:
+        """Test that streams_consume.lua exists in the package and is loaded into _STREAMS_CONSUME_LUA."""
+        script_path = Path(celery_redis_plus.__file__).parent / "streams_consume.lua"
+        assert script_path.is_file()
+        assert script_path.read_text() == _STREAMS_CONSUME_LUA
+        assert _STREAMS_CONSUME_LUA.strip()
+
+    def test_script_consumes_via_xreadgroup(self) -> None:
+        """Test that the script reads new entries via XREADGROUP (atomic deliver + PEL register)."""
+        assert "XREADGROUP" in _STREAMS_CONSUME_LUA
+        assert "'>'" in _STREAMS_CONSUME_LUA
+
+    def test_script_lazy_drops_expired_entries_with_xack_xdel(self) -> None:
+        """Test that expired entries (x-message-ttl) are dropped inside the script via XACK + XDEL."""
+        assert "XACK" in _STREAMS_CONSUME_LUA
+        assert "XDEL" in _STREAMS_CONSUME_LUA
+
+    def test_script_returns_false_when_all_streams_empty(self) -> None:
+        """Test that the script falls through to `return false` (nil to redis-py) on total miss."""
+        assert _STREAMS_CONSUME_LUA.rstrip().endswith("return false")
