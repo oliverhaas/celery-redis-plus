@@ -1552,13 +1552,9 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                                 keys=[prefixed_stream_key],
                                 args=[self.consumer_group, self.consumer_name, idle_threshold_ms],
                             )
-                            # A missing stream or group is a silent no-op (empty
-                            # list). Any other XINFO failure comes back as
-                            # [-1, message] instead (see the script), which is
-                            # otherwise unobservable since the write itself
-                            # never raises for that case. Ordinary replies are
-                            # lists of consumer names, so only an integer first
-                            # element can be the sentinel; matching the shape
+                            # Ordinary replies are lists of consumer names, so
+                            # only an integer first element can be the script's
+                            # [-1, message] failure sentinel. Matching the shape
                             # rather than indexing also excludes bytes, which
                             # would otherwise index to an int.
                             match result:
