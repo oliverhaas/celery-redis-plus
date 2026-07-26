@@ -798,11 +798,6 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         # Queues already reported as hitting the delayed-move limit (warn-once)
         self._warned_delayed_limit: set[str] = set()
 
-        # A dead-letter stream inside the transport's own stream namespace can
-        # be a queue's level stream, and a poisoned message copied back into
-        # the queue it was just dropped from is immortal: it is redelivered,
-        # exceeds the restore cap again, and is copied again, forever. Reject
-        # at setup rather than discover it in production.
         if self.dead_letter_stream is not None and str(self.dead_letter_stream).startswith(STREAM_KEY_PREFIX):
             message = (
                 f"dead_letter_stream {self.dead_letter_stream!r} must not start with "
