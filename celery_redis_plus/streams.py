@@ -906,6 +906,47 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             results = pipe.execute()
         return sum(int(count) for count in results)
 
+    def _purge(self, queue: str) -> int:
+        """Delete all messages from a queue: level streams and the delayed zset.
+
+        Consumer groups die with their stream and are recreated lazily on next
+        use, so the cached group entries for this queue are dropped as well.
+        """
+        stream_keys = self._stream_keys_for_queue(queue)
+        delayed_key = self._delayed_key(queue)
+        with self.conn_or_acquire() as client:
+            with client.pipeline() as pipe:
+                for stream_key in stream_keys:
+                    pipe.xlen(stream_key)
+                pipe.zcard(delayed_key)
+                counts = pipe.execute()
+            client.delete(*stream_keys, delayed_key)
+        for stream_key in stream_keys:
+            self._ensured_groups.discard(stream_key)
+        return sum(int(count) for count in counts)
+
+    def _delete(self, queue: str, *args: Any, **kwargs: Any) -> None:
+        # kombu calls: _delete(queue, exchange, routing_key, pattern)
+        exchange = args[0] if args else ""
+        routing_key = args[1] if len(args) > 1 else ""
+        pattern = args[2] if len(args) > 2 else ""  # noqa: PLR2004
+        self.auto_delete_queues.discard(queue)
+        had_expires = queue in self._expires
+        self._expires.pop(queue, None)
+        self._message_ttls.pop(queue, None)
+        stream_keys = self._stream_keys_for_queue(queue)
+        delayed_key = self._delayed_key(queue)
+        with self.conn_or_acquire(client=kwargs.get("client")) as client:
+            client.srem(
+                self.keyprefix_queue % (exchange,),
+                self.sep.join([routing_key or "", pattern or "", queue or ""]),
+            )
+            client.delete(*stream_keys, delayed_key)
+        for stream_key in stream_keys:
+            self._ensured_groups.discard(stream_key)
+        if had_expires:
+            self.connection.cycle._update_expires_timer()
+
     def _move_delayed(self, queue: str, limit: int = DEFAULT_REQUEUE_BATCH_LIMIT) -> int:
         """Move due delayed messages into their priority streams.
 

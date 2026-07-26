@@ -5721,3 +5721,98 @@ class TestStreamsSize:
         assert channel._size("myq") == 0
         mock_client.pipeline.assert_called_once()
         mock_pipe.zcard.assert_called_once_with("delayed:myq")
+
+
+@pytest.mark.unit
+class TestStreamsPurgeDelete:
+    """Unit tests for Channel._purge and Channel._delete."""
+
+    def _make_channel(self) -> tuple[Channel, MagicMock, MagicMock]:
+        """Build a bare channel with mocked client, pipeline, stream keys, and group cache."""
+        channel = object.__new__(Channel)
+        channel._stream_keys_for_queue = MagicMock(
+            return_value=["stream:myq:9", "stream:myq:6", "stream:myq:3", "stream:myq:0"],
+        )
+        channel._ensured_groups = {"stream:myq:9", "stream:myq:0", "stream:other:0"}
+
+        mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        return channel, mock_client, mock_pipe
+
+    def test_purge_counts_then_deletes_all_keys(self) -> None:
+        """_purge returns the pre-delete count and DELs all level streams plus the delayed zset."""
+        channel, mock_client, mock_pipe = self._make_channel()
+        mock_pipe.execute.return_value = [1, 2, 0, 3, 4]
+
+        count = channel._purge("myq")
+
+        assert count == 10
+        assert mock_pipe.xlen.call_count == 4
+        mock_pipe.zcard.assert_called_once_with("delayed:myq")
+        mock_client.delete.assert_called_once_with(
+            "stream:myq:9",
+            "stream:myq:6",
+            "stream:myq:3",
+            "stream:myq:0",
+            "delayed:myq",
+        )
+
+    def test_purge_drops_ensured_group_cache_entries(self) -> None:
+        """_purge forgets cached consumer groups for the purged queue only."""
+        channel, _mock_client, mock_pipe = self._make_channel()
+        mock_pipe.execute.return_value = [0, 0, 0, 0, 0]
+
+        channel._purge("myq")
+
+        assert channel._ensured_groups == {"stream:other:0"}
+
+    def test_delete_removes_binding_streams_and_expires_state(self) -> None:
+        """_delete removes the exchange binding, all queue keys, and per-queue TTL state."""
+        channel, mock_client, _mock_pipe = self._make_channel()
+        channel.auto_delete_queues = {"myq"}
+        channel._expires = {"myq": 20000}
+        channel._message_ttls = {"myq": 5000}
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+        channel.connection = MagicMock()
+
+        channel._delete("myq", "myexchange", "rkey", "")
+
+        mock_client.srem.assert_called_once_with(
+            "_kombu.binding.myexchange",
+            "rkey\x06\x16\x06\x16myq",
+        )
+        mock_client.delete.assert_called_once_with(
+            "stream:myq:9",
+            "stream:myq:6",
+            "stream:myq:3",
+            "stream:myq:0",
+            "delayed:myq",
+        )
+        assert channel._expires == {}
+        assert channel._message_ttls == {}
+        assert "myq" not in channel.auto_delete_queues
+        assert channel._ensured_groups == {"stream:other:0"}
+        channel.connection.cycle._update_expires_timer.assert_called_once()
+
+    def test_delete_without_expires_leaves_timer_alone(self) -> None:
+        """_delete does not touch the expires timer when the queue had no x-expires."""
+        channel, _mock_client, _mock_pipe = self._make_channel()
+        channel.auto_delete_queues = set()
+        channel._expires = {}
+        channel._message_ttls = {}
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+        channel.connection = MagicMock()
+
+        channel._delete("myq", "myexchange", "", "")
+
+        channel.connection.cycle._update_expires_timer.assert_not_called()
