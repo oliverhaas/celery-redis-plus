@@ -330,7 +330,6 @@ class GlobalKeyPrefixMixin:
     global_keyprefix: str = ""
 
     PREFIXED_SIMPLE_COMMANDS: ClassVar[list[str]] = [
-        "EXISTS",
         "EXPIRE",
         "HDEL",
         "HGET",
@@ -405,6 +404,7 @@ class GlobalKeyPrefixMixin:
 
     PREFIXED_COMPLEX_COMMANDS: ClassVar[dict[str, dict[str, int | None] | Callable[..., list[Any]]]] = {
         "DEL": {"args_start": 0, "args_end": None},
+        "EXISTS": {"args_start": 0, "args_end": None},
         "WATCH": {"args_start": 0, "args_end": None},
         "BZMPOP": _prefix_bzmpop_args,
         "XREAD": _prefix_xread_args,

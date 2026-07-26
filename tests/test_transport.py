@@ -247,6 +247,14 @@ class TestGlobalKeyPrefixMixin:
             "prefix_fake_key3",
         ]
 
+    def test_prefix_exists_multiple_keys(self) -> None:
+        """Test EXISTS command with multiple keys: every key must be prefixed, not just the first."""
+        mixin = GlobalKeyPrefixMixin()
+        mixin.global_keyprefix = "prefix_"
+
+        prefixed_args = mixin._prefix_args(["EXISTS", "a", "b", "c"])
+        assert prefixed_args == ["EXISTS", "prefix_a", "prefix_b", "prefix_c"]
+
     def test_prefix_xread(self) -> None:
         """Test XREAD key prefixing."""
         mixin = GlobalKeyPrefixMixin()

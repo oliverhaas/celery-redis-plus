@@ -6373,11 +6373,14 @@ class TestStreamsSizePurgeIntegration:
         global_keyprefix: str,
     ) -> None:
         """_size sums entries across priority-level streams plus the delayed
-        zset; _purge returns that same count and leaves the queue empty.
+        zset; _purge returns that same count and leaves the queue empty;
+        _has_queue reports True while a level stream or the delayed zset
+        exists and False once none of them do.
         """
         host, port, _image = redis_container
         broker_url = f"redis://{host}:{port}/0"
         queue = "size-purge-integration-queue"
+        missing_queue = "size-purge-integration-queue-never-declared"
 
         conn = Connection(
             broker_url,
@@ -6398,8 +6401,20 @@ class TestStreamsSizePurgeIntegration:
                     properties["eta"] = eta
                 return {"body": '{"task": "test"}', "properties": properties}
 
-            # Three immediate messages across three different priority streams...
+            assert channel._has_queue(missing_queue) is False
+
+            # A lone default-priority message lands in stream:{queue}:0, the
+            # LAST key _has_queue passes to EXISTS (_stream_keys_for_queue
+            # returns highest level first). Checking _has_queue here, before
+            # any higher-priority stream exists, is what actually exercises
+            # the first-key-only prefix bug (Fix round 2, N1): the
+            # higher-priority streams added below would otherwise make the
+            # first EXISTS key match regardless of whether the rest prefixed
+            # correctly, masking the bug.
             channel._put(queue, make_message("tag-p0", priority=0))
+            assert channel._has_queue(queue) is True
+
+            # Two more immediate messages across two other priority streams...
             channel._put(queue, make_message("tag-p5", priority=5))
             channel._put(queue, make_message("tag-p9", priority=9))
             # ...plus one native-delayed message staged in the delayed zset
@@ -6408,10 +6423,12 @@ class TestStreamsSizePurgeIntegration:
             channel._put(queue, make_message("tag-delayed", priority=0, eta=time.time() + 10))
 
             assert channel._size(queue) == 4
+            assert channel._has_queue(queue) is True
 
             purged = channel._purge(queue)
 
             assert purged == 4
             assert channel._size(queue) == 0
+            assert channel._has_queue(queue) is False
         finally:
             conn.close()
