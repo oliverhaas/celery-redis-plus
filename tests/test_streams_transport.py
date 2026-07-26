@@ -136,20 +136,6 @@ class TestPriorityToLevel:
 class TestStreamsPrefixMixin:
     """Tests for the stream command additions to GlobalKeyPrefixMixin."""
 
-    def test_prefix_xack(self) -> None:
-        """Test XACK key prefixing (XACK key group id [id ...])."""
-        client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
-
-        args = client._prefix_args(["XACK", "stream:celery:9", "celery", "1-0"])
-        assert args == ["XACK", "test:stream:celery:9", "celery", "1-0"]
-
-    def test_prefix_xdel(self) -> None:
-        """Test XDEL key prefixing (XDEL key id [id ...])."""
-        client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
-
-        args = client._prefix_args(["XDEL", "stream:celery:9", "1-0", "2-0"])
-        assert args == ["XDEL", "test:stream:celery:9", "1-0", "2-0"]
-
     def test_prefix_xlen(self) -> None:
         """Test XLEN key prefixing (XLEN key)."""
         client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
@@ -177,13 +163,6 @@ class TestStreamsPrefixMixin:
 
         args = client._prefix_args(["XRANGE", "stream:celery:9", "-", "+"])
         assert args == ["XRANGE", "test:stream:celery:9", "-", "+"]
-
-    def test_prefix_xtrim(self) -> None:
-        """Test XTRIM key prefixing (XTRIM key MAXLEN [~] threshold)."""
-        client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
-
-        args = client._prefix_args(["XTRIM", "dead_letters", "MAXLEN", "~", "10000"])
-        assert args == ["XTRIM", "test:dead_letters", "MAXLEN", "~", "10000"]
 
     def test_prefix_xreadgroup(self) -> None:
         """Test XREADGROUP prefixes stream keys but not group, consumer, or IDs."""
@@ -242,20 +221,6 @@ class TestStreamsPrefixMixin:
         args = client._prefix_args(["XGROUP CREATE", "stream:celery:9", "celery", "0", "MKSTREAM"])
         assert args == ["XGROUP CREATE", "test:stream:celery:9", "celery", "0", "MKSTREAM"]
 
-    def test_prefix_xgroup_delconsumer(self) -> None:
-        """Test XGROUP DELCONSUMER prefixes the key (single "XGROUP DELCONSUMER" command name)."""
-        client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
-
-        args = client._prefix_args(["XGROUP DELCONSUMER", "stream:celery:9", "celery", "worker1"])
-        assert args == ["XGROUP DELCONSUMER", "test:stream:celery:9", "celery", "worker1"]
-
-    def test_prefix_xinfo_stream(self) -> None:
-        """Test XINFO STREAM prefixes the key at args[0] (single "XINFO STREAM" command name)."""
-        client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
-
-        args = client._prefix_args(["XINFO STREAM", "stream:celery:9"])
-        assert args == ["XINFO STREAM", "test:stream:celery:9"]
-
     def test_prefix_xinfo_consumers(self) -> None:
         """Test XINFO CONSUMERS prefixes the key but not the group (single command name)."""
         client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
@@ -263,40 +228,39 @@ class TestStreamsPrefixMixin:
         args = client._prefix_args(["XINFO CONSUMERS", "stream:celery:9", "celery"])
         assert args == ["XINFO CONSUMERS", "test:stream:celery:9", "celery"]
 
-    def test_prefix_xgroup_setid(self) -> None:
-        """Test XGROUP SETID prefixes the key (single "XGROUP SETID" command name)."""
-        client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
-
-        args = client._prefix_args(["XGROUP SETID", "stream:celery:9", "celery", "0"])
-        assert args == ["XGROUP SETID", "test:stream:celery:9", "celery", "0"]
-
-    def test_prefix_xgroup_destroy(self) -> None:
-        """Test XGROUP DESTROY prefixes the key (single "XGROUP DESTROY" command name)."""
-        client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
-
-        args = client._prefix_args(["XGROUP DESTROY", "stream:celery:9", "celery"])
-        assert args == ["XGROUP DESTROY", "test:stream:celery:9", "celery"]
-
-    def test_prefix_xgroup_createconsumer(self) -> None:
-        """Test XGROUP CREATECONSUMER prefixes the key (single command name)."""
-        client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
-
-        args = client._prefix_args(["XGROUP CREATECONSUMER", "stream:celery:9", "celery", "worker1"])
-        assert args == ["XGROUP CREATECONSUMER", "test:stream:celery:9", "celery", "worker1"]
-
-    def test_prefix_xinfo_groups(self) -> None:
-        """Test XINFO GROUPS prefixes the key (single "XINFO GROUPS" command name)."""
-        client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
-
-        args = client._prefix_args(["XINFO GROUPS", "stream:celery:9"])
-        assert args == ["XINFO GROUPS", "test:stream:celery:9"]
-
     def test_no_prefix_when_empty(self) -> None:
         """Test that an empty prefix leaves stream command keys unchanged."""
         client = PrefixedStrictRedis(connection_pool=MagicMock())
 
-        args = client._prefix_args(["XACK", "stream:celery:9", "celery", "1-0"])
-        assert args == ["XACK", "stream:celery:9", "celery", "1-0"]
+        args = client._prefix_args(["XLEN", "stream:celery:9"])
+        assert args == ["XLEN", "stream:celery:9"]
+
+    def test_commands_that_only_run_inside_lua_are_not_registered(self) -> None:
+        """Test the table lists no command this codebase never issues from Python.
+
+        EVALSHA passes KEYS through untouched, so the Lua scripts never
+        consult this table; registering the commands they use is dead config
+        that reads like coverage. Task 14 dropped XAUTOCLAIM for the same
+        reason, and these were left behind.
+        """
+        lua_only = {
+            "XACK",
+            "XDEL",
+            "XGROUP DELCONSUMER",
+        }
+        never_issued = {
+            "XTRIM",
+            "XGROUP SETID",
+            "XGROUP DESTROY",
+            "XGROUP CREATECONSUMER",
+            "XINFO STREAM",
+            "XINFO GROUPS",
+            "XAUTOCLAIM",
+        }
+        registered = set(PrefixedStrictRedis.PREFIXED_SIMPLE_COMMANDS)
+        assert registered & (lua_only | never_issued) == set()
+        # The commands actually issued from Python are still registered
+        assert {"XADD", "XLEN", "XPENDING", "XCLAIM", "XRANGE", "XGROUP CREATE", "XINFO CONSUMERS"} <= registered
 
 
 @pytest.mark.unit

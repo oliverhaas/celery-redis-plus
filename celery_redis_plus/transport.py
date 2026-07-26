@@ -349,22 +349,21 @@ class GlobalKeyPrefixMixin:
         "ZREM",
         "ZREVRANGEBYSCORE",
         "ZSCORE",
+        # Stream commands are listed only where this codebase issues them from
+        # Python. Commands that run exclusively inside the Lua scripts (XACK,
+        # XDEL, XINFO CONSUMERS' delete counterpart XGROUP DELCONSUMER) are
+        # deliberately absent: EVALSHA passes KEYS through untouched, so Lua
+        # never consults this table and a registration for it would be dead
+        # config that reads like coverage. Same reason XAUTOCLAIM was dropped.
         "XADD",
-        "XACK",
-        "XDEL",
         "XLEN",
         "XPENDING",
         "XCLAIM",
+        # XRANGE and XINFO CONSUMERS are issued from Python by tests that
+        # inspect stream state through the channel's own prefixed client
         "XRANGE",
-        "XTRIM",
-        # redis-py sends these as one fused command name, not two tokens
+        # redis-py sends this as one fused command name, not two tokens
         "XGROUP CREATE",
-        "XGROUP SETID",
-        "XGROUP DESTROY",
-        "XGROUP CREATECONSUMER",
-        "XGROUP DELCONSUMER",
-        "XINFO STREAM",
-        "XINFO GROUPS",
         "XINFO CONSUMERS",
     ]
 
