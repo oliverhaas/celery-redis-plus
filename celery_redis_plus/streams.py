@@ -483,10 +483,8 @@ class MultiChannelPoller:
                 break
             delivered_any = True
         if hit_cap:
-            # Cap hit without ever seeing Empty, so more may still be waiting
-            # and _consume_read only arms on an empty pass. Guard on headroom:
-            # arming at zero leaves on_readable refusing to parse the fd that
-            # on_poll_start keeps re-adding, busy-spinning until an ack.
+            # More may still be waiting, but arming at zero headroom busy-spins:
+            # on_readable refuses the fd that on_poll_start keeps re-adding.
             headroom = None if qos is None else qos.can_consume_max_estimate()
             if headroom is None or headroom > 0:
                 channel._xreadgroup_start()
