@@ -73,6 +73,9 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 from kombu.exceptions import VersionMismatch
 from kombu.transport import virtual
+from kombu.transport.base import (
+    to_rabbitmq_queue_arguments,  # type: ignore[attr-defined]  # ty: ignore[unresolved-import]
+)
 from kombu.utils.compat import register_after_fork
 from kombu.utils.encoding import bytes_to_str
 from kombu.utils.eventio import ERR, READ, poll
@@ -96,6 +99,7 @@ from .constants import (
     DELAYED_KEY_PREFIX,
     HEARTBEAT_INTERVAL_DIVISOR,
     MAX_PRIORITY,
+    MIN_QUEUE_EXPIRES,
     SHUTDOWN_IDLE_MS,
     STREAM_KEY_PREFIX,
 )
@@ -579,17 +583,43 @@ class MultiChannelPoller:
             channel._heartbeat()
 
     def maybe_refresh_queue_expires(self) -> None:
-        """Refresh PEXPIRE on stream keys with x-expires TTL.
-
-        Placeholder: filled in with queue TTL support; the periodic timer can
-        already call it safely.
-        """
+        """Refresh PEXPIRE on stream keys with x-expires TTL."""
+        for channel in self._channels:
+            channel._refresh_queue_expires()
 
     def _update_expires_timer(self) -> None:
         """Register or update the periodic PEXPIRE timer based on configured TTLs.
 
-        Placeholder: filled in with queue TTL support.
+        Interval = min(all configured x-expires) / 2, so the TTL is refreshed
+        ~2 times before it would expire.
         """
+        min_ttl_ms: int | None = None
+        for channel in self._channels:
+            for ttl_ms in channel._expires.values():
+                if min_ttl_ms is None or ttl_ms < min_ttl_ms:
+                    min_ttl_ms = ttl_ms
+
+        if min_ttl_ms is None:
+            if self._expires_timer_entry is not None:
+                self._expires_timer_entry.cancel()
+                self._expires_timer_entry = None
+                self._expires_timer_interval = None
+            return
+
+        interval = min_ttl_ms / 2 / 1000  # ms -> seconds, divided by 2
+
+        if self._expires_timer_interval == interval:
+            return
+
+        if self._expires_timer_entry is not None:
+            self._expires_timer_entry.cancel()
+
+        if self._loop is not None:
+            self._expires_timer_entry = self._loop.call_repeatedly(
+                interval,
+                self.maybe_refresh_queue_expires,
+            )
+            self._expires_timer_interval = interval
 
 
 class Channel(FanoutStreamsMixin, virtual.Channel):
@@ -612,6 +642,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
     sep = "\x06\x16"
     _in_poll = None
     _in_fanout_poll = None
+    _warned_expires_clamp = False
     max_priority = MAX_PRIORITY  # Override kombu's default of 9 to enable full 0-255 range
 
     # Message TTL in seconds enforced lazily at delivery (None = no TTL)
@@ -946,6 +977,46 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             self._ensured_groups.discard(stream_key)
         if had_expires:
             self.connection.cycle._update_expires_timer()
+
+    def prepare_queue_arguments(self, arguments: dict[str, Any] | None, **kwargs: Any) -> dict[str, Any] | None:
+        return to_rabbitmq_queue_arguments(arguments, **kwargs)
+
+    def _new_queue(self, queue: str, auto_delete: bool = False, **kwargs: Any) -> None:
+        if auto_delete:
+            self.auto_delete_queues.add(queue)
+        arguments = kwargs.get("arguments") or {}
+        x_expires = arguments.get("x-expires")
+        if x_expires is not None and queue not in self._expires:
+            x_expires = int(x_expires)
+            if x_expires < MIN_QUEUE_EXPIRES:
+                if not self._warned_expires_clamp:
+                    logger.warning(
+                        "x-expires %dms is below minimum %dms, clamping."
+                        " This warning is shown once; other queues may also be affected.",
+                        x_expires,
+                        MIN_QUEUE_EXPIRES,
+                    )
+                    Channel._warned_expires_clamp = True
+                x_expires = MIN_QUEUE_EXPIRES
+            self._expires[queue] = x_expires
+            self.connection.cycle._update_expires_timer()
+        x_message_ttl = arguments.get("x-message-ttl")
+        if x_message_ttl is not None and queue not in self._message_ttls:
+            self._message_ttls[queue] = int(x_message_ttl)
+
+    def _refresh_queue_expires(self) -> None:
+        """Refresh PEXPIRE on level streams and the delayed zset for queues with x-expires."""
+        if not self._expires:
+            return
+        try:
+            with self.conn_or_acquire() as client, client.pipeline() as pipe:
+                for queue, ttl_ms in self._expires.items():
+                    for stream_key in self._stream_keys_for_queue(queue):
+                        pipe.pexpire(stream_key, ttl_ms)
+                    pipe.pexpire(self._delayed_key(queue), ttl_ms)
+                pipe.execute()
+        except Exception:
+            logger.warning("Failed to refresh queue expires, will retry next cycle", exc_info=True)
 
     def _move_delayed(self, queue: str, limit: int = DEFAULT_REQUEUE_BATCH_LIMIT) -> int:
         """Move due delayed messages into their priority streams.

@@ -33,6 +33,7 @@ from celery_redis_plus.constants import (
     DEFAULT_VISIBILITY_TIMEOUT,
     DELAYED_KEY_PREFIX,
     HEARTBEAT_INTERVAL_DIVISOR,
+    MIN_QUEUE_EXPIRES,
     SHUTDOWN_IDLE_MS,
     STREAM_KEY_PREFIX,
 )
@@ -5816,3 +5817,141 @@ class TestStreamsPurgeDelete:
         channel._delete("myq", "myexchange", "", "")
 
         channel.connection.cycle._update_expires_timer.assert_not_called()
+
+
+@pytest.mark.unit
+class TestStreamsExpires:
+    """Unit tests for x-expires queue TTL handling (declare, PEXPIRE refresh, poller timer)."""
+
+    def _make_channel(self) -> tuple[Channel, MagicMock, MagicMock]:
+        """Build a bare channel with TTL state and a mocked client/pipeline."""
+        channel = object.__new__(Channel)
+        channel._expires = {}
+        channel._message_ttls = {}
+        channel.auto_delete_queues = set()
+        channel.connection = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(
+            return_value=["stream:myq:9", "stream:myq:6", "stream:myq:3", "stream:myq:0"],
+        )
+
+        mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        return channel, mock_client, mock_pipe
+
+    def test_new_queue_registers_expires_and_updates_timer(self) -> None:
+        """x-expires is stored in ms and the poller expires timer is updated."""
+        channel, _mock_client, _mock_pipe = self._make_channel()
+
+        channel._new_queue("myq", arguments={"x-expires": 30000})
+
+        assert channel._expires == {"myq": 30000}
+        channel.connection.cycle._update_expires_timer.assert_called_once()
+
+    def test_new_queue_clamps_expires_below_minimum(self) -> None:
+        """x-expires below MIN_QUEUE_EXPIRES is clamped to the minimum."""
+        channel, _mock_client, _mock_pipe = self._make_channel()
+
+        with patch.object(Channel, "_warned_expires_clamp", new=False, create=True):
+            channel._new_queue("myq", arguments={"x-expires": 500})
+
+        assert channel._expires == {"myq": MIN_QUEUE_EXPIRES}
+
+    def test_new_queue_registers_message_ttl(self) -> None:
+        """x-message-ttl is stored per queue and does not touch the expires timer."""
+        channel, _mock_client, _mock_pipe = self._make_channel()
+
+        channel._new_queue("myq", arguments={"x-message-ttl": 5000})
+
+        assert channel._message_ttls == {"myq": 5000}
+        channel.connection.cycle._update_expires_timer.assert_not_called()
+
+    def test_new_queue_tracks_auto_delete(self) -> None:
+        """auto_delete queues are recorded for cleanup at channel close."""
+        channel, _mock_client, _mock_pipe = self._make_channel()
+
+        channel._new_queue("myq", auto_delete=True)
+
+        assert "myq" in channel.auto_delete_queues
+
+    def test_refresh_queue_expires_pexpires_all_queue_keys(self) -> None:
+        """_refresh_queue_expires PEXPIREs every level stream and the delayed zset."""
+        channel, _mock_client, mock_pipe = self._make_channel()
+        channel._expires = {"myq": 20000}
+
+        channel._refresh_queue_expires()
+
+        assert mock_pipe.pexpire.call_count == 5
+        pexpire_calls = [call.args for call in mock_pipe.pexpire.call_args_list]
+        assert ("stream:myq:9", 20000) in pexpire_calls
+        assert ("stream:myq:6", 20000) in pexpire_calls
+        assert ("stream:myq:3", 20000) in pexpire_calls
+        assert ("stream:myq:0", 20000) in pexpire_calls
+        assert ("delayed:myq", 20000) in pexpire_calls
+        mock_pipe.execute.assert_called_once()
+
+    def test_refresh_queue_expires_noop_without_expires(self) -> None:
+        """_refresh_queue_expires does nothing when no queue has x-expires."""
+        channel, _mock_client, _mock_pipe = self._make_channel()
+        channel._expires = {}
+
+        channel._refresh_queue_expires()
+
+        channel.conn_or_acquire.assert_not_called()
+
+    def test_refresh_queue_expires_survives_connection_failure(self) -> None:
+        """A connection error during refresh is logged, not raised (timer must survive)."""
+        channel, _mock_client, _mock_pipe = self._make_channel()
+        channel._expires = {"myq": 20000}
+        channel.conn_or_acquire = MagicMock(side_effect=ConnectionError("boom"))
+
+        channel._refresh_queue_expires()  # Must not raise
+
+    def test_update_expires_timer_registers_interval(self) -> None:
+        """The poller registers a repeating timer at min(TTL) / 2."""
+        poller = MultiChannelPoller()
+        mock_channel = MagicMock()
+        mock_channel._expires = {"myq": 20000}
+        poller._channels.add(mock_channel)
+        mock_loop = MagicMock()
+        mock_entry = MagicMock()
+        mock_loop.call_repeatedly.return_value = mock_entry
+        poller._loop = mock_loop
+
+        poller._update_expires_timer()
+
+        mock_loop.call_repeatedly.assert_called_once_with(10.0, poller.maybe_refresh_queue_expires)
+        assert poller._expires_timer_entry is mock_entry
+        assert poller._expires_timer_interval == 10.0
+
+    def test_update_expires_timer_cancels_without_expires(self) -> None:
+        """The timer is cancelled when no queue has x-expires anymore."""
+        poller = MultiChannelPoller()
+        mock_entry = MagicMock()
+        poller._expires_timer_entry = mock_entry
+        poller._expires_timer_interval = 10.0
+
+        poller._update_expires_timer()
+
+        mock_entry.cancel.assert_called_once()
+        assert poller._expires_timer_entry is None
+        assert poller._expires_timer_interval is None
+
+    def test_maybe_refresh_queue_expires_calls_all_channels(self) -> None:
+        """maybe_refresh_queue_expires fans out to every registered channel."""
+        poller = MultiChannelPoller()
+        chan_a = MagicMock()
+        chan_b = MagicMock()
+        poller._channels.update({chan_a, chan_b})
+
+        poller.maybe_refresh_queue_expires()
+
+        chan_a._refresh_queue_expires.assert_called_once()
+        chan_b._refresh_queue_expires.assert_called_once()
