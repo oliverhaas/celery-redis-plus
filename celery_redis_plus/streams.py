@@ -190,11 +190,9 @@ class QoS(virtual.QoS):
 
     def ack(self, delivery_tag: str) -> None:
         if self.channel._collected:
-            # Connection lost, not a shutdown: no client left to talk to, and the
-            # broker still owns this PEL entry for a peer to reclaim.
-            # Must be _collected, NOT closed: virtual.Channel.close() sets closed
-            # before restore_unacked_once(), so keying off it would drop the acks
-            # that the restore's hub drain exists to deliver.
+            # Connection lost, not a shutdown: the broker still owns this PEL
+            # entry for a peer to reclaim. Not `closed`, which close() sets
+            # before restore_unacked_once() and would drop the restore's acks.
             logger.debug("Skipping ack for delivery_tag %r: channel was collected", delivery_tag)
             self._fanout_tags.discard(delivery_tag)
             super().ack(delivery_tag)
