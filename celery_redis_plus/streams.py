@@ -732,12 +732,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
     _pool: Any = None
 
     # Set only by _release_channel_on_collect() (in transport.py, shared by
-    # both transports). Distinct from kombu's own `closed`: virtual.Channel.
-    # close() also sets `closed = True` for a genuine shutdown, well before
-    # restore_unacked_once() runs, so `closed` cannot be used to detect a
-    # lost-connection collect. A class attribute (not an __init__
-    # assignment) so it defaults to False even on test doubles built via
-    # object.__new__(Channel), which skip __init__.
+    # both transports). A class attribute rather than an __init__ assignment
+    # so it defaults to False on test doubles built via object.__new__.
     _collected: bool = False
 
     from_transport_options = virtual.Channel.from_transport_options + (
