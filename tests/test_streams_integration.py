@@ -1578,6 +1578,68 @@ class TestStreamsTTL:
         finally:
             app.close()
 
+    def test_expired_message_dropped_on_the_blocking_read_too(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Test the blocking XREADGROUP leg enforces x-message-ttl, not just the Lua pass.
+
+        The non-blocking pass gets its lazy TTL drop from the consume Lua
+        script, which the raw blocking XREADGROUP never goes through. Without
+        an explicit check there, the very same expired entry is delivered or
+        dropped depending only on which leg happened to pick it up.
+        """
+        queue = "blocking-ttl-queue"
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            redis_client.delete(
+                f"{global_keyprefix}{STREAM_KEY_PREFIX}{queue}:0",
+                f"{global_keyprefix}{DELAYED_KEY_PREFIX}{queue}",
+            )
+            channel._new_queue(queue, arguments={"x-message-ttl": 1000})
+
+            # Watched-queue setup normally done by basic_consume; this test
+            # drives the blocking leg by hand
+            if queue not in channel._active_queues:
+                channel._active_queues.append(queue)
+            channel._queue_cycle = [queue]
+            if channel.client.connection is None:
+                channel.client.connection = channel.client.connection_pool.get_connection()
+
+            channel._put(
+                queue,
+                {
+                    "body": '{"task": "test.add", "args": [1, 2]}',
+                    "properties": {
+                        "delivery_tag": "blocking-ttl-tag",
+                        "delivery_info": {"exchange": "", "routing_key": queue},
+                        "headers": {},
+                    },
+                },
+            )
+
+            time.sleep(1.5)  # entry id timestamp is now older than the 1s TTL
+
+            # The stream is non-empty, so the "blocking" read returns at once
+            # with the expired entry, exactly as it would on a live wake
+            channel._xreadgroup_start()
+            with patch.object(channel.connection, "_deliver") as mock_deliver, pytest.raises(Empty):
+                channel._xreadgroup_read()
+
+            mock_deliver.assert_not_called()
+            assert cast("QoS", channel.qos)._in_flight == {}
+            # Acked and deleted, not merely skipped and left pending
+            assert redis_client.xlen(f"{global_keyprefix}{STREAM_KEY_PREFIX}{queue}:0") == 0
+            assert (
+                redis_client.xpending(f"{global_keyprefix}{STREAM_KEY_PREFIX}{queue}:0", channel.consumer_group)[
+                    "pending"
+                ]
+                == 0
+            )
+
     def test_expired_delayed_message_dropped_by_pump(
         self,
         celery_app: Celery,

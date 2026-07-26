@@ -1934,6 +1934,8 @@ class TestStreamsXReadGroup:
         channel.global_keyprefix = global_keyprefix
         channel._in_poll = True
         channel.connection_errors = _connection_errors
+        channel.message_ttl = None
+        channel._message_ttls = {}
         mock_qos = MagicMock()
         mock_qos._in_flight = {}
         channel._qos = mock_qos
@@ -1962,6 +1964,8 @@ class TestStreamsXReadGroup:
         channel.global_keyprefix = ""
         channel._in_poll = True
         channel.connection_errors = _connection_errors
+        channel.message_ttl = None
+        channel._message_ttls = {}
         mock_qos = MagicMock()
         mock_qos._in_flight = {}
         channel._qos = mock_qos
@@ -1984,6 +1988,129 @@ class TestStreamsXReadGroup:
         assert delivered_queues == ["q1", "q2"]
         assert channel._in_poll is None
 
+    @staticmethod
+    def _make_ttl_channel(global_keyprefix: str, now_ms: int) -> tuple[Channel, MagicMock, MagicMock]:
+        """Channel wired for the blocking read with a mocked server clock."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel.connection_errors = _connection_errors
+        channel.consumer_group = "celery"
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        channel.client = MagicMock()
+        channel.connection = MagicMock()
+
+        ttl_client = MagicMock()
+        ttl_client.time.return_value = (now_ms // 1000, (now_ms % 1000) * 1000)
+        mock_ack_script = MagicMock()
+        ttl_client.register_script.return_value = mock_ack_script
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=ttl_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        return channel, mock_ack_script, ttl_client
+
+    def test_xreadgroup_read_drops_an_expired_entry_instead_of_delivering_it(
+        self,
+        global_keyprefix: str,
+    ) -> None:
+        """Test the blocking leg honours x-message-ttl the same way the Lua pass does.
+
+        The Lua consume script applies the lazy TTL drop for the
+        non-blocking pass, but a raw XREADGROUP has no such wrapper, so
+        without an explicit check the same expired entry is delivered or
+        dropped purely depending on which leg picked it up.
+        """
+        now_ms = 1_700_000_100_000
+        channel, mock_ack_script, _ttl_client = self._make_ttl_channel(global_keyprefix, now_ms)
+        channel._message_ttls = {"q1": 60_000}
+
+        expired_id = f"{now_ms - 120_000}-0"
+        payload = b'{"body": "test", "properties": {"delivery_tag": "tagA"}}'
+        channel.client.parse_response.return_value = [
+            (f"{global_keyprefix}stream:q1:0".encode(), [(expired_id.encode(), {b"payload": payload})]),
+        ]
+
+        with pytest.raises(Empty):
+            channel._xreadgroup_read()
+
+        channel.connection._deliver.assert_not_called()
+        assert channel._qos._in_flight == {}
+        mock_ack_script.assert_called_once_with(
+            keys=[f"{global_keyprefix}stream:q1:0"],
+            args=["celery", expired_id, ""],
+        )
+        assert channel._in_poll is None
+
+    def test_xreadgroup_read_delivers_an_unexpired_entry_and_drops_only_the_expired_one(self) -> None:
+        """Test only the entries past the TTL are dropped; the rest of the reply is delivered."""
+        now_ms = 1_700_000_100_000
+        channel, mock_ack_script, _ttl_client = self._make_ttl_channel("", now_ms)
+        channel._message_ttls = {"q1": 60_000}
+
+        expired_id = f"{now_ms - 120_000}-0"
+        live_id = f"{now_ms - 1_000}-0"
+        channel.client.parse_response.return_value = [
+            (
+                b"stream:q1:0",
+                [
+                    (expired_id.encode(), {b"payload": b'{"body": "old", "properties": {"delivery_tag": "tagOld"}}'}),
+                    (live_id.encode(), {b"payload": b'{"body": "new", "properties": {"delivery_tag": "tagNew"}}'}),
+                ],
+            ),
+        ]
+
+        assert channel._xreadgroup_read() is True
+
+        assert channel._qos._in_flight == {"tagNew": ("stream:q1:0", live_id)}
+        delivered_tags = [c.args[0]["properties"]["delivery_tag"] for c in channel.connection._deliver.call_args_list]
+        assert delivered_tags == ["tagNew"]
+        mock_ack_script.assert_called_once_with(keys=["stream:q1:0"], args=["celery", expired_id, ""])
+
+    def test_xreadgroup_read_ttl_cutoff_uses_the_server_clock(self) -> None:
+        """Test the cutoff comes from TIME, so a worker clock running ahead cannot drop live entries.
+
+        The entry is 30s old by the server's clock and a 60s TTL applies,
+        but two minutes old by the worker's local clock.
+        """
+        now_ms = 1_700_000_100_000
+        channel, mock_ack_script, ttl_client = self._make_ttl_channel("", now_ms)
+        channel._message_ttls = {"q1": 60_000}
+
+        entry_id = f"{now_ms - 30_000}-0"
+        channel.client.parse_response.return_value = [
+            (
+                b"stream:q1:0",
+                [(entry_id.encode(), {b"payload": b'{"body": "x", "properties": {"delivery_tag": "t"}}'})],
+            ),
+        ]
+
+        with patch("celery_redis_plus.streams.time", return_value=(now_ms + 90_000) / 1000):
+            assert channel._xreadgroup_read() is True
+
+        ttl_client.time.assert_called_once_with()
+        mock_ack_script.assert_not_called()
+        assert channel._qos._in_flight == {"t": ("stream:q1:0", entry_id)}
+
+    def test_xreadgroup_read_without_a_ttl_never_acquires_a_connection(self) -> None:
+        """Test the no-TTL hot path stays free of the extra TIME round trip."""
+        now_ms = 1_700_000_100_000
+        channel, mock_ack_script, _ttl_client = self._make_ttl_channel("", now_ms)
+
+        channel.client.parse_response.return_value = [
+            (b"stream:q1:0", [(b"1-0", {b"payload": b'{"body": "x", "properties": {"delivery_tag": "t"}}'})]),
+        ]
+
+        assert channel._xreadgroup_read() is True
+
+        channel.conn_or_acquire.assert_not_called()
+        mock_ack_script.assert_not_called()
+        assert channel._qos._in_flight == {"t": ("stream:q1:0", "1-0")}
+
     def test_xreadgroup_read_drops_in_flight_when_delivery_raises(self) -> None:
         """Test a raising delivery callback leaves no unreclaimable in-flight record.
 
@@ -1995,6 +2122,8 @@ class TestStreamsXReadGroup:
         channel.global_keyprefix = ""
         channel._in_poll = True
         channel.connection_errors = _connection_errors
+        channel.message_ttl = None
+        channel._message_ttls = {}
         mock_qos = MagicMock()
         mock_qos._in_flight = {}
         channel._qos = mock_qos

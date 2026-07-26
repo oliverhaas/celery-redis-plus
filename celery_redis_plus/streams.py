@@ -65,7 +65,7 @@ import math
 import numbers
 import os
 import socket as socket_module
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from queue import Empty
 from time import time
@@ -1870,6 +1870,14 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         whole ensured-group cache is invalidated and Empty is raised, so
         the next non-blocking pass re-creates the groups before touching
         the streams.
+
+        Unlike the non-blocking pass, a raw XREADGROUP has no Lua wrapper
+        to apply the lazy message-TTL drop, so expired entries are filtered
+        here instead: without it a queue's ``x-message-ttl`` would be
+        enforced on some ticks and ignored on others, purely by which leg
+        happened to pick the entry up. The clock comes from the server, and
+        the connection behind it is only acquired if a watched queue
+        actually has a TTL.
         """
         try:
             try:
@@ -1888,7 +1896,26 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             if not messages:
                 raise Empty
 
-            delivered = False
+            if not self._deliver_xreadgroup_entries(messages):
+                raise Empty
+            return True
+        finally:
+            self._in_poll = None
+
+    def _deliver_xreadgroup_entries(self, messages: Sequence[Any]) -> bool:
+        """Deliver the entries of a blocking XREADGROUP reply, dropping expired ones.
+
+        Args:
+            messages: The parsed XREADGROUP reply, a sequence of
+                ``(stream_key, [(entry_id, fields), ...])`` pairs.
+
+        Returns:
+            True if at least one entry was delivered.
+        """
+        delivered = False
+        with ExitStack() as stack:
+            ack_script: Any = None
+            now_ms = 0
             for stream, message_list in messages:
                 stream_str = bytes_to_str(stream) if isinstance(stream, bytes) else stream
                 # Reply stream names carry the global key prefix; strip so
@@ -1898,21 +1925,32 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                     stream_str = stream_str[len(prefix) :]
                 # stream:{queue}:{level} -> logical queue name
                 queue_name = stream_str[len(STREAM_KEY_PREFIX) :].rsplit(":", 1)[0]
+                ttl_ms = self._effective_message_ttl_ms(queue_name)
                 for message_id, fields in message_list:
                     message_id_str = bytes_to_str(message_id) if isinstance(message_id, bytes) else message_id
                     payload_field = fields.get(b"payload") or fields.get("payload")
                     if not payload_field:
                         continue
+                    if ttl_ms > 0:
+                        if ack_script is None:
+                            # Server clock, not the caller's: a worker running
+                            # ahead of the server would drop live messages
+                            client = stack.enter_context(self.conn_or_acquire())
+                            ack_script = client.register_script(_STREAMS_ACK_LUA)
+                            server_seconds, server_micros = client.time()
+                            now_ms = int(server_seconds) * 1000 + int(server_micros) // 1000
+                        # Entry ids encode creation time in ms
+                        if int(message_id_str.split("-")[0]) < now_ms - ttl_ms:
+                            ack_script(
+                                keys=[f"{self.global_keyprefix}{stream_str}"],
+                                args=[self.consumer_group, message_id_str, ""],
+                            )
+                            continue
                     message: dict[str, Any] = loads(bytes_to_str(payload_field))
                     delivery_tag = message["properties"]["delivery_tag"]
                     self._deliver_in_flight(message, queue_name, delivery_tag, stream_str, message_id_str)
                     delivered = True
-
-            if not delivered:
-                raise Empty
-            return True
-        finally:
-            self._in_poll = None
+        return delivered
 
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
         if cmd_type == "XREAD":
