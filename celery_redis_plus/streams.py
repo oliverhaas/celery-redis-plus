@@ -1890,12 +1890,10 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             super().close()
         finally:
             if not already_closed:
-                # Runs after super().close() (which calls restore_unacked_once)
-                # on purpose: conn_or_acquire() can lazily rebuild self._pool
-                # during the restore, and that rebuilt pool must be disconnected
-                # too, not just whatever pool existed before restore ran. The
-                # try/finally ensures this teardown still runs even if
-                # super().close() raises.
+                # After super().close() (which calls restore_unacked_once) on
+                # purpose: conn_or_acquire() can lazily rebuild self._pool
+                # during the restore, and that rebuilt pool must be
+                # disconnected too, not just the one that existed before.
                 self._disconnect_pools()
                 self._close_clients()
 
