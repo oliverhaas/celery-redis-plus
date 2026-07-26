@@ -341,10 +341,8 @@ class QoS(virtual.QoS):
                             else:
                                 released_tags.extend(tag for tag, _ in entries)
                 except Exception:
-                    # No connection at all, so nothing was released and _in_flight
-                    # stays untouched. Must not escape: this runs inside
-                    # Channel.close(), and raising would abort the rest of that
-                    # close and every later channel's.
+                    # Must not escape: this runs inside Channel.close(), and
+                    # raising would abort that close and every later channel's.
                     logger.warning(
                         "Could not acquire a connection to release in-flight messages for instant"
                         " reclaim; peers will reclaim them after the visibility timeout",
