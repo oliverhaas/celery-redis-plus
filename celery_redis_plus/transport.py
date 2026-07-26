@@ -772,6 +772,14 @@ class MultiChannelPoller:
 
         Interval = min(all configured x-expires) / 2, so the TTL is refreshed
         ~2 times before it would expire.
+
+        With no TTLs configured, or with the event loop not registered yet,
+        any existing timer is cancelled and both _expires_timer_entry and
+        _expires_timer_interval are reset to None in the same branch. Without
+        that reset, a queue declared before register_with_event_loop runs
+        would leave _expires_timer_interval stale, and the interval-equality
+        check below could then suppress the real registration once the loop
+        does show up.
         """
         min_ttl_ms: int | None = None
         for channel in self._channels:
@@ -779,11 +787,11 @@ class MultiChannelPoller:
                 if min_ttl_ms is None or ttl_ms < min_ttl_ms:
                     min_ttl_ms = ttl_ms
 
-        if min_ttl_ms is None:
+        if min_ttl_ms is None or self._loop is None:
             if self._expires_timer_entry is not None:
                 self._expires_timer_entry.cancel()
-                self._expires_timer_entry = None
-                self._expires_timer_interval = None
+            self._expires_timer_entry = None
+            self._expires_timer_interval = None
             return
 
         interval = min_ttl_ms / 2 / 1000  # ms → seconds, divided by 2
@@ -794,12 +802,11 @@ class MultiChannelPoller:
         if self._expires_timer_entry is not None:
             self._expires_timer_entry.cancel()
 
-        if self._loop is not None:
-            self._expires_timer_entry = self._loop.call_repeatedly(
-                interval,
-                self.maybe_refresh_queue_expires,
-            )
-            self._expires_timer_interval = interval
+        self._expires_timer_entry = self._loop.call_repeatedly(
+            interval,
+            self.maybe_refresh_queue_expires,
+        )
+        self._expires_timer_interval = interval
 
     def on_readable(self, fileno: int) -> bool | None:
         chan, cmd_type = self._fd_to_chan[fileno]
@@ -2045,8 +2052,12 @@ class Transport(virtual.Transport):
         visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         loop.call_repeatedly(visibility_timeout / 3, cycle.maybe_update_messages_index)
 
-        # Store loop for dynamic timer registration (queue TTL refresh)
+        # Store loop for dynamic timer registration (queue TTL refresh), then arm
+        # the timer immediately: a queue with x-expires may already have been
+        # declared (the Tasks bootstep can run before this method does), and
+        # nothing else re-triggers registration for it.
         cycle._loop = loop
+        cycle._update_expires_timer()
 
     def on_readable(self, fileno: int) -> Any:  # type: ignore[override]  # ty: ignore[invalid-method-override]
         """Handle AIO event for one of our file descriptors."""

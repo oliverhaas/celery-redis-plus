@@ -2224,6 +2224,61 @@ class TestMultiChannelPoller:
         channel._poll_error.assert_called_once_with("BZMPOP")
         assert result is None
 
+    def test_update_expires_timer_stays_disarmed_without_loop(self) -> None:
+        """A stale timer entry/interval is honestly reset to None when the loop
+        is not registered yet, not merely left in place.
+
+        Regression: this branch used to cancel a pre-existing entry but leave
+        both _expires_timer_entry and _expires_timer_interval at their stale
+        values, so the poller believed a cancelled timer was still live at the
+        old interval, and the interval-equality check could then suppress the
+        real registration once register_with_event_loop later assigns a loop
+        and calls this method.
+        """
+        poller = MultiChannelPoller()
+        mock_channel = MagicMock()
+        mock_channel._expires = {"myq": 20000}
+        poller._channels.add(mock_channel)
+        mock_entry = MagicMock()
+        poller._expires_timer_entry = mock_entry
+        poller._expires_timer_interval = 999.0  # stale value from an earlier state
+        assert poller._loop is None
+
+        poller._update_expires_timer()
+
+        mock_entry.cancel.assert_called_once()
+        assert poller._expires_timer_entry is None
+        assert poller._expires_timer_interval is None
+
+    def test_register_with_event_loop_arms_expires_timer_for_already_declared_queue(self) -> None:
+        """A queue with x-expires declared before the event loop exists still gets
+        its refresh timer armed once register_with_event_loop runs.
+
+        Regression: _update_expires_timer was only ever called from _new_queue and
+        _delete. If the first x-expires queue was declared while cycle._loop was
+        still None (the Tasks bootstep can run before the event loop is
+        registered), the timer was computed but never armed, and nothing armed it
+        afterward either: the queue's key(s) could then expire mid-operation with
+        unacked entries still in the messages index.
+        """
+        transport = object.__new__(Transport)
+        cycle = MultiChannelPoller()
+        transport.cycle = cycle
+        mock_channel = MagicMock()
+        mock_channel.qos = None  # keeps on_poll_init's initial pump a no-op here
+        mock_channel._expires = {"myq": 30000}
+        cycle._channels.add(mock_channel)
+        assert cycle._loop is None  # precondition: no event loop when the queue was declared
+
+        loop = MagicMock()
+        connection = MagicMock()
+        connection.client.transport_options = {}
+
+        transport.register_with_event_loop(connection, loop)
+
+        loop.call_repeatedly.assert_any_call(15.0, cycle.maybe_refresh_queue_expires)
+        assert cycle._expires_timer_interval == 15.0
+
 
 @pytest.mark.unit
 class TestFastSlowConsumeMode:
