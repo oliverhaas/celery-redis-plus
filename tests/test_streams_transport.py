@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import socket
@@ -2049,6 +2050,95 @@ class TestStreamsConsumeRead:
             "q1",
         )
         channel._xreadgroup_start.assert_not_called()
+
+    def test_consume_read_rotates_queue_cycle_so_a_busy_queue_cannot_starve_the_rest(self) -> None:
+        """Test a queue that always yields does not monopolise the cycle.
+
+        _consume_read returns on the first queue that yields, so without
+        rotation the head queue is served on every pass and every queue
+        behind it starves for as long as it stays busy.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._queue_cycle = ["alpha", "beta", "gamma"]
+        channel._in_poll = None
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._consume_script_sha = "sha123"
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(side_effect=lambda q: [f"stream:{q}:0"])
+        channel._xreadgroup_start = MagicMock()
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        mock_client = MagicMock()
+        channel.client = mock_client
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        # Every stream always has an entry waiting
+        counter = itertools.count()
+        mock_client.parse_response.side_effect = lambda *_a, **_kw: [
+            b"stream:whatever:0",
+            b"1111-0",
+            f'{{"body": "x", "properties": {{"delivery_tag": "tag{next(counter)}"}}}}'.encode(),
+        ]
+
+        for _ in range(6):
+            assert channel._consume_read() is True
+
+        delivered_queues = [call.args[1] for call in mock_connection._deliver.call_args_list]
+        assert delivered_queues == ["alpha", "beta", "gamma", "alpha", "beta", "gamma"]
+
+    def test_consume_read_rotation_skips_past_the_queues_that_were_empty(self) -> None:
+        """Test rotation starts the next pass behind the queue that actually yielded.
+
+        Rotating by a fixed one instead would re-serve the yielding queue on
+        the very next pass whenever the queues ahead of it were empty.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._queue_cycle = ["alpha", "beta", "gamma", "delta"]
+        channel._in_poll = None
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._consume_script_sha = "sha123"
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(side_effect=lambda q: [f"stream:{q}:0"])
+        channel._xreadgroup_start = MagicMock()
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        mock_client = MagicMock()
+        channel.client = mock_client
+        channel.connection = MagicMock()
+
+        payload = b'{"body": "x", "properties": {"delivery_tag": "tagA"}}'
+        # alpha empty, beta yields; gamma and delta are never reached
+        mock_client.parse_response.side_effect = [None, [b"stream:beta:0", b"1111-0", payload]]
+
+        assert channel._consume_read() is True
+
+        # Rotating a fixed one instead would give ["beta", "gamma", "delta", "alpha"],
+        # putting beta straight back at the head it just yielded from
+        assert channel._queue_cycle == ["gamma", "delta", "alpha", "beta"]
+
+    def test_consume_read_does_not_rotate_a_single_queue_cycle(self) -> None:
+        """Test rotation is a no-op with one watched queue (nothing to be fair to)."""
+        channel = object.__new__(Channel)
+        channel._queue_cycle = ["alpha"]
+
+        channel._rotate_queue_cycle(0)
+
+        assert channel._queue_cycle == ["alpha"]
 
     def test_consume_read_loads_script_when_sha_missing(self) -> None:
         """Test _consume_read loads and caches the Lua script SHA when unset."""

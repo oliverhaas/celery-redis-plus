@@ -1924,6 +1924,70 @@ class TestStreamsSizePurgeIntegration:
 
 
 @pytest.mark.integration
+class TestStreamsQueueFairness:
+    """Round-robin fairness of the non-blocking consume pass across watched queues."""
+
+    def test_consume_read_alternates_between_two_continuously_busy_queues(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Test a busy queue at the head of the cycle does not starve the queue behind it.
+
+        _consume_read scans _queue_cycle in order and returns on the first
+        queue that yields, so without rotating the cycle after a hit the
+        head queue is served on every single pass. Against a real server
+        that produced the delivery order ['alpha' x5, 'beta'].
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queues = ["fairness-alpha", "fairness-beta"]
+
+        conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={"global_keyprefix": global_keyprefix},
+        )
+        try:
+            channel = cast("Channel", conn.channel())
+
+            for queue in queues:
+                for index in range(5):
+                    channel._put(
+                        queue,
+                        {
+                            "body": '{"task": "test"}',
+                            "properties": {
+                                "delivery_tag": f"{queue}-{index}",
+                                "delivery_info": {"exchange": "", "routing_key": queue},
+                                "headers": {},
+                            },
+                        },
+                    )
+
+            channel._queue_cycle = list(queues)
+            if channel.client.connection is None:
+                channel.client.connection = channel.client.connection_pool.get_connection()
+
+            with patch.object(channel.connection, "_deliver") as mock_deliver:
+                for _ in range(6):
+                    assert channel._consume_read() is True
+
+            delivered = [call.args[1] for call in mock_deliver.call_args_list]
+            assert delivered == [
+                "fairness-alpha",
+                "fairness-beta",
+                "fairness-alpha",
+                "fairness-beta",
+                "fairness-alpha",
+                "fairness-beta",
+            ]
+        finally:
+            conn.close()
+
+
+@pytest.mark.integration
 class TestStreamsBlockingPriority:
     """Strict priority ordering across levels through the blocking XREADGROUP wait."""
 

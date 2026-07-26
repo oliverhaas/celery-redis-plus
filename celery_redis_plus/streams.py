@@ -1651,6 +1651,25 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         """Rebuild the round-robin queue cycle from the watched non-fanout queues."""
         self._queue_cycle = list(self.active_queues)
 
+    def _rotate_queue_cycle(self, served_index: int) -> None:
+        """Move the queue that just yielded, and everything before it, to the back.
+
+        _consume_read scans _queue_cycle in order and returns on the first
+        queue that yields, so without rotation a continuously busy queue at
+        the head is served every single pass and every queue behind it
+        starves. Rotating past the served position makes the next pass start
+        at the following queue, which is the same fairness guarantee the
+        requeue cycle already gets from MultiChannelPoller._requeue_offsets.
+
+        Args:
+            served_index: Index in _queue_cycle of the queue that yielded.
+        """
+        cycle = self._queue_cycle
+        if len(cycle) < 2:  # noqa: PLR2004
+            return
+        split = (served_index + 1) % len(cycle)
+        self._queue_cycle = cycle[split:] + cycle[:split]
+
     def basic_consume(self, queue: str, *args: Any, **kwargs: Any) -> str:
         if queue in self._fanout_queues:
             self.active_fanout_queues.add(queue)
@@ -1691,8 +1710,10 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         the queue's level streams highest priority first with non-blocking
         XREADGROUP, so delivery and PEL registration are atomic in Redis.
 
-        On the first hit: records the entry in QoS._in_flight, delivers the
-        message, and returns True. When every queue is empty: arms a
+        On the first hit: rotates _queue_cycle past the queue that yielded
+        (so the next pass starts behind it and a busy queue cannot starve
+        the ones after it), records the entry in QoS._in_flight, delivers
+        the message, and returns True. When every queue is empty: arms a
         blocking XREADGROUP over all watched streams via _xreadgroup_start()
         (keeps _in_poll set) and raises Empty.
 
@@ -1701,7 +1722,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         was warm; the cache is invalidated, the groups are re-created, and
         the EVALSHA is retried once for that queue.
         """
-        for queue in self._queue_cycle:
+        for index, queue in enumerate(list(self._queue_cycle)):
             sha = self._ensure_consume_script_sha()
             stream_keys = self._stream_keys_for_queue(queue)
             for stream_key in stream_keys:
@@ -1748,6 +1769,9 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 entry_id = bytes_to_str(result[1])
                 message: dict[str, Any] = loads(bytes_to_str(result[2]))
                 delivery_tag = message["properties"]["delivery_tag"]
+                # Rotate before delivering so a raising delivery callback
+                # cannot pin the cycle on the same queue forever
+                self._rotate_queue_cycle(index)
                 if self.qos is not None:
                     cast("QoS", self.qos)._in_flight[delivery_tag] = (result_stream, entry_id)
                 self.connection._deliver(message, queue)
