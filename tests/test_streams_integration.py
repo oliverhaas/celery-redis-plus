@@ -29,6 +29,7 @@ from celery_redis_plus.streams import (
     Transport,
     priority_to_level,
 )
+from celery_redis_plus.transport import client_lib
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -100,6 +101,110 @@ def _make_streams_app(host: str, port: int, global_keyprefix: str, **transport_o
     if options:
         app.conf.update(broker_transport_options=options)
     return app
+
+
+# Parameters for _run_multi_page_reclaim_scenario (see its docstring for why
+# these exact numbers are load-bearing, not illustrative).
+_MULTI_PAGE_RECLAIM_TOTAL = 101
+_MULTI_PAGE_RECLAIM_STUCK_INDEX = 99
+_MULTI_PAGE_RECLAIM_BUDGET = 100
+
+
+def _run_multi_page_reclaim_scenario(
+    channel_a: Channel,
+    channel_b: Channel,
+    queue: str,
+) -> tuple[int, list[dict[str, Any]], list[str], str]:
+    """Force a second real xpending_range page and reclaim across it via channel_b.
+
+    Stages _MULTI_PAGE_RECLAIM_TOTAL (101) same-priority messages into one
+    stream via channel_a (consumed but never acked, so every one is
+    genuinely pending and idle once channel_b's visibility_timeout elapses).
+    The entry at _MULTI_PAGE_RECLAIM_STUCK_INDEX (the 100th staged, "stuck")
+    is marked as already in-flight for channel_b itself, simulating a
+    message this same worker identity is already handling elsewhere (a
+    long-running task, or one claimed moments ago by a sibling channel
+    sharing this consumer_name): Channel._own_in_flight_message_ids excludes
+    it from this call's claiming, so it is discovered on every page but
+    never claimed, and (since XCLAIM never touches it) never has its idle
+    time reset, staying genuinely rediscoverable for the rest of this call.
+
+    That last property is the reason this scenario needs an entry that is
+    filtered out (not merely claimed) to make the exclusive cursor
+    (streams.py: ``cursor = "(" + last_id``) actually observable end to end
+    against a real server. A naive design that just claims a full 100-entry
+    first page and inspects whether the 101st entry is reachable through a
+    plain claimed boundary id does NOT distinguish inclusive from exclusive
+    cursors at all: confirmed empirically (not just by reading the code)
+    against a live Redis 6.2 container, XCLAIM resets a claimed entry's idle
+    time to 0 by default, so ``XPENDING ... IDLE`` never re-surfaces it on a
+    later page regardless of whether the next cursor is inclusive or
+    exclusive of it. Only an entry that is discovered but deliberately never
+    claimed keeps reappearing, and only that keeps an inclusive-cursor
+    regression observably stuck.
+
+    budget is exactly _MULTI_PAGE_RECLAIM_TOTAL - 1 (100): the first page
+    (count = min(budget, 100) = 100) discovers the 99 entries staged before
+    "stuck" plus "stuck" itself as the page's last id, a full page (Redis
+    only returns a short page once truly exhausted). The correct exclusive
+    cursor skips past "stuck" and spends the one remaining budget slot
+    claiming the 101st (last) staged entry, landing on exactly 100 claimed.
+    An inclusive cursor instead re-discovers "stuck" on every later page
+    (count=1 from here on always returns it first, since it is still
+    genuinely idle and never claimed), permanently stalling discovery until
+    DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT is hit, so the 101st entry is never
+    reached and the total claimed count comes up exactly one short.
+
+    Args:
+        channel_a: Producing/holding channel; publishes and consumes without acking.
+        channel_b: Reclaiming channel; must use a different consumer_name than channel_a.
+        queue: Queue name to stage into.
+
+    Returns:
+        Tuple of (claimed, delivered_messages, consumed_tags, stuck_tag).
+        delivered_messages are the raw payloads handed to Transport._deliver;
+        consumed_tags is every staged delivery_tag in publish order; stuck_tag
+        is the one delivery_tag deliberately excluded from claiming.
+    """
+    total = _MULTI_PAGE_RECLAIM_TOTAL
+    stuck_index = _MULTI_PAGE_RECLAIM_STUCK_INDEX
+    budget = _MULTI_PAGE_RECLAIM_BUDGET
+
+    for i in range(total):
+        channel_a._put(
+            queue,
+            {
+                "body": f'{{"i": {i}}}',
+                "properties": {
+                    "delivery_tag": f"multipage-{i:04d}",
+                    "delivery_info": {"exchange": "celery", "routing_key": queue},
+                    "headers": {},
+                },
+            },
+        )
+
+    consumed_tags: list[str] = []
+    for _ in range(total):
+        consumed = channel_a._get(queue)
+        consumed_tags.append(consumed["properties"]["delivery_tag"])
+
+    stuck_tag = consumed_tags[stuck_index]
+    stuck_stream_key, stuck_entry_id = cast("QoS", channel_a.qos)._in_flight[stuck_tag]
+
+    time.sleep(1.0)  # exceed the short visibility_timeout both channels use
+
+    # Simulate channel_b already owning/handling the "stuck" entry elsewhere:
+    # _own_in_flight_message_ids excludes it from this call's claiming.
+    channel_b_qos = cast("QoS", channel_b.qos)
+    channel_b_qos._in_flight["multipage-synthetic-own"] = (stuck_stream_key, stuck_entry_id)
+    try:
+        delivered: list[dict[str, Any]] = []
+        with patch.object(channel_b.connection, "_deliver", side_effect=lambda msg, _q: delivered.append(msg)):
+            claimed = channel_b._reclaim_and_deliver(queue, budget)
+    finally:
+        del channel_b_qos._in_flight["multipage-synthetic-own"]
+
+    return claimed, delivered, consumed_tags, stuck_tag
 
 
 @pytest.fixture(scope="session")
@@ -660,6 +765,51 @@ class TestStreamsReclaimIntegration:
         delivered_message = delivered[0]
         assert delivered_message.delivery_tag == "tag-integration-reclaim"
         assert delivered_message.properties["headers"]["x-restore-count"] == 1
+
+    def test_multi_page_discovery_reclaims_every_survivor_exactly_once(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Test a forced second xpending_range page reclaims every survivor exactly once.
+
+        See _run_multi_page_reclaim_scenario's docstring for why this exact
+        staging is required to make the discover-then-claim pass's
+        exclusive-cursor continuation (streams.py's
+        ``cursor = "(" + last_id``) observable against a real server at all,
+        rather than silently masked by XCLAIM's own idle-reset behavior.
+        Mutating that prefix away (an inclusive cursor) turns this test red:
+        the entry staged right after the deliberately-unclaimed "stuck" one
+        is never discovered, so the total claimed count comes up one short.
+        """
+        host, port, _image = redis_container
+        queue = "multipage-reclaim-queue"
+        app_a = _make_streams_app(host, port, global_keyprefix, visibility_timeout=0.3, consumer_name="worker-a")
+        app_b = _make_streams_app(host, port, global_keyprefix, visibility_timeout=0.3, consumer_name="worker-b")
+        try:
+            with app_a.connection() as conn_a, app_b.connection() as conn_b:
+                channel_a = cast("Channel", conn_a.default_channel)
+                channel_b = cast("Channel", conn_b.default_channel)
+                claimed, delivered, consumed_tags, stuck_tag = _run_multi_page_reclaim_scenario(
+                    channel_a,
+                    channel_b,
+                    queue,
+                )
+        finally:
+            app_a.close()
+            app_b.close()
+
+        delivered_tags = [message["properties"]["delivery_tag"] for message in delivered]
+        expected_tags = set(consumed_tags) - {stuck_tag}
+
+        # Discriminates inclusive from exclusive paging directly: an
+        # inclusive cursor stalls discovery on the "stuck" entry and never
+        # reaches the one staged right after it, so this comes up short by
+        # exactly one instead of matching.
+        assert claimed == len(expected_tags)
+        assert len(delivered_tags) == len(set(delivered_tags)), "an entry was delivered more than once"
+        assert set(delivered_tags) == expected_tags
 
 
 @pytest.mark.integration
@@ -1780,6 +1930,11 @@ class TestStreamsBlockingPriority:
             if channel.client.connection is None:
                 channel.client.connection = channel.client.connection_pool.get_connection()
 
+            # Baseline captured before arming, so the poll below detects
+            # this consumer's own block registering (and only that), not
+            # some pre-existing blocked client elsewhere on the server.
+            baseline_blocked = redis_client.info("clients")["blocked_clients"]
+
             # Every level stream is empty: the non-blocking pass misses on
             # all of them, arms the blocking XREADGROUP (COUNT 1, level
             # streams highest first), and raises Empty with _in_poll set
@@ -1787,7 +1942,27 @@ class TestStreamsBlockingPriority:
                 channel._consume_read()
             assert channel._in_poll is not None
 
-            time.sleep(0.2)  # let the server park the blocked consumer
+            # Wait deterministically for Redis to actually park this
+            # consumer as a blocked client, instead of a fixed sleep. A
+            # fixed sleep is a heuristic: if it ever proved too short (slow
+            # CI host, container cold start, GC pause), the publishes below
+            # would land before the block is registered, and Redis would
+            # resolve the "blocking" XREADGROUP as an immediate read over
+            # every watched stream that already has entries at that
+            # moment, in STREAMS-declared (highest-priority-first) order
+            # rather than arrival order. That would deliver [high, low-1]
+            # in one reply instead of [low-1] alone, breaking the ordering
+            # this test exists to prove not by a silent false pass but by a
+            # loud, honest assertion mismatch further down. Polling the
+            # server's own blocked_clients counter until it rises removes
+            # that race entirely: the block is confirmed armed before any
+            # publish is issued.
+            deadline = time.monotonic() + 2
+            while redis_client.info("clients")["blocked_clients"] <= baseline_blocked and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert redis_client.info("clients")["blocked_clients"] > baseline_blocked, (
+                "consumer's blocking XREADGROUP never registered as a blocked client on the server"
+            )
 
             # Publish while the consumer is blocked: low-1 arrives first and
             # wakes the blocked read (COUNT 1 serves exactly that entry);
@@ -1841,6 +2016,89 @@ class TestStreamsBlockingPriority:
 
 
 @pytest.mark.integration
+class TestStreamsRegisterXreadgroupCapExit:
+    """MultiChannelPoller._register_XREADGROUP must arm a blocking read on cap exit.
+
+    Regression test for fix round 1's M2: the drain loop that lets one hub
+    tick deliver a whole burst (see _register_XREADGROUP's own docstring)
+    only arms the blocking XREADGROUP when Channel._consume_read finds every
+    watched queue empty (the `except Empty` branch). If every one of
+    DEFAULT_REQUEUE_BATCH_LIMIT iterations instead delivers a message, the
+    loop used to exit via the cap with nothing armed, leaving the hub to
+    sleep up to poll_timeout even though more messages were still queued.
+    Only reachable with worker_prefetch_multiplier=0 (unbounded QoS, so
+    can_consume_max_estimate never trims the loop short of the cap), but
+    that is a supported setting.
+    """
+
+    def test_cap_exit_arms_blocking_read_when_queue_still_has_more(
+        self,
+        celery_app: Celery,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Test _in_poll is armed after the drain loop hits its patched cap with messages still queued."""
+        monkeypatch.setattr("celery_redis_plus.streams.DEFAULT_REQUEUE_BATCH_LIMIT", 3)
+
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            cycle = channel.connection.cycle
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._update_queue_cycle()
+
+            # Same one-time pinning TestStreamsBlockingPriority uses: _consume_read
+            # talks to this connection object directly (raw EVALSHA/send_command),
+            # so without this the first call crashes on client.connection being None.
+            if channel.client.connection is None:
+                channel.client.connection = channel.client.connection_pool.get_connection()
+
+            # Unbounded QoS (prefetch_count=0, the default for a channel not driven
+            # through a real worker's basic_qos): can_consume_max_estimate() returns
+            # None, so the loop never breaks early on capacity and always runs the
+            # full patched cap of 3 iterations below.
+            assert channel.qos.prefetch_count == 0
+
+            # Stage more messages than the patched cap so every iteration of the
+            # drain loop delivers one and the loop exits via the cap, never via Empty.
+            for i in range(5):
+                channel._put(
+                    "celery",
+                    {
+                        "body": f'{{"i": {i}}}',
+                        "properties": {
+                            "delivery_tag": f"cap-exit-{i}",
+                            "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                            "headers": {},
+                        },
+                    },
+                )
+
+            with patch.object(channel.connection, "_deliver") as mock_deliver:
+                delivered_any = cycle._register_XREADGROUP(channel)
+
+            # The patched cap (3) was hit before the queue ran dry; 2 messages
+            # remain unclaimed in the stream.
+            assert delivered_any is True
+            assert mock_deliver.call_count == 3
+
+            # The fix: a blocking XREADGROUP was armed for the remaining
+            # messages instead of leaving nothing in flight for the hub to
+            # wake on, which would otherwise sleep up to poll_timeout.
+            # _in_poll starts out False (not None) on first registration, so
+            # `is not None` would pass trivially even when nothing was armed;
+            # only a truthy check discriminates the fixed case (a real
+            # connection object) from the unfixed one (False).
+            assert channel._in_poll
+
+            # Drain the now-armed blocking reply (it returns immediately: data
+            # is already available) so the connection teardown below doesn't
+            # leave a command in flight on the socket.
+            with patch.object(channel.connection, "_deliver"):
+                assert channel._xreadgroup_read() is True
+
+
+@pytest.mark.integration
 class TestStreamsRedis62Floor:
     """Proves the streams transport's actual version floor: Redis 6.2, not 7.0+.
 
@@ -1851,11 +2109,31 @@ class TestStreamsRedis62Floor:
     this design at all, see carry-forward.md section 4). Every other
     integration test in this file runs against redis:latest/valkey:latest via
     the shared redis_container fixture, so none of them actually exercise
-    6.2. This class is intentionally small and non-parametrized (one
-    dedicated redis_62_container, no global_keyprefix matrix): just enough
-    to prove publish/consume/ack, the consumer-cleanup Lua script, and the
-    XPENDING-IDLE-then-XCLAIM reclaim path all work on the floor version.
+    6.2. This class is intentionally small (one dedicated, session-scoped
+    redis_62_container): just enough to prove publish/consume/ack, the
+    consumer-cleanup Lua script, and both reclaim paths (single-page and the
+    exclusive-cursor multi-page continuation) all work on the floor version.
+    The reclaim tests are parametrized over global_keyprefix so the floor
+    claim is also checked with a prefix, not just unprefixed; the other two
+    are not, to keep this class's runtime small.
+
+    _flush_redis_62 (autouse) flushes the shared session-scoped container
+    before and after every test in this class so they cannot see each
+    other's leftover keys; each test also uses its own queue name as a
+    second, independent layer of isolation.
     """
+
+    @pytest.fixture(autouse=True)
+    def _flush_redis_62(self, redis_62_container: tuple[str, int, str]) -> Generator[None]:
+        """Isolate each test: the container above is session-scoped, shared by the whole class."""
+        host, port, _image = redis_62_container
+        client = client_lib.Redis(host=host, port=port, decode_responses=False)
+        client.flushdb()
+        try:
+            yield
+        finally:
+            client.flushdb()
+            client.close()
 
     def test_publish_consume_ack_roundtrip(
         self,
@@ -1969,19 +2247,37 @@ class TestStreamsRedis62Floor:
         assert "idle-worker" not in remaining_names
         assert "busy-worker" in remaining_names
 
+    @pytest.mark.parametrize("global_keyprefix", ["", "testprefix:"])
     def test_reclaim_via_xpending_idle_and_xclaim(
         self,
         redis_62_container: tuple[str, int, str],
+        global_keyprefix: str,
     ) -> None:
-        """Test the discover-then-claim reclaim pass on Redis 6.2.
+        """Test the discover-then-claim reclaim pass on Redis 6.2, prefixed and not.
 
         Covers Channel._reclaim_and_deliver's two real-server dependencies:
         read-only `XPENDING ... IDLE` discovery (Redis 6.2+) followed by a
         counting `XCLAIM` with a real min_idle_time, never XAUTOCLAIM.
+        Parametrized over global_keyprefix: key-prefix correctness has
+        shipped broken on this branch before, and this class was otherwise
+        never exercised with a prefix at all.
         """
         host, port, _image = redis_62_container
-        app_a = _make_streams_app(host, port, "", visibility_timeout=2, consumer_name="worker-a")
-        app_b = _make_streams_app(host, port, "", visibility_timeout=2, consumer_name="worker-b")
+        queue = "redis62-reclaim-queue"
+        app_a = _make_streams_app(
+            host,
+            port,
+            global_keyprefix,
+            visibility_timeout=2,
+            consumer_name="worker-a",
+        )
+        app_b = _make_streams_app(
+            host,
+            port,
+            global_keyprefix,
+            visibility_timeout=2,
+            consumer_name="worker-b",
+        )
         try:
             with app_a.connection() as conn_a, app_b.connection() as conn_b:
                 channel_a = cast("Channel", conn_a.default_channel)
@@ -1992,28 +2288,30 @@ class TestStreamsRedis62Floor:
                     "body": '{"task": "test.add", "args": [1, 2]}',
                     "properties": {
                         "delivery_tag": delivery_tag,
-                        "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                        "delivery_info": {"exchange": "celery", "routing_key": queue},
                         "headers": {},
                     },
                 }
-                channel_a._put("celery", message)
-                channel_a._get("celery")  # worker-a never acks
+                channel_a._put(queue, message)
+                channel_a._get(queue)  # worker-a never acks
 
                 with patch.object(channel_b.connection, "_deliver") as mock_deliver:
-                    assert channel_b._reclaim_and_deliver("celery", 10) == 0
+                    assert channel_b._reclaim_and_deliver(queue, 10) == 0
 
                     time.sleep(2.5)  # idle now exceeds visibility_timeout=2
 
-                    claimed = channel_b._reclaim_and_deliver("celery", 10)
+                    claimed = channel_b._reclaim_and_deliver(queue, 10)
 
                     assert claimed == 1
-                    payload, queue = mock_deliver.call_args[0]
-                    assert queue == "celery"
+                    payload, delivered_queue = mock_deliver.call_args[0]
+                    assert delivered_queue == queue
                     assert payload["properties"]["delivery_tag"] == delivery_tag
                     assert payload["properties"]["headers"]["x-restore-count"] == 1
 
+                # channel.client auto-prefixes XPENDING (PREFIXED_SIMPLE_COMMANDS), so
+                # the stream key here is deliberately unprefixed either way.
                 pending = channel_b.client.xpending_range(
-                    f"{STREAM_KEY_PREFIX}celery:0",
+                    f"{STREAM_KEY_PREFIX}{queue}:0",
                     DEFAULT_CONSUMER_GROUP,
                     min="-",
                     max="+",
@@ -2024,6 +2322,61 @@ class TestStreamsRedis62Floor:
         finally:
             app_a.close()
             app_b.close()
+
+    @pytest.mark.parametrize("global_keyprefix", ["", "testprefix:"])
+    def test_multi_page_discovery_reclaims_every_survivor_exactly_once(
+        self,
+        redis_62_container: tuple[str, int, str],
+        global_keyprefix: str,
+    ) -> None:
+        """Test the exclusive-cursor multi-page continuation against Redis 6.2 itself.
+
+        The 6.2 floor claim rests on two real-server surfaces: the
+        `XPENDING ... IDLE` filter (covered by the roundtrip and single-page
+        reclaim tests above) and the exclusive stream ID ranges the
+        discover-then-claim pass uses to walk multi-page discovery
+        (streams.py's ``cursor = "(" + last_id``). This test closes the
+        second half specifically on 6.2, not just on redis:latest/valkey:latest.
+        See _run_multi_page_reclaim_scenario's docstring for why this exact
+        staging is required to make that cursor observable against a real
+        server at all, rather than silently masked by XCLAIM's own
+        idle-reset behavior.
+        """
+        host, port, _image = redis_62_container
+        queue = "redis62-multipage-reclaim-queue"
+        app_a = _make_streams_app(
+            host,
+            port,
+            global_keyprefix,
+            visibility_timeout=0.3,
+            consumer_name="worker-a",
+        )
+        app_b = _make_streams_app(
+            host,
+            port,
+            global_keyprefix,
+            visibility_timeout=0.3,
+            consumer_name="worker-b",
+        )
+        try:
+            with app_a.connection() as conn_a, app_b.connection() as conn_b:
+                channel_a = cast("Channel", conn_a.default_channel)
+                channel_b = cast("Channel", conn_b.default_channel)
+                claimed, delivered, consumed_tags, stuck_tag = _run_multi_page_reclaim_scenario(
+                    channel_a,
+                    channel_b,
+                    queue,
+                )
+        finally:
+            app_a.close()
+            app_b.close()
+
+        delivered_tags = [message["properties"]["delivery_tag"] for message in delivered]
+        expected_tags = set(consumed_tags) - {stuck_tag}
+
+        assert claimed == len(expected_tags)
+        assert len(delivered_tags) == len(set(delivered_tags)), "an entry was delivered more than once"
+        assert set(delivered_tags) == expected_tags
 
 
 @pytest.mark.integration
@@ -2115,9 +2468,15 @@ class TestStreamsThroughput:
         count = 50
         poll_timeout = Transport.polling_interval  # patched to 1s by conftest
 
-        start = time.monotonic()
+        # Publish before starting the clock: the brief's "a few seconds" bar
+        # is for draining an already-published batch, not for the publish
+        # calls themselves. Timing the 50 record.delay() calls inside the
+        # measurement window inflated elapsed with publish-side overhead
+        # that has nothing to do with the on_tick drain behavior under test.
         for i in range(count):
             record.delay(i)
+
+        start = time.monotonic()
 
         # Generous outer deadline so a genuine regression fails loudly with a
         # clear assertion message instead of hanging; the real bar is the
@@ -2137,11 +2496,15 @@ class TestStreamsThroughput:
             f"({rate:.1f} msg/s); count x poll_timeout = {count * poll_timeout}s",
         )
 
-        # "Far below" per the ruling: comfortably under a single poll_timeout,
+        # "Far below" per the ruling: the brief calls for "a few seconds," not
+        # a single poll_timeout. Observed drain time is a small fraction of a
+        # second (0.036-0.047s in prior runs), so a few-seconds bar still
+        # leaves ample headroom above real timing noise while remaining
         # nowhere near count x poll_timeout (the one-message-per-cycle
-        # regression this test exists to catch).
-        assert elapsed < poll_timeout, (
+        # regression this test exists to catch, ~50s here).
+        throughput_bar_seconds = 5.0
+        assert elapsed < throughput_bar_seconds, (
             f"drained {count} messages in {elapsed:.2f}s but expected well under "
-            f"a single poll_timeout ({poll_timeout}s); count x poll_timeout would be "
+            f"{throughput_bar_seconds:.0f}s; count x poll_timeout would be "
             f"{count * poll_timeout}s if the hub fell back to one message per cycle"
         )
