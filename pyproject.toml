@@ -117,6 +117,14 @@ unfixable = []
   "S311",    # Pseudo-random ok for tests (not cryptographic)
   "T201",    # Print statements useful in manual tests
 ]
+"battle/**" = [
+  "BLE001",  # Broad excepts keep orchestrator threads alive during chaos
+  "PLR2004", # Profile constants and thresholds are self-explanatory
+  "S311",    # Seeded pseudo-random drives reproducible chaos (not cryptographic)
+  "S603",    # subprocess calls to the docker CLI are the harness mechanism
+  "S607",    # docker is resolved from PATH by design
+  "T201",    # print IS the CLI user interface
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

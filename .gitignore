@@ -79,6 +79,9 @@ site/
 # Design specs / planning artifacts
 docs/superpowers/
 
+# Battle-testing harness output
+battle/results/
+
 # OS
 .DS_Store
 Thumbs.db

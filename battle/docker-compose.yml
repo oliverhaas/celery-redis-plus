@@ -1,0 +1,45 @@
+name: battle
+
+x-battle-env: &battle-env
+  BATTLE_TRANSPORT: ${BATTLE_TRANSPORT:-plus}
+  BATTLE_BROKER_URL: redis://redis-broker:6379/0
+  BATTLE_LEDGER_URL: redis://redis-ledger:6379/0
+  BATTLE_VISIBILITY_TIMEOUT: ${BATTLE_VISIBILITY_TIMEOUT:-30}
+  BATTLE_REQUEUE_INTERVAL: ${BATTLE_REQUEUE_INTERVAL:-10}
+  BATTLE_ACKS_LATE: ${BATTLE_ACKS_LATE:-0}
+  BATTLE_CONCURRENCY: ${BATTLE_CONCURRENCY:-4}
+  BATTLE_PREFETCH: ${BATTLE_PREFETCH:-4}
+  BATTLE_POOL: ${BATTLE_POOL:-prefork}
+  BATTLE_EVENT_PATCH: ${BATTLE_EVENT_PATCH:-0}
+  BATTLE_SOFT_SHUTDOWN_TIMEOUT: ${BATTLE_SOFT_SHUTDOWN_TIMEOUT:-8}
+
+services:
+  redis-broker:
+    image: ${BATTLE_BROKER_IMAGE:-redis:7}
+    ports:
+      - "127.0.0.1:${BATTLE_BROKER_PORT:-6390}:6379"
+
+  redis-ledger:
+    image: redis:7
+    ports:
+      - "127.0.0.1:${BATTLE_LEDGER_PORT:-6391}:6379"
+
+  worker:
+    build:
+      context: ..
+      dockerfile: battle/Dockerfile
+    environment: *battle-env
+    depends_on:
+      - redis-broker
+      - redis-ledger
+    stop_grace_period: 120s  # chaos controls kill timing; teardown uses down -t 5
+
+  monitor:
+    build:
+      context: ..
+      dockerfile: battle/Dockerfile
+    command: ["python", "-m", "battle_app.monitor"]
+    environment: *battle-env
+    depends_on:
+      - redis-broker
+      - redis-ledger
