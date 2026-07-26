@@ -427,23 +427,48 @@ class MultiChannelPoller:
     def _register_XREADGROUP(self, channel: Channel) -> bool:
         """Enable XREADGROUP mode for channel (queue streams).
 
-        Runs the non-blocking EVALSHA consume pass inline; when every queue
-        is empty the channel arms a blocking XREADGROUP and keeps _in_poll
-        set until the reply is parsed by _xreadgroup_read.
+        Loops the non-blocking EVALSHA consume pass inline within this one
+        hub tick, draining every already-available message up to the
+        channel's QoS prefetch headroom (or DEFAULT_REQUEUE_BATCH_LIMIT,
+        whichever is smaller), instead of delivering only the first hit.
+
+        Channel._consume_read's EVALSHA is synchronous: it sends and parses
+        the reply inline and returns on the first hit, unlike the sorted-set
+        transport's _register_BZMPOP, which sends and defers the read to
+        on_readable so the blocking reply itself wakes the hub again the
+        instant more data is available. Without this loop, a burst of N
+        already-queued messages would drain at only one message per hub
+        tick: nothing here would prompt the next tick to run any sooner than
+        the hub's own poll_timeout otherwise allows (bound by the nearest
+        scheduled timer, e.g. the requeue-check interval, not by anything
+        this transport controls), turning what should be a near-instant
+        drain into roughly N x poll_timeout. When every queue is empty, the
+        final _consume_read call arms a blocking XREADGROUP and keeps
+        _in_poll set until the reply is parsed by _xreadgroup_read.
 
         Returns:
-            True if the non-blocking pass delivered a message.
+            True if the non-blocking pass delivered at least one message.
         """
         ident = channel, channel.client, "XREADGROUP"
         if not self._client_registered(channel, channel.client, "XREADGROUP"):
             channel._in_poll = False
             self._register(*ident)
-        if not channel._in_poll:
+        if channel._in_poll:
+            return False
+
+        qos = channel.qos
+        delivered_any = False
+        for _ in range(DEFAULT_REQUEUE_BATCH_LIMIT):
+            if qos is not None:
+                remaining = qos.can_consume_max_estimate()
+                if remaining is not None and remaining <= 0:
+                    break
             try:
-                return channel._consume_read()
+                channel._consume_read()
             except Empty:
-                return False
-        return False
+                break
+            delivered_any = True
+        return delivered_any
 
     def _register_XREAD(self, channel: Channel) -> None:
         """Enable XREAD mode for channel (fanout streams)."""

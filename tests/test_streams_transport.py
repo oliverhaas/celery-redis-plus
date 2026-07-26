@@ -2098,7 +2098,13 @@ class TestStreamsPoller:
     """Unit tests for the streams MultiChannelPoller registration and drain cycle."""
 
     def test_register_xreadgroup_registers_socket_and_runs_pass(self) -> None:
-        """Test _register_XREADGROUP registers the client socket and runs the non-blocking pass."""
+        """Test _register_XREADGROUP registers the client socket and runs the non-blocking pass.
+
+        _consume_read delivers one message then finds the queue empty
+        (Empty), so the drain loop makes exactly two calls: deliver, then
+        stop. channel.qos is set to None to bypass the prefetch-headroom
+        gate, which is exercised separately below.
+        """
         poller = object.__new__(MultiChannelPoller)
         poller._fd_to_chan = {}
         poller._chan_to_sock = {}
@@ -2106,15 +2112,16 @@ class TestStreamsPoller:
 
         channel = MagicMock()
         channel._in_poll = None
+        channel.qos = None
         mock_sock = MagicMock()
         mock_sock.fileno.return_value = 7
         channel.client.connection._sock = mock_sock
-        channel._consume_read.return_value = True
+        channel._consume_read.side_effect = [True, Empty]
 
         result = poller._register_XREADGROUP(channel)
 
         assert result is True
-        channel._consume_read.assert_called_once()
+        assert channel._consume_read.call_count == 2
         assert poller._fd_to_chan[7] == (channel, "XREADGROUP")
         assert poller._chan_to_sock[(channel, channel.client, "XREADGROUP")] is mock_sock
         poller.poller.register.assert_called_once_with(mock_sock, poller.eventflags)
@@ -2147,6 +2154,7 @@ class TestStreamsPoller:
 
         channel = MagicMock()
         channel._in_poll = None
+        channel.qos = None
         mock_sock = MagicMock()
         mock_sock.fileno.return_value = 7
         channel.client.connection._sock = mock_sock
@@ -2156,6 +2164,59 @@ class TestStreamsPoller:
 
         assert result is False
         channel._consume_read.assert_called_once()
+
+    def test_register_xreadgroup_drains_available_burst_in_one_tick(self) -> None:
+        """Test the drain loop keeps calling _consume_read while messages are available.
+
+        Regression test for the finding behind TestStreamsThroughput
+        (tests/test_streams_integration.py): _consume_read's EVALSHA is
+        synchronous and returns on the first hit, so without a loop here a
+        burst of already-queued messages would drain at only one message
+        per hub tick, gated by the hub's own poll schedule rather than by
+        anything this transport controls.
+        """
+        poller = object.__new__(MultiChannelPoller)
+        poller._fd_to_chan = {}
+        poller._chan_to_sock = {}
+        poller.poller = MagicMock()
+
+        channel = MagicMock()
+        channel._in_poll = None
+        channel.qos = None
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 7
+        channel.client.connection._sock = mock_sock
+        channel._consume_read.side_effect = [True, True, True, Empty]
+
+        result = poller._register_XREADGROUP(channel)
+
+        assert result is True
+        assert channel._consume_read.call_count == 4
+
+    def test_register_xreadgroup_stops_at_prefetch_headroom(self) -> None:
+        """Test the drain loop stops once QoS.can_consume_max_estimate reaches zero.
+
+        _consume_read would happily keep delivering (it never runs out in
+        this test), so the loop must be the one enforcing the prefetch
+        limit rather than relying on the queue running dry.
+        """
+        poller = object.__new__(MultiChannelPoller)
+        poller._fd_to_chan = {}
+        poller._chan_to_sock = {}
+        poller.poller = MagicMock()
+
+        channel = MagicMock()
+        channel._in_poll = None
+        channel.qos.can_consume_max_estimate.side_effect = [2, 1, 0]
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 7
+        channel.client.connection._sock = mock_sock
+        channel._consume_read.return_value = True
+
+        result = poller._register_XREADGROUP(channel)
+
+        assert result is True
+        assert channel._consume_read.call_count == 2
 
     def test_on_poll_start_registers_active_channels(self) -> None:
         """Test on_poll_start registers queue channels for XREADGROUP and fanout channels for XREAD."""
