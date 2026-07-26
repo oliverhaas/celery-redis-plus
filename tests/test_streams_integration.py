@@ -954,6 +954,121 @@ class TestStreamsHeartbeatIntegration:
 
 
 @pytest.mark.integration
+class TestStreamsAcksLateIntegration:
+    """acks_late=True with a task that outlives visibility_timeout.
+
+    This is the configuration the transport's central claim is about:
+    visibility_timeout means "worker considered dead after this much
+    heartbeat silence", not "maximum task duration". Under acks_late the
+    message stays in the PEL for the whole task run, so the only thing
+    stopping a peer from stealing it is the XCLAIM ... JUSTID heartbeat
+    firing off the worker's hub timer.
+
+    TestStreamsHeartbeatIntegration calls channel._heartbeat() by hand. That
+    proves the reclaim arithmetic but not that the timer is registered and
+    still fires while a task occupies the pool, which is what this covers.
+
+    Requires a non-solo pool: solo runs the task in the hub thread, so the
+    heartbeat could not fire during the task however it was registered, and
+    the test would pass for the wrong reason.
+    """
+
+    VISIBILITY_TIMEOUT = 2
+    TASK_DURATION = 4
+
+    @pytest.fixture
+    def celery_config(
+        self,
+        redis_container: tuple[str, int, str],
+        global_keyprefix: str,
+    ) -> dict[str, Any]:
+        """Streams broker with a visibility_timeout well below the task duration."""
+        host, port, _image = redis_container
+        options: dict[str, Any] = {
+            "visibility_timeout": self.VISIBILITY_TIMEOUT,
+            "consumer_name": "acks-late-worker",
+        }
+        if global_keyprefix:
+            options["global_keyprefix"] = global_keyprefix
+        return {
+            "broker_url": f"valkey-streams://{host}:{port}/0",
+            "result_backend": f"redis://{host}:{port}/1",
+            "broker_transport_options": options,
+        }
+
+    @pytest.fixture
+    def celery_worker_pool(self) -> str:
+        """Non-solo pool so the hub keeps ticking while the task runs."""
+        return "threads"
+
+    def test_heartbeat_protects_a_long_acks_late_task_from_peer_reclaim(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+        redis_container: tuple[str, int, str],
+        global_keyprefix: str,
+    ) -> None:
+        """Test that a peer cannot reclaim an acks_late task that runs past visibility_timeout.
+
+        The task runs for twice the visibility_timeout. Without the heartbeat
+        its PEL entry would cross the idle threshold partway through and the
+        peer below would take it, executing the task a second time. The
+        assertions are that the peer reclaims nothing while the task is still
+        running, and that the task body ran exactly once.
+        """
+        host, port, _image = redis_container
+        started = threading.Event()
+        runs: list[int] = []
+        lock = threading.Lock()
+
+        @celery_app.task(acks_late=True)
+        def slow_echo(x: int) -> int:
+            with lock:
+                runs.append(x)
+            started.set()
+            time.sleep(self.TASK_DURATION)
+            return x
+
+        celery_worker.reload()
+        result = slow_echo.apply_async(args=(7,))
+
+        assert started.wait(timeout=30), "task never started"
+
+        # Let the PEL entry age past visibility_timeout while the task is
+        # still running. Only the heartbeat keeps it from qualifying as
+        # abandoned here.
+        time.sleep(self.VISIBILITY_TIMEOUT * 1.5)
+
+        peer_app = _make_streams_app(
+            host,
+            port,
+            global_keyprefix,
+            visibility_timeout=self.VISIBILITY_TIMEOUT,
+            consumer_name="peer-reclaimer",
+        )
+        try:
+            with peer_app.connection() as peer_conn:
+                peer_channel = cast("Channel", peer_conn.default_channel)
+                stolen: list[Any] = []
+                peer_channel.basic_consume(
+                    "celery",
+                    no_ack=False,
+                    callback=stolen.append,
+                    consumer_tag="peer-ctag",
+                )
+                processed = peer_channel._reclaim_and_deliver("celery", budget=10)
+        finally:
+            peer_app.close()
+
+        assert processed == 0, "peer reclaimed a heartbeated in-flight task"
+        assert stolen == []
+
+        assert result.get(timeout=30) == 7
+        with lock:
+            assert runs == [7], f"task body ran {len(runs)} times, expected exactly once"
+
+
+@pytest.mark.integration
 class TestStreamsPoisonIntegration:
     """max_restore_count enforcement and dead-letter copies for poison messages."""
 
