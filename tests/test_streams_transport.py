@@ -3930,6 +3930,7 @@ class TestStreamsReclaim:
         assert total == 1
         assert channel._move_delayed.call_count == 2
         channel._reclaim_and_deliver.assert_called_once_with("q2", DEFAULT_REQUEUE_BATCH_LIMIT - 1)
+        channel._cleanup_consumers.assert_called_once()
 
     def test_maybe_enqueue_due_messages_skips_inactive_channels(self) -> None:
         """Channels without a QoS or without active queues are skipped entirely."""
@@ -3947,6 +3948,8 @@ class TestStreamsReclaim:
         assert total == 0
         no_qos_channel._move_delayed.assert_not_called()
         idle_channel._move_delayed.assert_not_called()
+        no_qos_channel._cleanup_consumers.assert_not_called()
+        idle_channel._cleanup_consumers.assert_not_called()
 
     def test_maybe_enqueue_due_messages_skips_reclaim_when_cannot_consume(self) -> None:
         """Reclaim is skipped entirely once the channel is already at its prefetch_count limit.
@@ -5725,6 +5728,27 @@ class TestStreamsSize:
         mock_client.pipeline.assert_called_once()
         mock_pipe.zcard.assert_called_once_with("delayed:myq")
 
+    def test_has_queue_true_when_a_key_exists(self) -> None:
+        """_has_queue is True when EXISTS reports at least one matching key."""
+        channel, mock_client, _mock_pipe = self._make_channel()
+        mock_client.exists.return_value = 1
+
+        assert channel._has_queue("myq") is True
+        mock_client.exists.assert_called_once_with(
+            "stream:myq:9",
+            "stream:myq:6",
+            "stream:myq:3",
+            "stream:myq:0",
+            "delayed:myq",
+        )
+
+    def test_has_queue_false_when_no_keys_exist(self) -> None:
+        """_has_queue is False when neither the level streams nor the delayed zset exist."""
+        channel, mock_client, _mock_pipe = self._make_channel()
+        mock_client.exists.return_value = 0
+
+        assert channel._has_queue("myq") is False
+
 
 @pytest.mark.unit
 class TestStreamsPurgeDelete:
@@ -5848,6 +5872,24 @@ class TestStreamsExpires:
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
         return channel, mock_client, mock_pipe
 
+    def test_prepare_queue_arguments(self) -> None:
+        """prepare_queue_arguments converts expires/message_ttl to ms."""
+        channel = object.__new__(Channel)
+
+        result = channel.prepare_queue_arguments({}, expires=60.0, message_ttl=30.0)
+
+        assert result["x-expires"] == 60000
+        assert result["x-message-ttl"] == 30000
+
+    def test_prepare_queue_arguments_preserves_existing(self) -> None:
+        """prepare_queue_arguments preserves existing queue arguments."""
+        channel = object.__new__(Channel)
+
+        result = channel.prepare_queue_arguments({"x-custom": "value"}, expires=60.0)
+
+        assert result["x-expires"] == 60000
+        assert result["x-custom"] == "value"
+
     def test_new_queue_registers_expires_and_updates_timer(self) -> None:
         """x-expires is stored in ms and the poller expires timer is updated."""
         channel, _mock_client, _mock_pipe = self._make_channel()
@@ -5857,14 +5899,17 @@ class TestStreamsExpires:
         assert channel._expires == {"myq": 30000}
         channel.connection.cycle._update_expires_timer.assert_called_once()
 
-    def test_new_queue_clamps_expires_below_minimum(self) -> None:
-        """x-expires below MIN_QUEUE_EXPIRES is clamped to the minimum."""
+    def test_new_queue_clamps_expires_below_minimum(self, caplog: pytest.LogCaptureFixture) -> None:
+        """x-expires below MIN_QUEUE_EXPIRES is clamped, warns once, and flips the clamp flag."""
         channel, _mock_client, _mock_pipe = self._make_channel()
 
-        with patch.object(Channel, "_warned_expires_clamp", new=False, create=True):
-            channel._new_queue("myq", arguments={"x-expires": 500})
+        with patch.object(Channel, "_warned_expires_clamp", new=False):
+            with caplog.at_level(logging.WARNING, logger="celery_redis_plus.streams"):
+                channel._new_queue("myq", arguments={"x-expires": 500})
 
-        assert channel._expires == {"myq": MIN_QUEUE_EXPIRES}
+            assert channel._expires == {"myq": MIN_QUEUE_EXPIRES}
+            assert any("below minimum" in record.getMessage() for record in caplog.records)
+            assert Channel._warned_expires_clamp is True
 
     def test_new_queue_registers_message_ttl(self) -> None:
         """x-message-ttl is stored per queue and does not touch the expires timer."""

@@ -941,6 +941,11 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             cast("QoS", self.qos)._in_flight[delivery_tag] = (hit_key, entry_id)
             return message
 
+    def _has_queue(self, queue: str, **kwargs: Any) -> bool:
+        """Return whether any level stream or the delayed zset exists for this queue."""
+        with self.conn_or_acquire() as client:
+            return bool(client.exists(*self._stream_keys_for_queue(queue), self._delayed_key(queue)))
+
     def _size(self, queue: str) -> int:
         """Return the message count: sum of XLEN over level streams plus ZCARD of the delayed zset."""
         with self.conn_or_acquire() as client, client.pipeline() as pipe:
@@ -955,6 +960,9 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
 
         Consumer groups die with their stream and are recreated lazily on next
         use, so the cached group entries for this queue are dropped as well.
+        Deleting the level streams also destroys those consumer groups'
+        pending entry lists, so any unacked, in-flight messages are discarded
+        along with the queued ones.
         """
         stream_keys = self._stream_keys_for_queue(queue)
         delayed_key = self._delayed_key(queue)
