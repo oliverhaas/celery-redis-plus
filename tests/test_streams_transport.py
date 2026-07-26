@@ -2218,6 +2218,62 @@ class TestStreamsPoller:
         assert result is True
         assert channel._consume_read.call_count == 2
 
+    def test_register_xreadgroup_skips_cap_exit_arming_without_headroom(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Test cap-exit arming is skipped when prefetch headroom lands exactly at zero.
+
+        Arming with no headroom leaves on_readable refusing to parse the fd
+        that on_poll_start keeps re-adding every tick, busy-spinning the hub
+        until an ack frees capacity. Only reachable when headroom equals the
+        cap exactly: every iteration then passes the > 0 check, so the loop
+        still exits via the cap rather than the headroom break.
+        """
+        monkeypatch.setattr("celery_redis_plus.streams.DEFAULT_REQUEUE_BATCH_LIMIT", 3)
+        poller = object.__new__(MultiChannelPoller)
+        poller._fd_to_chan = {}
+        poller._chan_to_sock = {}
+        poller.poller = MagicMock()
+
+        channel = MagicMock()
+        channel._in_poll = None
+        # Three positive values inside the loop, then zero for the post-loop check.
+        channel.qos.can_consume_max_estimate.side_effect = [3, 2, 1, 0]
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 7
+        channel.client.connection._sock = mock_sock
+        channel._consume_read.return_value = True
+
+        poller._register_XREADGROUP(channel)
+
+        assert channel._consume_read.call_count == 3
+        channel._xreadgroup_start.assert_not_called()
+
+    def test_register_xreadgroup_arms_on_cap_exit_with_headroom_left(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Test cap exit still arms a blocking read while prefetch headroom remains."""
+        monkeypatch.setattr("celery_redis_plus.streams.DEFAULT_REQUEUE_BATCH_LIMIT", 3)
+        poller = object.__new__(MultiChannelPoller)
+        poller._fd_to_chan = {}
+        poller._chan_to_sock = {}
+        poller.poller = MagicMock()
+
+        channel = MagicMock()
+        channel._in_poll = None
+        channel.qos.can_consume_max_estimate.side_effect = [9, 8, 7, 6]
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 7
+        channel.client.connection._sock = mock_sock
+        channel._consume_read.return_value = True
+
+        poller._register_XREADGROUP(channel)
+
+        assert channel._consume_read.call_count == 3
+        channel._xreadgroup_start.assert_called_once_with()
+
     def test_on_poll_start_registers_active_channels(self) -> None:
         """Test on_poll_start registers queue channels for XREADGROUP and fanout channels for XREAD."""
         poller = object.__new__(MultiChannelPoller)

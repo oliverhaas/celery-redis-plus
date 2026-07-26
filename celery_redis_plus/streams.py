@@ -444,7 +444,12 @@ class MultiChannelPoller:
         this transport controls), turning what should be a near-instant
         drain into roughly N x poll_timeout. When every queue is empty, the
         final _consume_read call arms a blocking XREADGROUP and keeps
-        _in_poll set until the reply is parsed by _xreadgroup_read.
+        _in_poll set until the reply is parsed by _xreadgroup_read. Exiting
+        via the cap arms one here instead, so the remaining backlog is not
+        left waiting on poll_timeout. That is the one case where the blocking
+        path is entered with messages still queued, so _xreadgroup_read may
+        deliver up to one lower-priority entry per level stream ahead of
+        higher-priority ones; the next non-blocking pass restores order.
 
         Returns:
             True if the non-blocking pass delivered at least one message.
@@ -469,17 +474,15 @@ class MultiChannelPoller:
                 break
             delivered_any = True
         else:
-            # Every iteration delivered a message and the cap was still hit:
-            # _consume_read only arms a blocking XREADGROUP when a pass finds
-            # every watched queue empty (the `except Empty` branch above), so
-            # reaching the cap without ever seeing Empty means more messages
-            # may still be waiting past DEFAULT_REQUEUE_BATCH_LIMIT, with
-            # nothing armed to wake the hub for them. Arm one now: XREADGROUP
-            # with BLOCK still returns immediately when data is already
-            # there, so this either delivers right away on the next readable
-            # event or genuinely blocks if the queue just emptied, instead of
-            # leaving the hub to sleep up to poll_timeout with work queued.
-            channel._xreadgroup_start()
+            # Cap hit without ever seeing Empty, so more may still be waiting.
+            # _consume_read only arms a blocking XREADGROUP on an empty pass,
+            # leaving nothing to wake the hub for the rest; BLOCK still
+            # returns immediately when data is already there. Arm only with
+            # headroom left: at zero, on_readable refuses to parse the fd that
+            # on_poll_start keeps re-adding, busy-spinning until an ack.
+            headroom = None if qos is None else qos.can_consume_max_estimate()
+            if headroom is None or headroom > 0:
+                channel._xreadgroup_start()
         return delivered_any
 
     def _register_XREAD(self, channel: Channel) -> None:
@@ -1755,9 +1758,10 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
     def _xreadgroup_start(self, timeout: float | None = None) -> None:
         """Send a blocking XREADGROUP over all watched level streams.
 
-        Called when the non-blocking pass found every queue empty. Data on
-        any stream wakes the poller fd; strict priority order is restored on
-        the next non-blocking pass.
+        Called when the non-blocking pass found every queue empty, or when it
+        hit the per-tick drain cap with messages still available. Data on any
+        stream wakes the poller fd; strict priority order is restored on the
+        next non-blocking pass.
         """
         if timeout is None:
             timeout = self.connection.polling_interval or 1
