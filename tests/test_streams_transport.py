@@ -1424,6 +1424,34 @@ class TestStreamsQoSAck:
         qos._quick_ack.assert_called_once_with("tag1")
         assert "tag1" in qos._in_flight
 
+    def test_ack_while_closing_but_not_collected_still_acks_by_tag(self) -> None:
+        """F1 regression: an ack during graceful close must still reach the broker.
+
+        kombu's virtual.Channel.close() sets closed = True before it calls
+        restore_unacked_once(), and the shutdown dance drains hub callbacks
+        precisely so acks from just-completed tasks land in that window. A
+        guard keyed off `closed` swallowed them, leaving the PEL entry aged to
+        SHUTDOWN_IDLE_MS for a peer to re-execute at once. Only `_collected`
+        may suppress an ack.
+        """
+        channel = object.__new__(Channel)
+        channel.connection = MagicMock()
+        channel.closed = True
+        channel._collected = False
+
+        qos = object.__new__(QoS)
+        qos.channel = channel
+        qos._fanout_tags = set()
+        qos._in_flight = {"tag1": (f"{STREAM_KEY_PREFIX}my_queue:0", "1700000000000-0")}
+        qos._delivered = {"tag1": MagicMock()}
+        qos._dirty = set()
+        qos._quick_ack = MagicMock()
+        qos._ack_by_tag = MagicMock()
+
+        qos.ack("tag1")
+
+        qos._ack_by_tag.assert_called_once_with("tag1")
+
 
 @pytest.mark.unit
 class TestStreamsQoSReject:
@@ -5216,6 +5244,9 @@ class TestStreamsCollectVsClose:
         mock_qos.restore_unacked_once.assert_not_called()
         mock_qos._on_collect.cancel.assert_called_once()
         assert channel.closed is True
+        # Without this, deleting the _collected assignment leaves the whole
+        # suite green while acks on a collected channel raise again.
+        assert channel._collected is True
         transport.cycle.close.assert_called_once()
 
     def test_close_channel_still_restores_unacked(self) -> None:
@@ -5271,7 +5302,7 @@ class TestStreamsCollectVsClose:
         mock_qos.restore_unacked_once.assert_not_called()
         assert channel.closed is True
 
-    def test_release_channel_on_collect_already_closed_is_noop(self) -> None:
+    def test_release_channel_on_collect_already_collected_is_noop(self) -> None:
         """A channel already collected (e.g. by a prior collect) is left untouched."""
         channel, mock_qos = self._make_bare_channel()
         channel.closed = True
