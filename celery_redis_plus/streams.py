@@ -184,17 +184,11 @@ class QoS(virtual.QoS):
 
     def ack(self, delivery_tag: str) -> None:
         if self.channel._collected:
-            # The channel was released by Transport._collect on a lost
-            # connection, not a real shutdown: there is no client left to
-            # talk to (conn_or_acquire() would try to rebuild a pool that
-            # kombu's Connection.collect() has already severed from a
-            # client), and the broker still owns this PEL entry, so a peer
-            # will reclaim it after the visibility timeout. Nothing to do here.
-            # Note: this checks channel._collected, NOT channel.closed.
-            # virtual.Channel.close() sets `closed = True` for a genuine
-            # shutdown too, well before it calls restore_unacked_once(), so
-            # keying off `closed` would silently drop acks that arrive (via a
-            # deferred hub callback) during that restore window.
+            # Connection lost, not a shutdown: no client left to talk to, and the
+            # broker still owns this PEL entry for a peer to reclaim.
+            # Must be _collected, NOT closed: virtual.Channel.close() sets closed
+            # before restore_unacked_once(), so keying off it would drop the acks
+            # that the restore's hub drain exists to deliver.
             logger.debug("Skipping ack for delivery_tag %r: channel was collected", delivery_tag)
             self._fanout_tags.discard(delivery_tag)
             super().ack(delivery_tag)
@@ -340,13 +334,10 @@ class QoS(virtual.QoS):
                             else:
                                 released_tags.extend(tag for tag, _ in entries)
                 except Exception:
-                    # Could not even acquire a connection (e.g. the pool this
-                    # channel just tore down during close() failed to
-                    # reconnect): nothing was released, so _in_flight must
-                    # stay untouched and this must not escape restore_unacked_once
-                    # (it runs inside Channel.close(), which has already set
-                    # self.closed = True; an exception here would abort the
-                    # rest of that close and any later channels' closing).
+                    # No connection at all, so nothing was released and _in_flight
+                    # stays untouched. Must not escape: this runs inside
+                    # Channel.close(), and raising would abort the rest of that
+                    # close and every later channel's.
                     logger.warning(
                         "Could not acquire a connection to release in-flight messages for instant"
                         " reclaim; peers will reclaim them after the visibility timeout",
