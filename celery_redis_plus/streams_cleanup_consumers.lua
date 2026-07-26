@@ -42,7 +42,16 @@ local idle_threshold_ms = tonumber(ARGV[3])
 
 local ok, consumers = pcall(redis.call, 'XINFO', 'CONSUMERS', stream_key, group)
 if not ok then
-    local message = type(consumers) == 'string' and consumers or tostring(consumers)
+    -- pcall yields the error as a plain string on redis 7.x, redis 6.2 and
+    -- valkey (verified). Accept the {err = ...} table form too, so a server
+    -- that raises it does not turn every routine missing stream into a
+    -- "tostring(table)" message that matches neither case below.
+    local message = consumers
+    if type(message) == 'table' then
+        message = message.err or 'unknown error'
+    elseif type(message) ~= 'string' then
+        message = tostring(message)
+    end
     if message:find('no such key', 1, true) or message:find('NOGROUP', 1, true) then
         return {}
     end

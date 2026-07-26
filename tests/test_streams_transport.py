@@ -6070,6 +6070,7 @@ class TestStreamsConsumerCleanup:
         channel.visibility_timeout = 300
         channel.global_keyprefix = global_keyprefix
         channel.ResponseError = _client_exceptions.ResponseError
+        channel._warned_cleanup_streams = set()
         channel._stream_keys_for_queue = MagicMock(return_value=["stream:myq:0"])
 
         mock_client = MagicMock()
@@ -6128,6 +6129,43 @@ class TestStreamsConsumerCleanup:
         mock_logger.warning.assert_called_once()
         logged_message = mock_logger.warning.call_args.args[2]
         assert "WRONGTYPE" in logged_message
+
+    def test_cleanup_warns_once_per_stream_then_drops_to_debug(self) -> None:
+        """A persistent XINFO failure is loud once and quiet afterwards, not every cycle forever."""
+        channel, _mock_client, mock_script = self._make_channel()
+        mock_script.return_value = [-1, b"WRONGTYPE Operation against a key holding the wrong kind of value"]
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+            patch("celery_redis_plus.streams.logger") as mock_logger,
+        ):
+            channel._cleanup_consumers()
+            channel._cleanup_consumers()
+            channel._cleanup_consumers()
+
+        mock_logger.warning.assert_called_once()
+        assert mock_logger.debug.call_count == 2
+
+    @pytest.mark.parametrize("reply", [[b"worker-2", b"worker-3"], [-1], [-1, b"a", b"b"], b"OK"])
+    def test_cleanup_ignores_replies_that_are_not_the_error_sentinel(self, reply: Any) -> None:
+        """Only a two-element [int, message] reply is an error.
+
+        Deleted-name lists must not warn, and a malformed reply must be ignored
+        rather than IndexError out of the loop or index a bytes object to an int.
+        """
+        channel, _mock_client, mock_script = self._make_channel()
+        mock_script.return_value = reply
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+            patch("celery_redis_plus.streams.logger") as mock_logger,
+        ):
+            channel._cleanup_consumers()
+
+        mock_logger.warning.assert_not_called()
+        assert channel._warned_cleanup_streams == set()
 
     def test_cleanup_survives_one_stream_failing_and_still_processes_the_next(self) -> None:
         """A script-invocation error on one stream is isolated; the next stream still runs (I3)."""

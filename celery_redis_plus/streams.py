@@ -746,6 +746,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         self._message_ttls: dict[str, int] = {}  # queue_name -> message TTL in ms
         # Streams whose consumer group has already been created (XGROUP CREATE cache)
         self._ensured_groups: set[str] = set()
+        # Streams already reported as uninspectable by consumer cleanup (warn-once)
+        self._warned_cleanup_streams: set[str] = set()
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -1529,16 +1531,32 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                             # list). Any other XINFO failure comes back as
                             # [-1, message] instead (see the script), which is
                             # otherwise unobservable since the write itself
-                            # never raises for that case.
-                            if result and isinstance(result[0], int):
-                                message = result[1]
-                                if isinstance(message, bytes):
-                                    message = message.decode()
-                                logger.warning(
-                                    "Consumer cleanup could not inspect %s: %s",
-                                    prefixed_stream_key,
-                                    message,
-                                )
+                            # never raises for that case. Ordinary replies are
+                            # lists of consumer names, so only an integer first
+                            # element can be the sentinel; matching the shape
+                            # rather than indexing also excludes bytes, which
+                            # would otherwise index to an int.
+                            match result:
+                                case [int(), message]:
+                                    if isinstance(message, bytes):
+                                        message = message.decode()
+                                    # These conditions are persistent (a WRONGTYPE key
+                                    # does not clear itself), so shout once per stream
+                                    # and mutter afterwards rather than flooding every
+                                    # cycle forever.
+                                    log = (
+                                        logger.debug
+                                        if prefixed_stream_key in self._warned_cleanup_streams
+                                        else logger.warning
+                                    )
+                                    self._warned_cleanup_streams.add(prefixed_stream_key)
+                                    log(
+                                        "Consumer cleanup could not inspect %s: %s",
+                                        prefixed_stream_key,
+                                        message,
+                                    )
+                                case _:
+                                    pass
                         except self.ResponseError:
                             # One stream failing must not abort hygiene for the
                             # remaining streams and queues this cycle.
