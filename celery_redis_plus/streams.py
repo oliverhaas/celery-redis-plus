@@ -235,10 +235,8 @@ class QoS(virtual.QoS):
 
     def reject(self, delivery_tag: str, requeue: bool = False) -> None:
         if self.channel._collected:
-            # See ack(): the channel was released by Transport._collect, so
-            # there is no client left to talk to. The broker still owns this
-            # PEL entry and a peer will reclaim it after the visibility
-            # timeout, regardless of requeue.
+            # See ack(): no client left to talk to. A peer reclaims the PEL
+            # entry after the visibility timeout, requeue or not.
             logger.debug("Skipping reject for delivery_tag %r: channel was collected", delivery_tag)
             self._fanout_tags.discard(delivery_tag)
             super().ack(delivery_tag)
