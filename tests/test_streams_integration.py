@@ -5,8 +5,10 @@ from __future__ import annotations
 import time
 from queue import Empty
 from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import patch
 
 import pytest
+from kombu import Connection
 
 from celery_redis_plus.constants import (
     DEFAULT_CONSUMER_GROUP,
@@ -457,3 +459,452 @@ class TestStreamsDelayed:
             assert consumed["properties"]["delivery_tag"] == delivery_tag
             assert elapsed >= 3  # never delivered before its eta (lower bound only)
             assert redis_client.zcard(f"{global_keyprefix}{DELAYED_KEY_PREFIX}celery") == 0
+
+
+@pytest.mark.integration
+class TestStreamsReclaimIntegration:
+    """Discover-then-claim recovery of messages from consumers that stopped heartbeating.
+
+    Read-only XPENDING IDLE discovery followed by a counting XCLAIM
+    (Channel._reclaim_and_deliver). XAUTOCLAIM is not part of this design at
+    all (see carry-forward.md section 4).
+    """
+
+    def test_peer_reclaims_unacked_message_after_visibility_timeout(
+        self,
+        redis_container: tuple[str, int, str],
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Test that a peer claims an unacked message once its idle time exceeds visibility_timeout."""
+        host, port, _image = redis_container
+        redis_client.flushdb()
+
+        app_a = _make_streams_app(host, port, global_keyprefix, visibility_timeout=2, consumer_name="worker-a")
+        app_b = _make_streams_app(host, port, global_keyprefix, visibility_timeout=2, consumer_name="worker-b")
+        try:
+            with app_a.connection() as conn_a, app_b.connection() as conn_b:
+                channel_a = cast("Channel", conn_a.default_channel)
+                channel_b = cast("Channel", conn_b.default_channel)
+
+                delivery_tag = "reclaim-vt-test"
+                message = {
+                    "body": '{"task": "test.add", "args": [1, 2]}',
+                    "properties": {
+                        "delivery_tag": delivery_tag,
+                        "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                        "headers": {},
+                    },
+                }
+                channel_a._put("celery", message)
+
+                consumed = channel_a._get("celery")
+                assert consumed["properties"]["delivery_tag"] == delivery_tag
+                # worker-a never acks: simulates a worker that died mid-task
+
+                with patch.object(channel_b.connection, "_deliver") as mock_deliver:
+                    # Before the visibility timeout elapses the peer finds nothing to claim
+                    assert channel_b._reclaim_and_deliver("celery", 10) == 0
+                    mock_deliver.assert_not_called()
+
+                    time.sleep(2.5)  # idle now exceeds visibility_timeout=2
+
+                    claimed = channel_b._reclaim_and_deliver("celery", 10)
+
+                    assert claimed == 1
+                    payload, queue = mock_deliver.call_args[0]
+                    assert queue == "celery"
+                    assert payload["properties"]["delivery_tag"] == delivery_tag
+                    # Second delivery -> x-restore-count injected, same location as the
+                    # sorted-set transport (properties.headers) for parity
+                    assert payload["properties"]["headers"]["x-restore-count"] == 1
+
+                # PEL ownership moved to worker-b
+                pending = channel_b.client.xpending_range(
+                    f"{STREAM_KEY_PREFIX}celery:0",
+                    DEFAULT_CONSUMER_GROUP,
+                    min="-",
+                    max="+",
+                    count=10,
+                )
+                assert len(pending) == 1
+                assert pending[0]["consumer"] == b"worker-b"
+        finally:
+            app_a.close()
+            app_b.close()
+
+    def test_reclaim_redelivers_idle_message_with_restore_count(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """A message idle in the PEL past visibility_timeout is reclaimed by a peer and redelivered.
+
+        Unlike the test above (which mocks Transport._deliver to inspect the
+        raw payload), this drives the real basic_consume dispatch chain, so
+        the delivered message is a genuine kombu Message wired to the
+        reclaiming channel rather than a mocked call argument.
+
+        Sequence: publish via one channel ("producer-worker"), consume it into
+        the PEL without acking (simulating a worker that picked up the message
+        then died before it could ack), wait past a short visibility_timeout,
+        then reclaim via a second channel with a different consumer identity
+        ("reclaimer-worker") standing in for a live peer.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "reclaim-integration-queue"
+
+        producer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": 0.3,
+                "consumer_name": "producer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        reclaimer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": 0.3,
+                "consumer_name": "reclaimer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        try:
+            producer_channel = cast("Channel", producer_conn.channel())
+
+            message = {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-integration-reclaim",
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                },
+            }
+            producer_channel._put(queue, message)
+
+            # Consume into the PEL as "producer-worker" without acking, then
+            # abandon it (simulates a worker dying before it could ack).
+            consumed = producer_channel._get(queue)
+            assert consumed["properties"]["delivery_tag"] == "tag-integration-reclaim"
+
+            # Let visibility_timeout (0.3s) elapse with a generous margin so the
+            # entry is reliably reclaimable even under a slow container start or
+            # a GC pause on a loaded CI host.
+            time.sleep(1.0)
+
+            reclaimer_channel = cast("Channel", reclaimer_conn.channel())
+            delivered: list[Any] = []
+            reclaimer_channel.basic_consume(
+                queue,
+                no_ack=False,
+                callback=delivered.append,
+                consumer_tag="reclaimer-ctag",
+            )
+
+            processed = reclaimer_channel._reclaim_and_deliver(queue, budget=10)
+        finally:
+            producer_conn.close()
+            reclaimer_conn.close()
+
+        assert processed == 1
+        assert len(delivered) == 1
+        # basic_consume wraps the raw dict _reclaim_and_deliver hands to
+        # connection._deliver in a kombu Message before invoking the callback.
+        delivered_message = delivered[0]
+        assert delivered_message.delivery_tag == "tag-integration-reclaim"
+        assert delivered_message.properties["headers"]["x-restore-count"] == 1
+
+
+@pytest.mark.integration
+class TestStreamsHeartbeatIntegration:
+    """XCLAIM JUSTID heartbeats keeping in-flight messages alive past the visibility timeout."""
+
+    def test_heartbeat_prevents_peer_reclaim(
+        self,
+        redis_container: tuple[str, int, str],
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Test that heartbeats keep an in-flight message unclaimed longer than visibility_timeout."""
+        host, port, _image = redis_container
+        redis_client.flushdb()
+
+        app_a = _make_streams_app(host, port, global_keyprefix, visibility_timeout=2, consumer_name="worker-a")
+        app_b = _make_streams_app(host, port, global_keyprefix, visibility_timeout=2, consumer_name="worker-b")
+        try:
+            with app_a.connection() as conn_a, app_b.connection() as conn_b:
+                channel_a = cast("Channel", conn_a.default_channel)
+                channel_b = cast("Channel", conn_b.default_channel)
+
+                message = {
+                    "body": '{"task": "test.add", "args": [1, 2]}',
+                    "properties": {
+                        "delivery_tag": "heartbeat-survival-test",
+                        "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                        "headers": {},
+                    },
+                }
+                channel_a._put("celery", message)
+                channel_a._get("celery")
+
+                # Task "runs" for 3s, longer than visibility_timeout=2, with the worker
+                # main loop heartbeating every 0.5s
+                for _ in range(6):
+                    time.sleep(0.5)
+                    channel_a._heartbeat()
+
+                with patch.object(channel_b.connection, "_deliver") as mock_deliver:
+                    # Idle was reset by the heartbeats: the peer finds nothing
+                    assert channel_b._reclaim_and_deliver("celery", 10) == 0
+                    mock_deliver.assert_not_called()
+
+                    # Once the heartbeat stops the message becomes reclaimable again
+                    time.sleep(2.5)
+                    assert channel_b._reclaim_and_deliver("celery", 10) == 1
+
+                    payload, _queue = mock_deliver.call_args[0]
+                    # JUSTID heartbeats do not bump the delivery count: this is still
+                    # only the first restore
+                    assert payload["properties"]["headers"]["x-restore-count"] == 1
+        finally:
+            app_a.close()
+            app_b.close()
+
+    def test_heartbeat_keeps_in_flight_message_alive_past_visibility_timeout(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """A message held by a live worker survives repeated reclaim attempts while heartbeated.
+
+        Unlike the test above, this drives the real basic_consume dispatch
+        chain (a delivered list populated via a callback) instead of mocking
+        Transport._deliver, and builds the reclaimer's channel and consumer
+        group up front so that setup cost is paid before the heartbeat loop
+        rather than in the critical window between the last heartbeat and the
+        reclaim check below. The reclaim must find nothing: the heartbeat
+        resets the idle clock before it ever qualifies as abandoned.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "heartbeat-integration-queue"
+        visibility_timeout = 0.3
+
+        producer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "producer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        reclaimer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "reclaimer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        try:
+            producer_channel = cast("Channel", producer_conn.channel())
+
+            message = {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-integration-heartbeat",
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                },
+            }
+            producer_channel._put(queue, message)
+
+            # Consume into the PEL as "producer-worker" and hold it, standing
+            # in for a task that is still running (never acked).
+            consumed = producer_channel._get(queue)
+            assert consumed["properties"]["delivery_tag"] == "tag-integration-heartbeat"
+
+            # Build the reclaimer's channel and consumer group up front, so
+            # that setup cost is paid before the heartbeat loop rather than
+            # in the critical window between the last heartbeat and the
+            # reclaim check below.
+            reclaimer_channel = cast("Channel", reclaimer_conn.channel())
+            delivered: list[Any] = []
+            reclaimer_channel.basic_consume(
+                queue,
+                no_ack=False,
+                callback=delivered.append,
+                consumer_tag="reclaimer-ctag",
+            )
+
+            # Heartbeat well past visibility_timeout, resetting idle every
+            # half-period so it never crosses the timeout.
+            for _ in range(6):
+                time.sleep(visibility_timeout / 2)
+                producer_channel._heartbeat()
+
+            processed = reclaimer_channel._reclaim_and_deliver(queue, budget=10)
+        finally:
+            producer_conn.close()
+            reclaimer_conn.close()
+
+        assert processed == 0
+        assert delivered == []
+
+
+@pytest.mark.integration
+class TestStreamsPoisonIntegration:
+    """max_restore_count enforcement and dead-letter copies for poison messages."""
+
+    def test_message_dropped_after_max_restore_count(
+        self,
+        redis_container: tuple[str, int, str],
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Test that a message exceeding max_restore_count is dropped instead of redelivered.
+
+        Each reclaim is driven by a distinct peer (worker-a delivers and never
+        acks; worker-b reclaims once; worker-c reclaims again), never by the
+        channel that currently holds the entry. _own_in_flight_message_ids
+        deliberately never lets a channel reclaim an id it already holds
+        in-flight itself (it could be racing a still-running callback on that
+        same process), so a single, self-reclaiming channel would stay
+        permanently exempt from max_restore_count instead of exercising the
+        poison cap. Three distinct workers is the realistic shape of this
+        scenario: worker-a dies mid-task, worker-b picks it up and also fails
+        to ack, worker-c is the one that finally exceeds the cap and drops it.
+        """
+        host, port, _image = redis_container
+        redis_client.flushdb()
+
+        app_a = _make_streams_app(host, port, global_keyprefix, visibility_timeout=2, consumer_name="worker-a")
+        app_b = _make_streams_app(
+            host,
+            port,
+            global_keyprefix,
+            visibility_timeout=2,
+            max_restore_count=1,
+            consumer_name="worker-b",
+        )
+        app_c = _make_streams_app(
+            host,
+            port,
+            global_keyprefix,
+            visibility_timeout=2,
+            max_restore_count=1,
+            consumer_name="worker-c",
+        )
+        try:
+            with app_a.connection() as conn_a, app_b.connection() as conn_b, app_c.connection() as conn_c:
+                channel_a = cast("Channel", conn_a.default_channel)
+                channel_b = cast("Channel", conn_b.default_channel)
+                channel_c = cast("Channel", conn_c.default_channel)
+
+                message = {
+                    "body": '{"task": "test.add", "args": [1, 2]}',
+                    "properties": {
+                        "delivery_tag": "poison-drop-test",
+                        "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                        "headers": {},
+                    },
+                }
+                channel_a._put("celery", message)
+                channel_a._get("celery")  # delivery 1, never acked (crash-looping task)
+
+                with patch.object(channel_b.connection, "_deliver") as mock_deliver_b:
+                    time.sleep(2.5)
+                    # worker-b reclaims: restore count 1 == max_restore_count -> still delivered
+                    assert channel_b._reclaim_and_deliver("celery", 10) == 1
+                    assert mock_deliver_b.call_count == 1
+                    payload, _queue = mock_deliver_b.call_args[0]
+                    assert payload["properties"]["headers"]["x-restore-count"] == 1
+                # worker-b never acks either (also crash-looping)
+
+                with patch.object(channel_c.connection, "_deliver") as mock_deliver_c:
+                    time.sleep(2.5)
+                    # worker-c reclaims: restore count 2 > max_restore_count -> dropped
+                    channel_c._reclaim_and_deliver("celery", 10)
+                    mock_deliver_c.assert_not_called()
+
+                # Dropped message is fully gone: no stream entry, nothing pending
+                assert redis_client.xlen(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0") == 0
+                pending = channel_c.client.xpending_range(
+                    f"{STREAM_KEY_PREFIX}celery:0",
+                    DEFAULT_CONSUMER_GROUP,
+                    min="-",
+                    max="+",
+                    count=10,
+                )
+                assert pending == []
+        finally:
+            app_a.close()
+            app_b.close()
+            app_c.close()
+
+    def test_dead_letter_copy_written_when_configured(
+        self,
+        redis_container: tuple[str, int, str],
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Test that a poisoned message is copied to the dead letter stream before being dropped.
+
+        As above, the reclaim is driven by a peer (worker-b), never by the
+        delivering channel itself: _own_in_flight_message_ids would otherwise
+        keep worker-a's own never-acked delivery permanently exempt from the
+        poison cap.
+        """
+        host, port, _image = redis_container
+        redis_client.flushdb()
+
+        app_a = _make_streams_app(host, port, global_keyprefix, visibility_timeout=2, consumer_name="worker-a")
+        app_b = _make_streams_app(
+            host,
+            port,
+            global_keyprefix,
+            visibility_timeout=2,
+            max_restore_count=0,
+            dead_letter_stream="dead-letters",
+            consumer_name="worker-b",
+        )
+        try:
+            with app_a.connection() as conn_a, app_b.connection() as conn_b:
+                channel_a = cast("Channel", conn_a.default_channel)
+                channel_b = cast("Channel", conn_b.default_channel)
+
+                message = {
+                    "body": '{"task": "test.add", "args": [1, 2]}',
+                    "properties": {
+                        "delivery_tag": "poison-dlq-test",
+                        "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                        "headers": {},
+                    },
+                }
+                channel_a._put("celery", message)
+                channel_a._get("celery")  # delivery 1, never acked
+
+                with patch.object(channel_b.connection, "_deliver") as mock_deliver:
+                    time.sleep(2.5)
+                    # restore count 1 > max_restore_count=0 -> dead-letter + drop, no delivery
+                    channel_b._reclaim_and_deliver("celery", 10)
+                    mock_deliver.assert_not_called()
+
+                # Original entry gone from the queue stream
+                assert redis_client.xlen(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0") == 0
+                # Copy landed in the dead letter stream (prefixed like all transport keys)
+                entries = redis_client.xrange(f"{global_keyprefix}dead-letters")
+                assert len(entries) == 1
+                _entry_id, fields = entries[0]
+                assert b"poison-dlq-test" in fields[b"payload"]
+        finally:
+            app_a.close()
+            app_b.close()
