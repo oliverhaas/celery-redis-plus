@@ -1579,10 +1579,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                         message_id_str = bytes_to_str(message_id)
                         payload_field = fields.get(b"payload") or fields.get("payload")
                         if payload_field is None:
-                            # Foreign or corrupt entry: ack it away so it cannot loop forever.
-                            # Same treatment and same volume as its unparseable-payload
-                            # sibling below: this discards an entry, which must never be
-                            # silent even when the entry was never ours to begin with.
+                            # Foreign or corrupt entry: ack it away so it cannot
+                            # loop forever. Warn, not debug, since this discards.
                             logger.warning(
                                 "Stream %s: claimed entry %s has no payload field; acking it away.",
                                 stream_key,
