@@ -187,6 +187,30 @@ their stream on purge/delete and recreated on next use. Consumers that are idle
 longer than 12 x `visibility_timeout` and have no pending entries are removed
 periodically with `XGROUP DELCONSUMER`.
 
+### Streams Queue Length Reporting
+
+`queue_declare` message counts, `SimpleQueue.qsize()` and `celery amqp
+queue.declare` report the messages **available to be consumed**: `XLEN` summed
+over the queue's level streams, minus that consumer group's pending (in-flight)
+entries, plus the delayed sorted set. Messages a worker is currently processing
+are not counted. This matches the sorted set transport, where consuming pops the
+tag out of `queue:{name}`.
+
+Two consequences worth knowing:
+
+- `queue_delete(if_empty=True)` and `exchange_delete` will delete a queue whose
+  messages are all in flight, destroying them. The sorted set transport has the
+  same behavior. The worker path and auto-delete-on-close do not pass
+  `if_empty`.
+- A message whose consumer died stays pending until the reclaim sweep takes it,
+  so it stays uncounted for that window. The sorted set transport counts such a
+  message again as soon as its visibility timeout expires. If you need stranded
+  work to be visible, alert on consumer group lag (`XPENDING`) rather than on
+  queue length.
+
+`queue_purge` reports what it actually destroyed, in-flight entries included, so
+it can exceed a `queue_declare` count taken moments earlier.
+
 ### Streams Constants
 
 | Constant | Value | Description |

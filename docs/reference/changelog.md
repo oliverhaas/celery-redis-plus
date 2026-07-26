@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Redis Streams broker transport (`celery_redis_plus.streams:Transport`), selected via the `valkey-streams://` URL scheme or by setting `broker_transport` with a `redis://` URL. Point-to-point queues use consumer groups, so the broker's Pending Entries List tracks in-flight work: `XREADGROUP` delivers and registers a message in one atomic step, and acks are `XACK` + `XDEL`
+- Streams priority via per-level streams (`stream:{queue}:{level}`, steps `[0, 3, 6, 9]` by default), consumed highest level first inside a single Lua script
+- Streams delayed delivery via a `delayed:{queue}` sorted set pumped on the periodic requeue timer
+- Streams poison-message handling using the PEL delivery count as the native restore count, with an optional `dead_letter_stream` to copy messages to before dropping them
+- Streams heartbeat (`XCLAIM ... JUSTID`) that resets the PEL idle clock without bumping delivery counts, so `visibility_timeout` means "worker considered dead after this much heartbeat silence" rather than a maximum task duration
+- Streams graceful shutdown hands in-flight messages to peers immediately via `XCLAIM ... IDLE`, so a rolling restart does not wait out the visibility timeout
+- Fanout is shared between both transports via `FanoutStreamsMixin`; the sorted set transport is unchanged
+
+### Notes
+- The streams transport requires Redis 6.2+ (for the `XPENDING ... IDLE` filter). The sorted set transport still requires Redis 7.0+ (for BZMPOP). Valkey works at any version for both
+- Streams queue lengths report messages available to be consumed and exclude in-flight ones; see the queue length reporting notes in the API reference for the two consequences
+
 ## [0.3.0] - 2026-02-14
 
 ### Added
