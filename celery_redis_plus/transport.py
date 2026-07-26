@@ -505,10 +505,8 @@ class QoS(virtual.QoS):
 
     def reject(self, delivery_tag: str, requeue: bool = False) -> None:
         if self.channel._collected:
-            # See ack(): the channel is gone, so requeueing/removing from
-            # indices has nothing left to talk to. A peer reclaims this entry
-            # after the visibility timeout, same as any other in-flight
-            # message on a lost connection.
+            # See ack(): no client left to talk to. A peer reclaims the message
+            # after the visibility timeout, requeue or not.
             logger.debug("Skipping reject for delivery_tag %r: channel was collected", delivery_tag)
             self._fanout_tags.discard(delivery_tag)
             super().ack(delivery_tag)
