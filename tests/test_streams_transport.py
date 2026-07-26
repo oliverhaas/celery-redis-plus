@@ -419,14 +419,43 @@ class TestStreamsConsumerName:
         with patch.object(signals, "_worker_nodenames", weakref.WeakKeyDictionary()):
             assert channel.consumer_name == f"{socket.gethostname()}:{os.getpid()}"
 
-    def test_consumer_name_is_stable_across_calls(self) -> None:
-        """Test that consumer_name does not change between calls (never uuid-per-boot)."""
-        channel = object.__new__(Channel)
-        mock_connection = MagicMock()
-        mock_connection.client.transport_options = {}
-        channel.connection = mock_connection
+    def test_consumer_name_is_stable_across_separately_built_channels(self) -> None:
+        """Test two channels of the same worker resolve to the same consumer name.
 
-        assert channel.consumer_name == channel.consumer_name
+        The consumer name is what ties a restarted worker back to its own PEL
+        entries, so anything uuid-per-boot would orphan them until the
+        visibility timeout expires. consumer_name is a cached_property, so
+        reading it twice on one channel is equal by construction and proves
+        nothing; only separately constructed channels can show it.
+        """
+        names: list[str] = []
+        for _ in range(2):
+            channel = object.__new__(Channel)
+            mock_connection = MagicMock()
+            mock_connection.client.transport_options = {}
+            channel.connection = mock_connection
+            with patch.object(signals, "_worker_nodenames", weakref.WeakKeyDictionary()):
+                names.append(channel.consumer_name)
+
+        assert names[0] == names[1]
+
+    def test_consumer_name_from_a_registered_nodename_is_stable_across_channels(self) -> None:
+        """Test the same holds on the normal worker path, where a nodename is registered."""
+        registry: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+        app = MagicMock()
+        registry[app] = "worker1@examplehost"
+
+        names: list[str] = []
+        for _ in range(2):
+            channel = object.__new__(Channel)
+            mock_connection = MagicMock()
+            mock_connection.client.transport_options = {}
+            mock_connection.client.app = app
+            channel.connection = mock_connection
+            with patch.object(signals, "_worker_nodenames", registry):
+                names.append(channel.consumer_name)
+
+        assert names == ["worker1@examplehost", "worker1@examplehost"]
 
     def test_consumer_name_uses_registered_worker_nodename(self) -> None:
         """Test that consumer_name resolves to the nodename recorded for the channel's app."""
