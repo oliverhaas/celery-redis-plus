@@ -2405,10 +2405,8 @@ class Transport(virtual.Transport):
             heartbeat_interval = default_heartbeat_interval
         loop.call_repeatedly(heartbeat_interval, cycle.maybe_heartbeat)
 
-        # Store loop for dynamic timer registration (queue TTL refresh), then arm
-        # the timer immediately: a queue with x-expires may already have been
-        # declared (the Tasks bootstep can run before this method does), and
-        # nothing else re-triggers registration for it.
+        # Arm immediately: the Tasks bootstep can declare an x-expires queue
+        # before this runs, and nothing else re-triggers registration for it.
         cycle._loop = loop
         cycle._update_expires_timer()
 
