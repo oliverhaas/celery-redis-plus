@@ -1054,6 +1054,38 @@ class TestStreamsInvalidateGroup:
         assert channel._ensured_groups == set()
         channel._stream_keys_for_queue.assert_not_called()
 
+    def test_invalidate_group_logs_the_self_heal(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test the NOGROUP self-heal is not silent.
+
+        Losing a stream out of band also loses whatever was pending on it, so
+        an operator seeing unexplained redeliveries needs something to
+        correlate them with. Every NOGROUP recovery path in the transport
+        funnels through here.
+        """
+        channel = object.__new__(Channel)
+        channel._ensured_groups = {"stream:my_queue:0"}
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:my_queue:0"])
+
+        with caplog.at_level(logging.INFO, logger="celery_redis_plus.streams"):
+            channel._invalidate_group("my_queue")
+
+        assert any("my_queue" in record.getMessage() for record in caplog.records)
+        assert all(record.levelno == logging.INFO for record in caplog.records)
+
+    def test_invalidate_group_without_queue_names_every_watched_queue(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test the whole-cache case says so rather than naming a queue it does not know."""
+        channel = object.__new__(Channel)
+        channel._ensured_groups = {"stream:my_queue:0"}
+        channel._stream_keys_for_queue = MagicMock()
+
+        with caplog.at_level(logging.INFO, logger="celery_redis_plus.streams"):
+            channel._invalidate_group()
+
+        assert any("all watched queues" in record.getMessage() for record in caplog.records)
+
 
 @pytest.mark.unit
 class TestStreamsDeliverInFlight:
@@ -2515,8 +2547,12 @@ class TestStreamsConsumeRead:
         assert mock_client.connection.send_command.call_count == 2
         channel._xreadgroup_start.assert_called_once_with()
 
-    def test_consume_read_noscript_resets_sha(self) -> None:
-        """Test NOSCRIPT recovery: reset cached SHA, raise Empty, no blocking read armed."""
+    def test_consume_read_noscript_resets_sha(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Test NOSCRIPT recovery: reset cached SHA, raise Empty, no blocking read armed.
+
+        Logged at debug rather than warning: a SCRIPT FLUSH or a server
+        restart makes an eviction expected, and it costs one skipped tick.
+        """
         channel = object.__new__(Channel)
         channel.global_keyprefix = ""
         channel._queue_cycle = ["q1"]
@@ -2537,11 +2573,14 @@ class TestStreamsConsumeRead:
         )
         channel.client = mock_client
 
-        with pytest.raises(Empty):
+        with caplog.at_level(logging.DEBUG, logger="celery_redis_plus.streams"), pytest.raises(Empty):
             channel._consume_read()
 
         assert channel._consume_script_sha is None
         channel._xreadgroup_start.assert_not_called()
+        eviction_records = [r for r in caplog.records if "evicted" in r.getMessage()]
+        assert len(eviction_records) == 1
+        assert eviction_records[0].levelno == logging.DEBUG
 
     def test_consume_read_connection_error_disconnects(self) -> None:
         """Test _consume_read disconnects the raw connection on connection errors."""
@@ -4563,8 +4602,16 @@ class TestStreamsReclaim:
         assert delivered_message["properties"]["delivery_tag"] == "tag-first"
         assert channel._qos.can_consume.call_count == 1
 
-    def test_reclaim_missing_payload_acks_and_skips(self, global_keyprefix: str) -> None:
-        """A claimed entry with no payload field (foreign or corrupt) is acked away, never delivered."""
+    def test_reclaim_missing_payload_acks_and_skips(
+        self,
+        global_keyprefix: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A claimed entry with no payload field (foreign or corrupt) is acked away, never delivered.
+
+        Discarding an entry must never be silent, so this branch is logged
+        exactly like its unparseable-payload sibling below.
+        """
         channel = object.__new__(Channel)
         channel.global_keyprefix = global_keyprefix
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
@@ -4599,7 +4646,8 @@ class TestStreamsReclaim:
         mock_context.__exit__ = MagicMock(return_value=False)
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
 
-        result = channel._reclaim_and_deliver("celery", 100)
+        with caplog.at_level(logging.WARNING, logger="celery_redis_plus.streams"):
+            result = channel._reclaim_and_deliver("celery", 100)
 
         assert result == 1
         channel.connection._deliver.assert_not_called()
@@ -4607,6 +4655,7 @@ class TestStreamsReclaim:
             keys=[f"{global_keyprefix}stream:celery:0"],
             args=["celery", "1700000000000-0", ""],
         )
+        assert any("no payload field" in record.getMessage() for record in caplog.records)
 
     def test_reclaim_malformed_payload_acks_and_skips(self, global_keyprefix: str) -> None:
         """A claimed entry whose payload field fails to parse is acked away, never delivered.

@@ -902,6 +902,18 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         cache is cleared (used when the failing stream cannot be singled
         out, e.g. a blocking XREADGROUP armed across all watched queues).
         """
+        # Every NOGROUP self-heal in this transport funnels through here, so
+        # one line covers them all. Info, not warning: losing a stream out of
+        # band is a normal consequence of a purge, a queue delete or an
+        # x-expires TTL, and the recovery is automatic. Silence would be
+        # worse, since the same event also loses whatever was still pending
+        # on that stream, and an operator seeing unexplained redeliveries has
+        # nothing to correlate them with.
+        logger.info(
+            "Consumer group cache invalidated for %s after a stream was deleted out of band "
+            "(purge, queue delete, or x-expires); groups will be recreated on next use.",
+            "all watched queues" if queue is None else f"queue {queue}",
+        )
         if queue is None:
             self._ensured_groups.clear()
             return
@@ -1589,7 +1601,15 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                         message_id_str = bytes_to_str(message_id)
                         payload_field = fields.get(b"payload") or fields.get("payload")
                         if payload_field is None:
-                            # Foreign or corrupt entry: ack it away so it cannot loop forever
+                            # Foreign or corrupt entry: ack it away so it cannot loop forever.
+                            # Same treatment and same volume as its unparseable-payload
+                            # sibling below: this discards an entry, which must never be
+                            # silent even when the entry was never ours to begin with.
+                            logger.warning(
+                                "Stream %s: claimed entry %s has no payload field; acking it away.",
+                                stream_key,
+                                message_id_str,
+                            )
                             processed += 1
                             ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id_str, ""])
                             continue
@@ -1863,7 +1883,10 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 raise
             except self.ResponseError as exc:
                 if "NOSCRIPT" in str(exc):
-                    # Script evicted from cache, reload on next tick
+                    # Script evicted from cache, reload on next tick. Debug,
+                    # not warning: a SCRIPT FLUSH or a server restart makes
+                    # this expected, and it costs exactly one skipped tick.
+                    logger.debug("Consume script evicted from the Redis script cache; reloading on the next pass.")
                     self._consume_script_sha = None
                     raise Empty from None
                 if "NOGROUP" not in str(exc):
