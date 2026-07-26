@@ -898,13 +898,9 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         cache is cleared (used when the failing stream cannot be singled
         out, e.g. a blocking XREADGROUP armed across all watched queues).
         """
-        # Every NOGROUP self-heal in this transport funnels through here, so
-        # one line covers them all. Info, not warning: losing a stream out of
-        # band is a normal consequence of a purge, a queue delete or an
-        # x-expires TTL, and the recovery is automatic. Silence would be
-        # worse, since the same event also loses whatever was still pending
-        # on that stream, and an operator seeing unexplained redeliveries has
-        # nothing to correlate them with.
+        # Info, not warning: recovery is automatic. But not silent either, since
+        # the same event drops whatever was pending on that stream, and an
+        # operator seeing the redeliveries needs something to correlate them to.
         logger.info(
             "Consumer group cache invalidated for %s after a stream was deleted out of band "
             "(purge, queue delete, or x-expires); groups will be recreated on next use.",
