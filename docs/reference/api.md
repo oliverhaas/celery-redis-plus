@@ -4,7 +4,7 @@
 
 ### `celery_redis_plus.Transport`
 
-Custom transport with sorted set queues, priority encoding, delayed delivery, and Redis Streams fanout.
+Custom transport with sorted set queues, priority encoding, delayed delivery, and Redis Streams fanout. This is the default transport behind the `valkey://` scheme; for the consumer-group based streams transport see [Streams Transport](#streams-transport) below.
 
 **Usage:**
 
@@ -120,3 +120,81 @@ The following constants are used internally and define default behavior:
 | `QUEUE_KEY_PREFIX` | `"queue:"` | Prefix for queue sorted sets |
 | `MESSAGE_KEY_PREFIX` | `"message:"` | Prefix for message hashes |
 | `MESSAGES_INDEX_PREFIX` | `"messages_index:"` | Prefix for per-queue message index sorted sets |
+
+## Streams Transport
+
+### `celery_redis_plus.streams.Transport`
+
+Second transport built on Redis Streams with consumer groups. `XREADGROUP`
+delivers a message and registers it in the broker-native Pending Entries List
+(PEL) in one atomic step, so the broker itself tracks in-flight work. Fanout is
+shared with the sorted set transport.
+
+**Usage:**
+
+```python
+# For Valkey (use valkeys-streams:// for SSL)
+app.config_from_object({
+    'broker_url': 'valkey-streams://localhost:6379/0',
+})
+
+# For Redis
+app.config_from_object({
+    'broker_url': 'redis://localhost:6379/0',
+    'broker_transport': 'celery_redis_plus.streams:Transport',
+})
+```
+
+**Features:**
+
+- One stream per (queue, priority level), consumed through a consumer group via `XREADGROUP`
+- Broker-native in-flight tracking: deliver and PEL-register happen in one atomic step
+- Heartbeat via `XCLAIM ... JUSTID` keeps long-running tasks alive without bumping delivery counts
+- Native delayed delivery via a staging sorted set and a Lua pump
+- Poison message handling: delivery-count cap with optional dead-letter stream
+- Ack removes entries with XACK + XDEL, so streams shrink on every ack
+
+### Streams Transport Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `priority_steps` | `list[int]` | `[0, 3, 6, 9]` | Priority buckets in 0-255 space; one stream per (queue, level). A message goes to the highest step less than or equal to its priority |
+| `visibility_timeout` | `int` | `300` | Seconds of heartbeat silence before a worker's in-flight messages are reclaimed by peers. NOT a task duration limit |
+| `heartbeat_interval` | `float` | `visibility_timeout / 5` | Interval of the `XCLAIM ... JUSTID` heartbeat on in-flight messages |
+| `max_restore_count` | `int` | `None` | Involuntary-redelivery cap; messages exceeding it are dropped (or dead-lettered). A graceful-shutdown handoff also adds one to the count (the peer reclaims it on its next reclaim pass), so leave headroom for rolling restarts |
+| `dead_letter_stream` | `str` | `None` | Stream to copy poisoned messages to before dropping them (capped at about 10000 entries) |
+| `consumer_group` | `str` | `"celery"` | Consumer group name used on every queue stream |
+| `consumer_name` | `str` | `None` | Stable per-worker consumer identity; defaults to the worker nodename when available, else `hostname:pid` |
+| `global_keyprefix` | `str` | `""` | Prefix for all Redis keys |
+| `message_ttl` | `int` | `None` | Message TTL in seconds, enforced lazily at delivery (`None` = no TTL) |
+
+Connection options (`socket_timeout`, `max_connections`, `ssl`, ...) and fanout
+options (`stream_maxlen`, `fanout_prefix`, `fanout_patterns`) are identical to
+the sorted set transport.
+
+### Streams Redis Keys
+
+| Pattern | Type | Description |
+|---------|------|-------------|
+| `stream:{queue}:{level}` | Stream | One per (queue, priority level); each entry holds the serialized message in a single `payload` field |
+| `delayed:{queue}` | Sorted Set | Delayed messages; member = serialized message, score = absolute delivery time in ms |
+| `/{db}.{exchange}` | Stream | Fanout messages (shared with the sorted set transport) |
+| `_kombu.binding.{exchange}` | Set | Queue-exchange bindings (shared with the sorted set transport) |
+
+A consumer group (default name `celery`) is created lazily on every queue stream
+via `XGROUP CREATE ... MKSTREAM`. Consumer groups are deleted together with
+their stream on purge/delete and recreated on next use. Consumers that are idle
+longer than 12 x `visibility_timeout` and have no pending entries are removed
+periodically with `XGROUP DELCONSUMER`.
+
+### Streams Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `STREAM_KEY_PREFIX` | `"stream:"` | Prefix for per-level queue streams |
+| `DELAYED_KEY_PREFIX` | `"delayed:"` | Prefix for delayed-message sorted sets |
+| `DEFAULT_PRIORITY_STEPS` | `[0, 3, 6, 9]` | Default priority buckets |
+| `DEFAULT_CONSUMER_GROUP` | `"celery"` | Default consumer group name |
+| `SHUTDOWN_IDLE_MS` | `2^31` | Artificial idle applied at graceful shutdown so peers reclaim instantly |
+| `HEARTBEAT_INTERVAL_DIVISOR` | `5` | Default heartbeat interval = `visibility_timeout / 5` |
+| `CONSUMER_IDLE_CLEANUP_FACTOR` | `12` | Idle consumers removed after `12 x visibility_timeout` |

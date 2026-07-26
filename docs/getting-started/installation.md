@@ -4,7 +4,7 @@
 
 - Python >= 3.13
 - Celery >= 5.5.0
-- Redis >= 7.0 (for BZMPOP) or Valkey (any version)
+- Redis >= 7.0 for the sorted set transport (BZMPOP) and Redis >= 6.2 for the streams transport (the XPENDING ... IDLE filter), or Valkey (any version)
 
 ## Install
 

@@ -1,6 +1,6 @@
 # Celery Redis Plus
 
-Enhanced Redis/Valkey transport for Celery/Kombu with native delayed delivery, improved reliability, full priority support, and reliable fanout.
+Enhanced Redis/Valkey transports for Celery/Kombu with native delayed delivery, improved reliability, full priority support, and reliable fanout. Ships two broker transports: a sorted set transport (`valkey://`) and a Redis Streams transport with consumer groups (`valkey-streams://`).
 
 ## Overview
 
@@ -10,6 +10,7 @@ Enhanced Redis/Valkey transport for Celery/Kombu with native delayed delivery, i
 2. **Improved Reliability** - Atomic message consumption via BZMPOP with improvements regarding visibility timeout ensures zero message loss.
 3. **Full Priority Support** - All 256 priority levels (0-255) with RabbitMQ-compatible semantics (higher number = higher priority).
 4. **Reliable Fanout** - Redis Streams replace lossy PUB/SUB for durable broadcast event messaging.
+5. **Streams Transport** - An alternative queue transport (`valkey-streams://`) built on Redis Streams with consumer groups, where the broker natively tracks in-flight work and a worker heartbeat replaces task-duration-based visibility timeouts.
 
 ## Requirements
 
@@ -17,7 +18,7 @@ We target recent versions for BZMPOP support and to simplify development.
 
 - Python >= 3.13
 - Celery >= 5.5.0
-- Redis >= 7.0 (for BZMPOP) or Valkey (any version)
+- Redis >= 7.0 for the sorted set transport (BZMPOP) and Redis >= 6.2 for the streams transport (the XPENDING ... IDLE filter), or Valkey (any version)
 
 ## How It Works
 
@@ -36,6 +37,20 @@ Delayed messages are stored in a sorted set with timestamps as scores. A periodi
 ### Stream-based Fanout
 
 Fanout exchanges use Redis Streams. Messages are added with `XADD`, and each consumer uses `XREAD` tracking their own position. Old messages are trimmed based on `stream_maxlen`.
+
+### Streams Transport (`valkey-streams://`)
+
+The second transport stores each queue as a set of Redis Streams, one per priority
+level, consumed through a consumer group. `XREADGROUP` delivers a message and
+registers it in the broker-native Pending Entries List (PEL) in a single atomic
+step, so the broker itself tracks in-flight work. Workers send a periodic
+`XCLAIM ... JUSTID` heartbeat for their in-flight messages; if a worker dies, its
+messages become reclaimable by peers after `visibility_timeout` seconds of
+heartbeat silence. This means `visibility_timeout` no longer has to exceed the
+longest task: the default of 300 seconds is safe for tasks that run for hours.
+Delayed messages are staged in a `delayed:{queue}` sorted set and pumped into
+their priority stream when due. Acknowledged messages are removed with
+XACK + XDEL, so streams shrink on every ack.
 
 ## Contributing
 
