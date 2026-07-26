@@ -5914,6 +5914,7 @@ class TestStreamsSize:
     def _make_channel(self) -> tuple[Channel, MagicMock, MagicMock]:
         """Build a bare channel with mocked client, pipeline, and stream keys."""
         channel = object.__new__(Channel)
+        channel.consumer_group = "celery"
         channel._stream_keys_for_queue = MagicMock(
             return_value=["stream:myq:9", "stream:myq:6", "stream:myq:3", "stream:myq:0"],
         )
@@ -5933,7 +5934,18 @@ class TestStreamsSize:
     def test_size_sums_stream_lengths_and_delayed(self) -> None:
         """_size returns the sum of XLEN per level stream plus ZCARD of the delayed zset."""
         channel, mock_client, mock_pipe = self._make_channel()
-        mock_pipe.execute.return_value = [2, 0, 1, 4, 5]
+        # (XLEN, XPENDING) per level stream, then ZCARD of the delayed zset
+        mock_pipe.execute.return_value = [
+            2,
+            {"pending": 0},
+            0,
+            {"pending": 0},
+            1,
+            {"pending": 0},
+            4,
+            {"pending": 0},
+            5,
+        ]
 
         size = channel._size("myq")
 
@@ -5945,10 +5957,72 @@ class TestStreamsSize:
         mock_pipe.zcard.assert_called_once_with("delayed:myq")
         mock_pipe.execute.assert_called_once()
 
+    def test_size_excludes_in_flight_entries(self) -> None:
+        """_size subtracts each stream's PEL: delivered entries stay in the stream until acked.
+
+        XREADGROUP registers an entry in the pending entries list without
+        removing it, so counting XLEN alone would keep reporting messages
+        that are already out with a consumer and a fully consumed queue
+        would never read as empty. The sorted-set transport's _size does not
+        count in-flight messages either.
+        """
+        channel, _mock_client, mock_pipe = self._make_channel()
+        mock_pipe.execute.return_value = [
+            5,
+            {"pending": 2},
+            0,
+            {"pending": 0},
+            3,
+            {"pending": 3},
+            4,
+            {"pending": 1},
+            6,
+        ]
+
+        # (5-2) + (0-0) + (3-3) + (4-1) + 6 delayed
+        assert channel._size("myq") == 12
+        xpending_calls = [call.args for call in mock_pipe.xpending.call_args_list]
+        assert xpending_calls == [
+            ("stream:myq:9", "celery"),
+            ("stream:myq:6", "celery"),
+            ("stream:myq:3", "celery"),
+            ("stream:myq:0", "celery"),
+        ]
+
+    def test_size_treats_a_missing_consumer_group_as_nothing_pending(self) -> None:
+        """A stream that never had a consumer group answers XPENDING with NOGROUP.
+
+        That is an ordinary state (nothing has consumed from the queue yet),
+        so the entries still count as available rather than making the whole
+        call blow up.
+        """
+        channel, _mock_client, mock_pipe = self._make_channel()
+        nogroup = _client_exceptions.ResponseError("NOGROUP No such key or consumer group")
+        mock_pipe.execute.return_value = [7, nogroup, 0, nogroup, 0, nogroup, 0, nogroup, 0]
+
+        assert channel._size("myq") == 7
+
+    def test_size_never_returns_a_negative_count(self) -> None:
+        """A PEL larger than XLEN (entries XDELed while still pending) clamps to zero."""
+        channel, _mock_client, mock_pipe = self._make_channel()
+        mock_pipe.execute.return_value = [0, {"pending": 3}, 0, {"pending": 0}, 0, {"pending": 0}, 0, {"pending": 0}, 0]
+
+        assert channel._size("myq") == 0
+
     def test_size_empty_queue_returns_zero(self) -> None:
         """_size returns 0 when all streams and the delayed zset are empty."""
         channel, mock_client, mock_pipe = self._make_channel()
-        mock_pipe.execute.return_value = [0, 0, 0, 0, 0]
+        mock_pipe.execute.return_value = [
+            0,
+            {"pending": 0},
+            0,
+            {"pending": 0},
+            0,
+            {"pending": 0},
+            0,
+            {"pending": 0},
+            0,
+        ]
 
         assert channel._size("myq") == 0
         mock_client.pipeline.assert_called_once()

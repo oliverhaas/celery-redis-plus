@@ -1984,6 +1984,60 @@ class TestStreamsSizePurgeIntegration:
         finally:
             conn.close()
 
+    def test_size_excludes_in_flight_messages(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Test _size counts what is still available, not what is already out with a consumer.
+
+        XREADGROUP registers a delivered entry in the PEL without removing it
+        from the stream, so an XLEN-only count keeps reporting messages that
+        are in flight and a fully consumed queue never reads as empty. The
+        sorted-set transport's _size does not count in-flight messages
+        (ZPOPMIN removes them), so the two must agree.
+        """
+        host, port, _image = redis_container
+        queue = "size-in-flight-queue"
+
+        conn = Connection(
+            f"redis://{host}:{port}/0",
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={"global_keyprefix": global_keyprefix},
+        )
+        try:
+            channel = cast("Channel", conn.channel())
+            for index in range(2):
+                channel._put(
+                    queue,
+                    {
+                        "body": '{"task": "test"}',
+                        "properties": {
+                            "delivery_tag": f"size-in-flight-{index}",
+                            "delivery_info": {"exchange": "", "routing_key": queue},
+                            "headers": {},
+                        },
+                    },
+                )
+
+            assert channel._size(queue) == 2
+
+            # Consumed but not acked: still in the stream, still in the PEL
+            message = channel._get(queue)
+            assert channel._size(queue) == 1
+
+            # Acking removes the entry outright, so the count is unchanged
+            channel.basic_ack(message["properties"]["delivery_tag"])
+            assert channel._size(queue) == 1
+
+            second = channel._get(queue)
+            assert channel._size(queue) == 0
+            channel.basic_ack(second["properties"]["delivery_tag"])
+            assert channel._size(queue) == 0
+        finally:
+            conn.close()
+
 
 @pytest.mark.integration
 class TestStreamsRaisingDeliveryCallback:

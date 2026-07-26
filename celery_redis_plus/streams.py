@@ -1062,13 +1062,45 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             return bool(client.exists(*self._stream_keys_for_queue(queue), self._delayed_key(queue)))
 
     def _size(self, queue: str) -> int:
-        """Return the message count: sum of XLEN over level streams plus ZCARD of the delayed zset."""
+        """Return the number of messages waiting on a queue.
+
+        Counts the level streams plus the delayed staging zset, and subtracts
+        each stream's pending entries list. XREADGROUP registers a delivered
+        entry in the PEL without removing it from the stream, so XLEN alone
+        would keep counting messages that are already out with a consumer,
+        and a fully consumed queue would never report empty. The sorted-set
+        transport's _size does not count in-flight messages either (ZPOPMIN
+        removes them), so this keeps the two transports' queue depths
+        comparable.
+
+        Args:
+            queue: Queue name to measure.
+
+        Returns:
+            Messages available to be consumed, never negative.
+        """
+        stream_keys = self._stream_keys_for_queue(queue)
         with self.conn_or_acquire() as client, client.pipeline() as pipe:
-            for stream_key in self._stream_keys_for_queue(queue):
+            for stream_key in stream_keys:
                 pipe.xlen(stream_key)
+                pipe.xpending(stream_key, self.consumer_group)
             pipe.zcard(self._delayed_key(queue))
-            results = pipe.execute()
-        return sum(int(count) for count in results)
+            # A stream that never had a consumer group answers XPENDING with
+            # NOGROUP; that is an ordinary state, not an error worth raising
+            results = pipe.execute(raise_on_error=False)
+
+        total = 0
+        for index in range(len(stream_keys)):
+            length = results[index * 2]
+            pending = results[index * 2 + 1]
+            if isinstance(length, Exception):
+                continue
+            pending_count = pending.get("pending", 0) if isinstance(pending, dict) else 0
+            total += max(int(length) - int(pending_count), 0)
+        delayed = results[-1]
+        if not isinstance(delayed, Exception):
+            total += int(delayed)
+        return total
 
     def _purge(self, queue: str) -> int:
         """Delete all messages from a queue: level streams and the delayed zset.
