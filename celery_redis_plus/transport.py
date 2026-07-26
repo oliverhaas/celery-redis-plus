@@ -349,12 +349,9 @@ class GlobalKeyPrefixMixin:
         "ZREM",
         "ZREVRANGEBYSCORE",
         "ZSCORE",
-        # Stream commands are listed only where this codebase issues them from
-        # Python. Commands that run exclusively inside the Lua scripts (XACK,
-        # XDEL, XINFO CONSUMERS' delete counterpart XGROUP DELCONSUMER) are
-        # deliberately absent: EVALSHA passes KEYS through untouched, so Lua
-        # never consults this table and a registration for it would be dead
-        # config that reads like coverage. Same reason XAUTOCLAIM was dropped.
+        # Only stream commands this codebase issues from Python. Lua-only ones
+        # (XACK, XDEL, XGROUP DELCONSUMER) are absent by design: EVALSHA passes
+        # KEYS through untouched, so a registration here would be dead config.
         "XADD",
         "XLEN",
         "XPENDING",
