@@ -795,6 +795,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         self._ensured_groups: set[str] = set()
         # Streams already reported as uninspectable by consumer cleanup (warn-once)
         self._warned_cleanup_streams: set[str] = set()
+        # Queues already reported as hitting the delayed-move limit (warn-once)
+        self._warned_delayed_limit: set[str] = set()
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -1234,13 +1236,22 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             )
 
         if moved >= limit:
-            logger.warning(
+            # A queue that stays saturated hits this on every single cycle, so
+            # shout once per queue and mutter afterwards rather than filling
+            # the log with the same line forever. The counter resets as soon
+            # as a pass comes in under the limit, so a fresh backlog is
+            # reported loudly again.
+            log = logger.debug if queue in self._warned_delayed_limit else logger.warning
+            self._warned_delayed_limit.add(queue)
+            log(
                 "Queue %s moved the maximum of %d delayed messages allowed this pass "
                 "(the shared per-cycle requeue budget, or DEFAULT_REQUEUE_BATCH_LIMIT "
                 "when called outside the requeue cycle). There may be more messages waiting.",
                 queue,
                 limit,
             )
+        else:
+            self._warned_delayed_limit.discard(queue)
         return moved
 
     def _heartbeat(self) -> None:

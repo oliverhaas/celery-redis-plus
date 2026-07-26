@@ -1277,6 +1277,7 @@ class TestStreamsEffectiveMessageTtl:
             move_connection = MagicMock()
             move_connection.client.transport_options = {"priority_steps": [0]}
             move_channel.connection = move_connection
+            move_channel._warned_delayed_limit = set()
             move_channel._ensure_group = MagicMock()
             move_script = MagicMock(return_value=0)
             move_client = MagicMock()
@@ -2972,6 +2973,7 @@ class TestStreamsMoveDelayed:
         channel.connection = mock_connection
         channel.message_ttl = None
         channel._message_ttls = {}
+        channel._warned_delayed_limit = set()
         channel._ensure_group = MagicMock()
 
         mock_client = MagicMock()
@@ -3053,6 +3055,53 @@ class TestStreamsMoveDelayed:
         mock_script.return_value = 7
 
         assert channel._move_delayed("my_queue") == 7
+
+    def test_move_delayed_warns_once_per_queue_then_drops_to_debug(self) -> None:
+        """Test a queue pinned at the move limit is loud once, not on every cycle forever.
+
+        A saturated queue hits the limit on every pass, so an unconditional
+        warning fills the log with the same line at the requeue cadence
+        indefinitely.
+        """
+        channel, _mock_client, mock_script = self._make_channel()
+        mock_script.return_value = 5
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            for _ in range(3):
+                channel._move_delayed("my_queue", limit=5)
+
+        mock_logger.warning.assert_called_once()
+        assert mock_logger.debug.call_count == 2
+
+    def test_move_delayed_warns_again_after_a_pass_comes_in_under_the_limit(self) -> None:
+        """Test the warn-once latch resets, so a fresh backlog is reported loudly again."""
+        channel, _mock_client, mock_script = self._make_channel()
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            mock_script.return_value = 5
+            channel._move_delayed("my_queue", limit=5)
+            # Backlog cleared: nothing logged, and the latch is dropped
+            mock_script.return_value = 2
+            channel._move_delayed("my_queue", limit=5)
+            assert channel._warned_delayed_limit == set()
+            mock_script.return_value = 5
+            channel._move_delayed("my_queue", limit=5)
+
+        assert mock_logger.warning.call_count == 2
+        mock_logger.debug.assert_not_called()
+
+    def test_move_delayed_warn_once_latch_is_per_queue(self) -> None:
+        """Test one saturated queue does not silence the first report for another."""
+        channel, _mock_client, mock_script = self._make_channel()
+        mock_script.return_value = 5
+
+        with patch("celery_redis_plus.streams.logger") as mock_logger:
+            channel._move_delayed("queue-a", limit=5)
+            channel._move_delayed("queue-b", limit=5)
+
+        assert mock_logger.warning.call_count == 2
+        warned_queues = [c.args[1] for c in mock_logger.warning.call_args_list]
+        assert warned_queues == ["queue-a", "queue-b"]
 
     def test_move_delayed_passes_custom_limit_to_argv(self) -> None:
         """A custom limit kwarg is passed through as the Lua script's batch_limit ARGV slot.
