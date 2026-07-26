@@ -162,15 +162,6 @@ class TestStreamsPrefixMixin:
         args = client._prefix_args(["XPENDING", "stream:celery:9", "celery", "-", "+", "10", "worker1"])
         assert args == ["XPENDING", "test:stream:celery:9", "celery", "-", "+", "10", "worker1"]
 
-    def test_prefix_xautoclaim(self) -> None:
-        """Test XAUTOCLAIM key prefixing (XAUTOCLAIM key group consumer min-idle-time start)."""
-        client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")
-
-        args = client._prefix_args(
-            ["XAUTOCLAIM", "stream:celery:9", "celery", "worker1", "300000", "0-0", "COUNT", "10"],
-        )
-        assert args == ["XAUTOCLAIM", "test:stream:celery:9", "celery", "worker1", "300000", "0-0", "COUNT", "10"]
-
     def test_prefix_xclaim(self) -> None:
         """Test XCLAIM key prefixing (XCLAIM key group consumer min-idle-time id [id ...] [JUSTID])."""
         client = PrefixedStrictRedis(connection_pool=MagicMock(), global_keyprefix="test:")

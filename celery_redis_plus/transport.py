@@ -354,7 +354,6 @@ class GlobalKeyPrefixMixin:
         "XDEL",
         "XLEN",
         "XPENDING",
-        "XAUTOCLAIM",
         "XCLAIM",
         "XRANGE",
         "XTRIM",
