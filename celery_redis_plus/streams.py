@@ -476,13 +476,9 @@ class MultiChannelPoller:
                 hit_cap = False
                 break
             if remaining is None and iteration >= DEFAULT_UNBOUNDED_PREFETCH_DRAIN_LIMIT:
-                # Unbounded prefetch (worker_prefetch_multiplier=0) has no
-                # headroom to trim this loop, so a deep backlog would run
-                # DEFAULT_REQUEUE_BATCH_LIMIT synchronous EVALSHAs back to
-                # back in one tick, blocking every hub timer and every other
-                # channel meanwhile. Yield sooner on the same terms as the
-                # outer cap: the blocking read below keeps the rest of the
-                # backlog moving on the next tick.
+                # Unbounded prefetch has no headroom to trim this loop, so a
+                # deep backlog would block the hub for DEFAULT_REQUEUE_BATCH_LIMIT
+                # synchronous EVALSHAs. Yield early; the next tick resumes.
                 break
             try:
                 channel._consume_read()
