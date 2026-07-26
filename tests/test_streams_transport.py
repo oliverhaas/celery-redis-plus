@@ -5955,3 +5955,123 @@ class TestStreamsExpires:
 
         chan_a._refresh_queue_expires.assert_called_once()
         chan_b._refresh_queue_expires.assert_called_once()
+
+
+@pytest.mark.unit
+class TestStreamsConsumerCleanup:
+    """Unit tests for Channel._cleanup_consumers (XGROUP DELCONSUMER hygiene)."""
+
+    def _make_channel(self, consumers: list[dict[str, Any]]) -> tuple[Channel, MagicMock]:
+        """Build a bare channel whose client reports the given consumers on one stream."""
+        channel = object.__new__(Channel)
+        channel._queue_cycle = ["myq"]
+        channel.visibility_timeout = 300
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:myq:0"])
+
+        mock_client = MagicMock()
+        mock_client.xinfo_consumers.return_value = consumers
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        return channel, mock_client
+
+    def _idle_over_threshold(self) -> int:
+        """An idle time (ms) just past the cleanup threshold for visibility_timeout=300."""
+        return CONSUMER_IDLE_CLEANUP_FACTOR * 300 * 1000 + 1
+
+    def test_cleanup_deletes_idle_consumer_without_pending(self) -> None:
+        """An idle consumer with zero pending entries is removed from the group."""
+        idle = self._idle_over_threshold()
+        consumers = [{"name": b"worker-2", "pending": 0, "idle": idle, "inactive": idle}]
+        channel, mock_client = self._make_channel(consumers)
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+        ):
+            channel._cleanup_consumers()
+
+        mock_client.xinfo_consumers.assert_called_once_with("stream:myq:0", "celery")
+        mock_client.xgroup_delconsumer.assert_called_once_with("stream:myq:0", "celery", "worker-2")
+
+    def test_cleanup_skips_own_consumer(self) -> None:
+        """The channel's own consumer is never deleted, no matter how idle."""
+        idle = self._idle_over_threshold()
+        consumers = [{"name": b"worker-1", "pending": 0, "idle": idle, "inactive": idle}]
+        channel, mock_client = self._make_channel(consumers)
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+        ):
+            channel._cleanup_consumers()
+
+        mock_client.xgroup_delconsumer.assert_not_called()
+
+    def test_cleanup_skips_consumer_with_pending_entries(self) -> None:
+        """Consumers with pending entries are never deleted (reclaim drains them first)."""
+        idle = self._idle_over_threshold()
+        consumers = [{"name": b"worker-2", "pending": 3, "idle": idle, "inactive": idle}]
+        channel, mock_client = self._make_channel(consumers)
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+        ):
+            channel._cleanup_consumers()
+
+        mock_client.xgroup_delconsumer.assert_not_called()
+
+    def test_cleanup_skips_recently_active_consumer(self) -> None:
+        """Consumers below the idle threshold are kept."""
+        consumers = [{"name": b"worker-2", "pending": 0, "idle": 100, "inactive": 100}]
+        channel, mock_client = self._make_channel(consumers)
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+        ):
+            channel._cleanup_consumers()
+
+        mock_client.xgroup_delconsumer.assert_not_called()
+
+    def test_cleanup_survives_missing_stream_or_group(self) -> None:
+        """A missing stream or group (ResponseError) is skipped, not raised."""
+        channel, mock_client = self._make_channel([])
+        mock_client.xinfo_consumers.side_effect = _client_exceptions.ResponseError(
+            "NOGROUP No such consumer group",
+        )
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+        ):
+            channel._cleanup_consumers()  # Must not raise
+
+        mock_client.xgroup_delconsumer.assert_not_called()
+
+    def test_cleanup_noop_without_active_queues(self) -> None:
+        """No Redis calls are made when the channel consumes no queues."""
+        channel, _mock_client = self._make_channel([])
+        channel._queue_cycle = []
+
+        channel._cleanup_consumers()
+
+        channel.conn_or_acquire.assert_not_called()
+
+    def test_maybe_enqueue_due_messages_runs_consumer_cleanup(self) -> None:
+        """The periodic requeue cycle triggers consumer hygiene for active channels."""
+        poller = MultiChannelPoller()
+        mock_channel = MagicMock()
+        mock_channel.active_queues = {"myq"}
+        mock_channel._queue_cycle = ["myq"]
+        mock_channel._move_delayed.return_value = 0
+        mock_channel._reclaim_and_deliver.return_value = 0
+        poller._channels.add(mock_channel)
+
+        poller.maybe_enqueue_due_messages()
+
+        mock_channel._cleanup_consumers.assert_called_once()

@@ -87,6 +87,7 @@ from kombu.utils.url import _parse_url
 from vine import promise
 
 from .constants import (
+    CONSUMER_IDLE_CLEANUP_FACTOR,
     DEFAULT_CONSUMER_GROUP,
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_MAX_RESTORE_COUNT,
@@ -539,6 +540,9 @@ class MultiChannelPoller:
         cycle at the back moves one place forward each time, so it eventually
         leads and gets first claim on the budget.
 
+        Also runs consumer hygiene: idle consumers with no pending entries are
+        removed so consumer groups do not grow without bound.
+
         Returns:
             Total number of messages moved or reclaimed across all channels.
         """
@@ -575,6 +579,7 @@ class MultiChannelPoller:
                         exc_info=True,
                     )
             self._requeue_offsets[channel] = (offset + 1) % len(queues)
+            channel._cleanup_consumers()
         return total
 
     def maybe_heartbeat(self) -> None:
@@ -1468,6 +1473,38 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 if processed >= budget or prefetch_exhausted:
                     break
         return processed
+
+    def _cleanup_consumers(self) -> None:
+        """Remove idle consumers with no pending entries from consumer groups.
+
+        Consumers never expire in Redis, so every worker that ever connected
+        leaves a consumer entry behind. This slow periodic pass deletes
+        consumers idle longer than CONSUMER_IDLE_CLEANUP_FACTOR times the
+        visibility timeout. Consumers with pending entries are never deleted
+        (reclaim drains them first), and the channel's own consumer is kept.
+        """
+        if not self._queue_cycle:
+            return
+        idle_threshold_ms = CONSUMER_IDLE_CLEANUP_FACTOR * self.visibility_timeout * 1000
+        try:
+            with self.conn_or_acquire() as client:
+                for queue in self._queue_cycle:
+                    for stream_key in self._stream_keys_for_queue(queue):
+                        try:
+                            consumers = client.xinfo_consumers(stream_key, self.consumer_group)
+                        except self.ResponseError:
+                            # Stream or group does not exist (yet), nothing to clean
+                            continue
+                        for consumer in consumers:
+                            name = bytes_to_str(consumer["name"])
+                            if name == self.consumer_name:
+                                continue
+                            if int(consumer["pending"]) > 0:
+                                continue
+                            if int(consumer["idle"]) > idle_threshold_ms:
+                                client.xgroup_delconsumer(stream_key, self.consumer_group, name)
+        except Exception:
+            logger.warning("Failed to clean up idle consumers, will retry next cycle", exc_info=True)
 
     @property
     def priority_steps(self) -> list[int]:
