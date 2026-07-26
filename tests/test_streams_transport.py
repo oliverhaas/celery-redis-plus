@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, PropertyMock, call, patch
 
 import pytest
 from kombu import Connection
+from kombu.asynchronous import Hub
 from kombu.transport import TRANSPORT_ALIASES, get_transport_cls
 from kombu.utils.eventio import ERR, READ
 from kombu.utils.json import dumps as json_dumps
@@ -1326,6 +1327,7 @@ class TestStreamsQoSAck:
 
         mock_channel = MagicMock()
         mock_channel.closed = False
+        mock_channel._collected = False
         mock_channel.global_keyprefix = global_keyprefix
         mock_channel.consumer_group = "celery"
         mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
@@ -1351,7 +1353,7 @@ class TestStreamsQoSAck:
     def test_ack_fanout_tag_bypasses_stream_ack(self) -> None:
         """Test ack for fanout message discards the tag without touching Redis."""
         qos = object.__new__(QoS)
-        qos.channel = MagicMock(closed=False)
+        qos.channel = MagicMock(closed=False, _collected=False)
         qos._fanout_tags = {"tag1"}
         qos._in_flight = {}
         qos._delivered = {"tag1": MagicMock()}
@@ -1367,7 +1369,7 @@ class TestStreamsQoSAck:
     def test_ack_missing_metadata_logs_critical_and_acks(self, caplog: pytest.LogCaptureFixture) -> None:
         """Test ack without in-flight metadata logs critical but still acks locally."""
         qos = object.__new__(QoS)
-        qos.channel = MagicMock(closed=False)
+        qos.channel = MagicMock(closed=False, _collected=False)
         qos._fanout_tags = set()
         qos._in_flight = {}
         qos._delivered = {}
@@ -1381,23 +1383,31 @@ class TestStreamsQoSAck:
         qos.channel.conn_or_acquire.assert_not_called()
         qos._quick_ack.assert_called_once_with("ghost-tag")
 
-    def test_ack_after_channel_closed_does_not_raise(self) -> None:
-        """N1 regression: acking a released channel's in-flight tag must not raise.
+    def test_ack_after_channel_collected_does_not_raise(self) -> None:
+        """N1 regression: acking a collected channel's in-flight tag must not raise.
 
         Simulates the state right after Transport._collect() has run: the
-        channel is marked closed, and kombu's Connection.collect() has
-        severed channel.connection.client to None (Connection.
-        _do_close_transport does this unconditionally after any collect).
-        Before the fix, this fell through to _ack_by_tag(), which calls
-        conn_or_acquire() -> the .pool property -> _get_pool() ->
-        _connparams(), and _connparams() raises TypeError when
+        channel is marked collected (and, incidentally, closed, since a
+        genuine close() also happens to accompany a real collect), and
+        kombu's Connection.collect() has severed channel.connection.client to
+        None (Connection._do_close_transport does this unconditionally after
+        any collect). Before the fix, this fell through to _ack_by_tag(),
+        which calls conn_or_acquire() -> the .pool property -> _get_pool()
+        -> _connparams(), and _connparams() raises TypeError when
         self.connection.client is None. The entry must stay in _in_flight so
         a peer reclaims it after the visibility timeout instead.
+
+        Deliberately keys the assertion off channel._collected rather than
+        channel.closed (F1, round 3): a genuine Channel.close() also sets
+        `closed = True`, well before restore_unacked_once() runs, so a test
+        that only set `closed` could no longer distinguish "collected" from
+        "closing normally" once the guard uses the dedicated flag.
         """
         channel = object.__new__(Channel)
         channel.connection = MagicMock()
         channel.connection.client = None
         channel.closed = True
+        channel._collected = True
         channel._pool = None
         channel._async_pool = None
 
@@ -1431,6 +1441,7 @@ class TestStreamsQoSReject:
 
         mock_channel = MagicMock()
         mock_channel.closed = False
+        mock_channel._collected = False
         mock_channel.global_keyprefix = global_keyprefix
         mock_channel.consumer_group = "celery"
         mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
@@ -1475,6 +1486,7 @@ class TestStreamsQoSReject:
 
         mock_channel = MagicMock()
         mock_channel.closed = False
+        mock_channel._collected = False
         mock_channel.global_keyprefix = global_keyprefix
         mock_channel.consumer_group = "celery"
         mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
@@ -1499,7 +1511,7 @@ class TestStreamsQoSReject:
     def test_reject_fanout_tag_ignores_requeue(self) -> None:
         """Test reject for fanout message discards the tag; requeue unsupported for broadcast."""
         qos = object.__new__(QoS)
-        qos.channel = MagicMock(closed=False)
+        qos.channel = MagicMock(closed=False, _collected=False)
         qos._fanout_tags = {"tag1"}
         qos._in_flight = {}
         qos._delivered = {}
@@ -1515,7 +1527,7 @@ class TestStreamsQoSReject:
     def test_reject_missing_metadata_logs_critical_and_acks(self, caplog: pytest.LogCaptureFixture) -> None:
         """Test reject without in-flight metadata logs critical but still acks locally."""
         qos = object.__new__(QoS)
-        qos.channel = MagicMock(closed=False)
+        qos.channel = MagicMock(closed=False, _collected=False)
         qos._fanout_tags = set()
         qos._in_flight = {}
         qos._delivered = {}
@@ -1541,6 +1553,7 @@ class TestStreamsQoSReject:
 
         mock_channel = MagicMock()
         mock_channel.closed = False
+        mock_channel._collected = False
         mock_channel.global_keyprefix = ""
         mock_channel.consumer_group = "celery"
         mock_channel.conn_or_acquire = MagicMock(return_value=mock_context)
@@ -1562,10 +1575,10 @@ class TestStreamsQoSReject:
         assert "tag1" not in qos._in_flight
         qos._quick_ack.assert_called_once_with("tag1")
 
-    def test_reject_after_channel_closed_does_not_raise(self) -> None:
-        """N1 regression: rejecting a released channel's in-flight tag must not raise.
+    def test_reject_after_channel_collected_does_not_raise(self) -> None:
+        """N1 regression: rejecting a collected channel's in-flight tag must not raise.
 
-        See TestStreamsQoSAck.test_ack_after_channel_closed_does_not_raise:
+        See TestStreamsQoSAck.test_ack_after_channel_collected_does_not_raise:
         same collected-channel state, but through reject()'s _ack_by_tag()
         branch instead of ack()'s.
         """
@@ -1573,6 +1586,7 @@ class TestStreamsQoSReject:
         channel.connection = MagicMock()
         channel.connection.client = None
         channel.closed = True
+        channel._collected = True
         channel._pool = None
         channel._async_pool = None
 
@@ -5258,9 +5272,10 @@ class TestStreamsCollectVsClose:
         assert channel.closed is True
 
     def test_release_channel_on_collect_already_closed_is_noop(self) -> None:
-        """A channel already closed (e.g. by a prior collect) is left untouched."""
+        """A channel already collected (e.g. by a prior collect) is left untouched."""
         channel, mock_qos = self._make_bare_channel()
         channel.closed = True
+        channel._collected = True
         channel._disconnect_pools = MagicMock()
         channel._close_clients = MagicMock()
 
@@ -5421,6 +5436,113 @@ class TestStreamsShutdownRestoreIntegration:
         # the pickup came from the artificial idle release, not from
         # visibility_timeout naturally elapsing.
         assert elapsed < visibility_timeout / 2
+
+    def test_deferred_ack_during_close_restore_window_still_fully_acks(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """A hub.call_soon()-deferred ack drained during close() leaves no PEL or stream entry.
+
+        F1 regression (Fix round 3): QoS.ack/reject's collected-channel no-op
+        guard was keyed off channel.closed, but virtual.Channel.close() sets
+        `closed = True` for a genuine shutdown too, well before it reaches
+        restore_unacked_once(). Graceful shutdown's _drain_hub_callbacks()
+        runs inside that same restore_unacked_once() call, specifically to
+        flush acks from tasks that finished just before shutdown (scheduled
+        via hub.call_soon()). Keying the no-op off `closed` silently dropped
+        every one of those acks, leaving the PEL entry and stream entry
+        behind (and, via the sibling restore path, given an artificial
+        SHUTDOWN_IDLE_MS idle time), so a peer's reclaim pass would
+        immediately redeliver an already-completed task. Reproduces the
+        reviewer's repro shape directly: a real kombu Hub, a message acked
+        via hub.call_soon(message.ack), then a real Channel.close().
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "graceful-shutdown-ack-queue"
+        visibility_timeout = 20.0
+
+        producer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "producer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        hub = Hub()
+        try:
+            producer_channel = cast("Channel", producer_conn.channel())
+
+            message = {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-graceful-shutdown-ack",
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                },
+            }
+            producer_channel._put(queue, message)
+            # basic_get (not the raw _get) returns a real Message wired to
+            # this channel, so message.ack() below exercises the exact same
+            # call chain a completed task's deferred ack goes through in
+            # production.
+            consumed = producer_channel.basic_get(queue, no_ack=False)
+            assert consumed is not None
+            assert consumed.delivery_tag == "tag-graceful-shutdown-ack"
+
+            producer_qos = cast("QoS", producer_channel.qos)
+            stream_key, message_id = producer_qos._in_flight["tag-graceful-shutdown-ack"]
+
+            # Wire a real Hub onto the channel's connection cycle, exactly as
+            # Transport.register_with_event_loop() does in production, and
+            # defer the ack the way a just-finished task's completion
+            # callback does: call_soon(), not a direct call.
+            producer_channel.connection.cycle._loop = hub
+            hub.call_soon(consumed.ack)
+
+            # No worker pool registered for this connection: isolates the
+            # deferred-ack drain from the executor-wait branch (covered by
+            # the test above and unit tests), so this test exercises only
+            # the ack-during-restore-window guard.
+            with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=None):
+                producer_channel.close()
+
+            assert producer_channel.closed is True
+            assert producer_qos._in_flight == {}
+
+            inspector_conn = Connection(
+                broker_url,
+                transport="celery_redis_plus.streams:Transport",
+                transport_options={
+                    "visibility_timeout": visibility_timeout,
+                    "consumer_name": "inspector-worker",
+                    "global_keyprefix": global_keyprefix,
+                },
+            )
+            try:
+                inspector_channel = cast("Channel", inspector_conn.channel())
+                with inspector_channel.conn_or_acquire() as client:
+                    pending_after = client.xpending_range(
+                        stream_key,
+                        inspector_channel.consumer_group,
+                        min="-",
+                        max="+",
+                        count=10,
+                    )
+                    stream_entries = client.xrange(stream_key, message_id, message_id)
+                # XACK removed the PEL entry...
+                assert pending_after == []
+                # ...and XDEL removed the stream entry itself.
+                assert stream_entries == []
+            finally:
+                inspector_conn.close()
+        finally:
+            hub.close()
+            producer_conn.close()
 
     def test_connection_collect_does_not_release_pel_or_shutdown_executor(
         self,
