@@ -1062,6 +1062,97 @@ class TestStreamsInvalidateGroup:
 
 
 @pytest.mark.unit
+class TestStreamsDeliverInFlight:
+    """Tests for _deliver_in_flight, the shared record-then-deliver step.
+
+    kombu's Consumer._receive_callback wraps only the decode section, so a
+    raising delivery callback propagates back out of Transport._deliver. An
+    in-flight record left behind by such a raise is heartbeated forever
+    (XCLAIM ... JUSTID resets the PEL idle clock every cycle), so the entry
+    never crosses the visibility timeout for a peer, and
+    _own_in_flight_message_ids hides it from this channel's own reclaim pass
+    too. Verified against a real server: the entry stayed unreclaimable
+    across repeated heartbeats.
+    """
+
+    @staticmethod
+    def _make_channel() -> tuple[Channel, MagicMock]:
+        channel = object.__new__(Channel)
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        channel.connection = MagicMock()
+        return channel, mock_qos
+
+    def test_records_in_flight_before_delivering(self) -> None:
+        """The record must exist before the callback runs: an ack can land inside that call."""
+        channel, mock_qos = self._make_channel()
+        seen: list[dict[str, tuple[str, str]]] = []
+        channel.connection._deliver.side_effect = lambda *_a: seen.append(dict(mock_qos._in_flight))
+
+        channel._deliver_in_flight({"body": "x"}, "q1", "tagA", "stream:q1:0", "1-0")
+
+        assert seen == [{"tagA": ("stream:q1:0", "1-0")}]
+        assert mock_qos._in_flight == {"tagA": ("stream:q1:0", "1-0")}
+        channel.connection._deliver.assert_called_once_with({"body": "x"}, "q1")
+
+    def test_drops_in_flight_when_the_delivery_callback_raises(self) -> None:
+        """A raise means the handoff never happened, so the entry goes back to the safety net."""
+        channel, mock_qos = self._make_channel()
+        channel.connection._deliver.side_effect = RuntimeError("callback exploded")
+
+        with pytest.raises(RuntimeError):
+            channel._deliver_in_flight({"body": "x"}, "q1", "tagA", "stream:q1:0", "1-0")
+
+        assert mock_qos._in_flight == {}
+
+    def test_drops_in_flight_on_a_base_exception(self) -> None:
+        """A worker interrupted mid-delivery must not leak an unreclaimable entry either."""
+        channel, mock_qos = self._make_channel()
+        channel.connection._deliver.side_effect = KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            channel._deliver_in_flight({"body": "x"}, "q1", "tagA", "stream:q1:0", "1-0")
+
+        assert mock_qos._in_flight == {}
+
+    def test_leaves_other_in_flight_entries_alone_when_one_delivery_raises(self) -> None:
+        """Only the failing tag is dropped; concurrent in-flight work is untouched."""
+        channel, mock_qos = self._make_channel()
+        mock_qos._in_flight["tagOther"] = ("stream:q1:0", "9-0")
+        channel.connection._deliver.side_effect = RuntimeError("callback exploded")
+
+        with pytest.raises(RuntimeError):
+            channel._deliver_in_flight({"body": "x"}, "q1", "tagA", "stream:q1:0", "1-0")
+
+        assert mock_qos._in_flight == {"tagOther": ("stream:q1:0", "9-0")}
+
+    def test_tolerates_a_channel_without_qos(self) -> None:
+        """A channel with no QoS still delivers; there is simply nothing to record.
+
+        Patched at the class level because virtual.Channel.qos builds a QoS
+        lazily, so setting _qos = None would silently give us a real one.
+        """
+        channel, _mock_qos = self._make_channel()
+
+        with patch.object(Channel, "qos", new_callable=PropertyMock, return_value=None):
+            channel._deliver_in_flight({"body": "x"}, "q1", "tagA", "stream:q1:0", "1-0")
+
+        channel.connection._deliver.assert_called_once_with({"body": "x"}, "q1")
+
+    def test_tolerates_a_channel_without_qos_when_delivery_raises(self) -> None:
+        """The cleanup path must not turn a callback error into an AttributeError."""
+        channel, _mock_qos = self._make_channel()
+        channel.connection._deliver.side_effect = RuntimeError("callback exploded")
+
+        with (
+            patch.object(Channel, "qos", new_callable=PropertyMock, return_value=None),
+            pytest.raises(RuntimeError),
+        ):
+            channel._deliver_in_flight({"body": "x"}, "q1", "tagA", "stream:q1:0", "1-0")
+
+
+@pytest.mark.unit
 class TestStreamsEffectiveMessageTtl:
     """Tests for _effective_message_ttl_ms, the one rule every consume path shares."""
 
@@ -1893,6 +1984,37 @@ class TestStreamsXReadGroup:
         assert delivered_queues == ["q1", "q2"]
         assert channel._in_poll is None
 
+    def test_xreadgroup_read_drops_in_flight_when_delivery_raises(self) -> None:
+        """Test a raising delivery callback leaves no unreclaimable in-flight record.
+
+        The entries the raise skipped were never recorded either, so all of
+        them fall back to the visibility timeout instead of being pinned by
+        the heartbeat.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._in_poll = True
+        channel.connection_errors = _connection_errors
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        mock_client = MagicMock()
+        channel.client = mock_client
+        mock_connection = MagicMock()
+        mock_connection._deliver.side_effect = RuntimeError("callback exploded")
+        channel.connection = mock_connection
+
+        mock_client.parse_response.return_value = [
+            (b"stream:q1:9", [(b"1-0", {b"payload": b'{"body": "a", "properties": {"delivery_tag": "tagA"}}'})]),
+            (b"stream:q2:0", [(b"2-0", {b"payload": b'{"body": "b", "properties": {"delivery_tag": "tagB"}}'})]),
+        ]
+
+        with pytest.raises(RuntimeError):
+            channel._xreadgroup_read()
+
+        assert mock_qos._in_flight == {}
+        assert channel._in_poll is None
+
     def test_xreadgroup_read_empty_reply_raises_empty(self) -> None:
         """Test _xreadgroup_read raises Empty on a nil reply (BLOCK timeout) and clears _in_poll."""
         channel = object.__new__(Channel)
@@ -2050,6 +2172,44 @@ class TestStreamsConsumeRead:
             "q1",
         )
         channel._xreadgroup_start.assert_not_called()
+
+    def test_consume_read_drops_in_flight_when_delivery_raises(self, global_keyprefix: str) -> None:
+        """Test a raising delivery callback does not strand an unreclaimable PEL entry.
+
+        A record left behind here is heartbeated forever, so its PEL idle
+        time never reaches the visibility timeout and no peer can claim it,
+        while _own_in_flight_message_ids hides it from this channel too.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._queue_cycle = ["q1"]
+        channel._in_poll = None
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel._consume_script_sha = "sha123"
+        channel.connection_errors = _connection_errors
+        channel.ResponseError = _client_exceptions.ResponseError
+        channel.consumer_group = "celery"
+        channel.consumer_name = "host:42"
+        channel._ensure_group = MagicMock()
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:q1:0"])
+        channel._xreadgroup_start = MagicMock()
+        mock_qos = MagicMock()
+        mock_qos._in_flight = {}
+        channel._qos = mock_qos
+        mock_client = MagicMock()
+        channel.client = mock_client
+        mock_connection = MagicMock()
+        mock_connection._deliver.side_effect = RuntimeError("callback exploded")
+        channel.connection = mock_connection
+
+        payload = b'{"body": "test", "properties": {"delivery_tag": "tagA"}}'
+        mock_client.parse_response.return_value = [f"{global_keyprefix}stream:q1:0".encode(), b"1111-0", payload]
+
+        with pytest.raises(RuntimeError):
+            channel._consume_read()
+
+        assert mock_qos._in_flight == {}
 
     def test_consume_read_rotates_queue_cycle_so_a_busy_queue_cannot_starve_the_rest(self) -> None:
         """Test a queue that always yields does not monopolise the cycle.
@@ -2896,6 +3056,62 @@ class TestStreamsReclaim:
         assert delivered_message["properties"]["headers"]["x-restore-count"] == 1
         assert channel._qos._in_flight["tag-reclaim-1"] == ("stream:celery:0", "1700000000000-0")
         mock_ack_script.assert_not_called()
+
+    def test_reclaim_drops_in_flight_when_delivery_raises(self) -> None:
+        """A raising delivery callback on the reclaim path leaves no stranded in-flight record.
+
+        The entry stays claimed by this consumer, so only the visibility
+        timeout can hand it on; an in-flight record would keep the heartbeat
+        resetting that clock forever.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.message_ttl = None
+        channel._message_ttls = {}
+        channel.max_restore_count = None
+        channel.dead_letter_stream = None
+        channel.consumer_group = "celery"
+        channel.consumer_name = "worker1:123"
+        channel._stream_keys_for_queue = MagicMock(return_value=["stream:celery:0"])
+        channel._qos = MagicMock()
+        channel._qos._in_flight = {}
+        channel._qos.can_consume_max_estimate.return_value = None
+        channel.connection = MagicMock()
+        channel.connection.cycle = None
+        channel.connection._deliver.side_effect = RuntimeError("callback exploded")
+
+        payload_json = json_dumps(
+            {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-reclaim-boom",
+                    "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    "headers": {},
+                },
+            },
+        )
+        mock_client = MagicMock()
+        mock_client.time.return_value = (1700000100, 0)
+        mock_client.register_script.return_value = MagicMock()
+        mock_client.xpending_range.return_value = [
+            {
+                "message_id": b"1700000000000-0",
+                "consumer": b"worker1:123",
+                "time_since_delivered": 400000,
+                "times_delivered": 1,
+            },
+        ]
+        mock_client.xclaim.return_value = [(b"1700000000000-0", {b"payload": payload_json.encode()})]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with pytest.raises(RuntimeError):
+            channel._reclaim_and_deliver("celery", 100)
+
+        assert channel._qos._in_flight == {}
 
     def test_reclaim_missing_from_xpending_defaults_to_no_restore_count_header(self, global_keyprefix: str) -> None:
         """An id XCLAIM returns that is absent from the discovery-phase XPENDING map defaults to restore_count 0.

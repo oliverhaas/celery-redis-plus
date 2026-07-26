@@ -943,6 +943,47 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             ttl_ms = queue_ttl_ms if ttl_ms <= 0 else min(ttl_ms, queue_ttl_ms)
         return max(ttl_ms, 0)
 
+    def _deliver_in_flight(
+        self,
+        message: dict[str, Any],
+        queue: str,
+        delivery_tag: str,
+        stream_key: str,
+        entry_id: str,
+    ) -> None:
+        """Record a message's PEL metadata, deliver it, and drop the record if delivery raises.
+
+        The QoS in-flight record has to exist before the delivery callback
+        runs, since an ack can land inside that same call. But kombu's
+        ``Consumer._receive_callback`` wraps only the decode section, so an
+        exception from the user callback propagates straight back out of
+        ``Transport._deliver``. A record left behind by such a raise is worse
+        than useless: ``_heartbeat`` keeps issuing ``XCLAIM ... JUSTID`` for
+        it every cycle, so the entry's PEL idle time never crosses the
+        visibility timeout, and ``_own_in_flight_message_ids`` filters it out
+        of this channel's own reclaim pass as well. Neither a peer nor this
+        worker could ever take it again. Dropping the record on the way out
+        hands the entry back to the visibility-timeout safety net, turning a
+        permanent stall into an ordinary at-least-once redelivery.
+
+        Args:
+            message: Deserialized message to deliver.
+            queue: Logical queue name the message was consumed from.
+            delivery_tag: The message's delivery tag, used as the in-flight key.
+            stream_key: Unprefixed stream key holding the entry.
+            entry_id: Stream entry id, for the later XACK+XDEL.
+        """
+        qos = self.qos
+        if qos is not None:
+            cast("QoS", qos)._in_flight[delivery_tag] = (stream_key, entry_id)
+        delivered = False
+        try:
+            self.connection._deliver(message, queue)
+            delivered = True
+        finally:
+            if not delivered and qos is not None:
+                cast("QoS", qos)._in_flight.pop(delivery_tag, None)
+
     def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:
         """Get a single message from a queue (synchronous).
 
@@ -1524,9 +1565,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                         if restore_count > 0:
                             headers = message.setdefault("properties", {}).setdefault("headers", {})
                             headers["x-restore-count"] = restore_count
-                        if qos is not None:
-                            qos._in_flight[delivery_tag] = (stream_key, message_id_str)
-                        self.connection._deliver(message, queue)
+                        self._deliver_in_flight(message, queue, delivery_tag, stream_key, message_id_str)
                         if qos is not None and not qos.can_consume():
                             prefetch_exhausted = True
                     if page_short or prefetch_exhausted:
@@ -1772,9 +1811,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 # Rotate before delivering so a raising delivery callback
                 # cannot pin the cycle on the same queue forever
                 self._rotate_queue_cycle(index)
-                if self.qos is not None:
-                    cast("QoS", self.qos)._in_flight[delivery_tag] = (result_stream, entry_id)
-                self.connection._deliver(message, queue)
+                self._deliver_in_flight(message, queue, delivery_tag, result_stream, entry_id)
                 return True
 
         # Every watched queue is empty: arm the blocking XREADGROUP (sets _in_poll)
@@ -1868,9 +1905,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                         continue
                     message: dict[str, Any] = loads(bytes_to_str(payload_field))
                     delivery_tag = message["properties"]["delivery_tag"]
-                    if self.qos is not None:
-                        cast("QoS", self.qos)._in_flight[delivery_tag] = (stream_str, message_id_str)
-                    self.connection._deliver(message, queue_name)
+                    self._deliver_in_flight(message, queue_name, delivery_tag, stream_str, message_id_str)
                     delivered = True
 
             if not delivered:

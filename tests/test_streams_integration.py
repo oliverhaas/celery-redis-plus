@@ -1924,6 +1924,89 @@ class TestStreamsSizePurgeIntegration:
 
 
 @pytest.mark.integration
+class TestStreamsRaisingDeliveryCallback:
+    """A delivery callback that raises must not strand its PEL entry forever.
+
+    kombu's Consumer._receive_callback wraps only the decode section, so an
+    exception from the user callback propagates straight back out of
+    Transport._deliver. The _in_flight entry recorded just before the call
+    would otherwise survive, and Channel._heartbeat keeps XCLAIM ... JUSTID
+    -ing it every cycle, so its PEL idle time never crosses the visibility
+    timeout and no peer can ever reclaim it. That is the one place where the
+    heartbeat defeats the safety net instead of reinforcing it.
+    """
+
+    def test_reclaim_takes_over_an_entry_whose_delivery_callback_raised(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Test the entry is handed back to the visibility-timeout safety net.
+
+        _own_in_flight_message_ids filters ids this process still believes it
+        is handling out of every reclaim pass, so an orphaned _in_flight entry
+        is not merely heartbeated forever, it is also invisible to this
+        worker's own reclaim. Reclaiming it is therefore a direct, timing-free
+        assertion that the orphan is gone.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "raising-callback-queue"
+        delivery_tag = "raising-callback-tag"
+
+        conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={"global_keyprefix": global_keyprefix},
+        )
+        try:
+            channel = cast("Channel", conn.channel())
+            channel.visibility_timeout = 0.2
+            channel._put(
+                queue,
+                {
+                    "body": '{"task": "test"}',
+                    "properties": {
+                        "delivery_tag": delivery_tag,
+                        "delivery_info": {"exchange": "", "routing_key": queue},
+                        "headers": {},
+                    },
+                },
+            )
+            channel._queue_cycle = [queue]
+            if channel.client.connection is None:
+                channel.client.connection = channel.client.connection_pool.get_connection()
+
+            class CallbackExplodedError(Exception):
+                pass
+
+            delivered_tags: list[str] = []
+
+            def deliver(message: dict[str, Any], _queue: str) -> None:
+                delivered_tags.append(message["properties"]["delivery_tag"])
+                if len(delivered_tags) == 1:
+                    raise CallbackExplodedError
+
+            qos = cast("QoS", channel.qos)
+            with patch.object(channel.connection, "_deliver", side_effect=deliver):
+                with pytest.raises(CallbackExplodedError):
+                    channel._consume_read()
+
+                # The delivery never completed, so this worker must not keep
+                # claiming ownership of the entry
+                assert qos._in_flight == {}
+
+                time.sleep(0.3)  # idle past the 0.2s visibility timeout
+                reclaimed = channel._reclaim_and_deliver(queue, 10)
+
+            assert reclaimed == 1
+            assert delivered_tags == [delivery_tag, delivery_tag]
+        finally:
+            conn.close()
+
+
+@pytest.mark.integration
 class TestStreamsQueueFairness:
     """Round-robin fairness of the non-blocking consume pass across watched queues."""
 
