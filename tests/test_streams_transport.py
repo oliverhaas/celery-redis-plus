@@ -1061,6 +1061,147 @@ class TestStreamsInvalidateGroup:
 
 
 @pytest.mark.unit
+class TestStreamsEffectiveMessageTtl:
+    """Tests for _effective_message_ttl_ms, the one rule every consume path shares."""
+
+    @staticmethod
+    def _make_channel(message_ttl: int | None, message_ttls: dict[str, int]) -> Channel:
+        channel = object.__new__(Channel)
+        channel.message_ttl = message_ttl
+        channel._message_ttls = message_ttls
+        return channel
+
+    @pytest.mark.parametrize(
+        ("message_ttl", "queue_ttl_ms", "expected_ttl_ms"),
+        [
+            (None, None, 0),
+            (60, None, 60000),
+            (None, 5000, 5000),
+            (60, 5000, 5000),
+            (2, 5000, 2000),
+            (0, 5000, 5000),
+            (0, None, 0),
+            (-1, 5000, 5000),
+            (-1, None, 0),
+            (-30, 5000, 5000),
+            (60, -1, 0),
+        ],
+        ids=[
+            "unset",
+            "channel-only",
+            "queue-only",
+            "queue-smaller",
+            "channel-smaller",
+            "zero-channel-keeps-queue-ttl",
+            "zero-channel-alone-is-no-ttl",
+            "negative-one-channel-keeps-queue-ttl",
+            "negative-one-channel-alone-is-no-ttl",
+            "any-negative-channel-keeps-queue-ttl",
+            "negative-queue-ttl-normalized-to-no-ttl",
+        ],
+    )
+    def test_effective_message_ttl_ms(
+        self,
+        message_ttl: int | None,
+        queue_ttl_ms: int | None,
+        expected_ttl_ms: int,
+    ) -> None:
+        """A non-positive channel message_ttl means unset, never expire-immediately.
+
+        -1 is the sorted-set transport's documented no-TTL sentinel
+        (DEFAULT_MESSAGE_TTL), so a user migrating between transports carries
+        it over. Reading it as a real TTL makes min(-1000, queue_ttl_ms)
+        negative, which every downstream ``ttl_ms > 0`` guard reads as
+        "no TTL", silently disabling the queue's own x-message-ttl.
+        """
+        channel = self._make_channel(message_ttl, {} if queue_ttl_ms is None else {"my_queue": queue_ttl_ms})
+
+        assert channel._effective_message_ttl_ms("my_queue") == expected_ttl_ms
+
+    def test_effective_message_ttl_ms_is_per_queue(self) -> None:
+        """A queue with no x-message-ttl falls back to the channel-wide value alone."""
+        channel = self._make_channel(60, {"other_queue": 1000})
+
+        assert channel._effective_message_ttl_ms("my_queue") == 60000
+        assert channel._effective_message_ttl_ms("other_queue") == 1000
+
+    def test_every_consume_path_uses_the_shared_helper(self) -> None:
+        """_get, _consume_read and _move_delayed all resolve the TTL through one helper.
+
+        Before this was hoisted, the four sites disagreed on what "unset"
+        meant: two tested ``== 0`` and two tested ``> 0`` / ``<= 0``, so a
+        negative channel-level message_ttl disabled x-message-ttl on the two
+        hot consume paths while the delayed pump and the reclaim pass kept
+        enforcing it.
+        """
+        observed: list[str] = []
+
+        def record(_self: Channel, queue: str) -> int:
+            observed.append(queue)
+            return 4242
+
+        with patch.object(Channel, "_effective_message_ttl_ms", record):
+            # _get
+            get_channel = object.__new__(Channel)
+            get_channel.global_keyprefix = ""
+            get_channel._ensure_group = MagicMock()
+            get_channel._stream_keys_for_queue = MagicMock(return_value=["stream:my_queue:0"])
+            get_script = MagicMock(return_value=None)
+            get_client = MagicMock()
+            get_client.register_script.return_value = get_script
+            get_context = MagicMock()
+            get_context.__enter__ = MagicMock(return_value=get_client)
+            get_context.__exit__ = MagicMock(return_value=False)
+            get_channel.conn_or_acquire = MagicMock(return_value=get_context)
+            with (
+                patch.object(Channel, "consumer_group", "celery", create=True),
+                patch.object(Channel, "consumer_name", "testhost:4242", create=True),
+                pytest.raises(Empty),
+            ):
+                get_channel._get("my_queue")
+
+            # _consume_read
+            read_channel = object.__new__(Channel)
+            read_channel.global_keyprefix = ""
+            read_channel._queue_cycle = ["my_queue"]
+            read_channel._in_poll = None
+            read_channel._consume_script_sha = "sha123"
+            read_channel.connection_errors = _connection_errors
+            read_channel.ResponseError = _client_exceptions.ResponseError
+            read_channel.consumer_group = "celery"
+            read_channel.consumer_name = "host:42"
+            read_channel._ensure_group = MagicMock()
+            read_channel._stream_keys_for_queue = MagicMock(return_value=["stream:my_queue:0"])
+            read_channel._xreadgroup_start = MagicMock()
+            read_client = MagicMock()
+            read_client.parse_response.return_value = None
+            read_channel.client = read_client
+            with pytest.raises(Empty):
+                read_channel._consume_read()
+
+            # _move_delayed
+            move_channel = object.__new__(Channel)
+            move_channel.global_keyprefix = ""
+            move_connection = MagicMock()
+            move_connection.client.transport_options = {"priority_steps": [0]}
+            move_channel.connection = move_connection
+            move_channel._ensure_group = MagicMock()
+            move_script = MagicMock(return_value=0)
+            move_client = MagicMock()
+            move_client.register_script.return_value = move_script
+            move_context = MagicMock()
+            move_context.__enter__ = MagicMock(return_value=move_client)
+            move_context.__exit__ = MagicMock(return_value=False)
+            move_channel.conn_or_acquire = MagicMock(return_value=move_context)
+            move_channel._move_delayed("my_queue")
+
+        assert observed == ["my_queue", "my_queue", "my_queue"]
+        assert int(get_script.call_args.kwargs["args"][2]) == 4242
+        assert read_client.connection.send_command.call_args[0][-1] == "4242"
+        assert move_script.call_args.kwargs["args"][1] == 4242
+
+
+@pytest.mark.unit
 class TestStreamsConsumeLua:
     """Tests for the streams_consume.lua script file and its module-level loading."""
 
@@ -1218,8 +1359,18 @@ class TestStreamsGet:
             (None, 5000, 5000),
             (60, 5000, 5000),
             (2, 5000, 2000),
+            (-1, 5000, 5000),
+            (-1, None, 0),
         ],
-        ids=["no-ttl", "channel-only", "queue-only", "queue-smaller", "channel-smaller"],
+        ids=[
+            "no-ttl",
+            "channel-only",
+            "queue-only",
+            "queue-smaller",
+            "channel-smaller",
+            "negative-channel-keeps-queue-ttl",
+            "negative-channel-alone-is-no-ttl",
+        ],
     )
     def test_get_ttl_argv_min_rule(
         self,

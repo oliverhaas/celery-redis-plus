@@ -1533,6 +1533,51 @@ class TestStreamsTTL:
             # The expired entry was acked and deleted, not left behind
             assert redis_client.xlen(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0") == 0
 
+    def test_negative_channel_message_ttl_still_enforces_x_message_ttl_on_consume(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """A message_ttl of -1 must not disable the queue's own x-message-ttl.
+
+        -1 is the sorted-set transport's documented no-TTL sentinel
+        (DEFAULT_MESSAGE_TTL), so a user migrating between the two transports
+        carries it straight over. Reading it as a real TTL makes
+        min(-1000, x-message-ttl) negative, and the consume script's
+        ``ttl_ms > 0`` guard then treats that as "no TTL", delivering an
+        entry that is long past its expiry.
+        """
+        host, port, _image = redis_container
+        queue = "negative-message-ttl-queue"
+        app = _make_streams_app(host, port, global_keyprefix, message_ttl=-1)
+        try:
+            with app.connection() as conn:
+                channel = cast("Channel", conn.default_channel)
+                assert channel.message_ttl == -1
+
+                channel._new_queue(queue, arguments={"x-message-ttl": 1000})
+
+                message = {
+                    "body": '{"task": "test.add", "args": [1, 2]}',
+                    "properties": {
+                        "delivery_tag": "negative-ttl-tag",
+                        "delivery_info": {"exchange": "", "routing_key": queue},
+                        "headers": {},
+                    },
+                }
+                channel._put(queue, message)
+
+                time.sleep(1.5)  # entry id timestamp is now older than the 1s TTL
+
+                with pytest.raises(Empty):
+                    channel._get(queue)
+
+                # The expired entry was acked and deleted, not delivered
+                assert channel.client.xlen(f"{STREAM_KEY_PREFIX}{queue}:0") == 0
+        finally:
+            app.close()
+
     def test_expired_delayed_message_dropped_by_pump(
         self,
         celery_app: Celery,

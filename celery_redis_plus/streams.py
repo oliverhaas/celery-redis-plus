@@ -913,6 +913,36 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             if queue in self._expires:
                 client.pexpire(stream_key, self._expires[queue])
 
+    def _effective_message_ttl_ms(self, queue: str) -> int:
+        """Effective message TTL for a queue in milliseconds (0 = no TTL).
+
+        Combines the channel-wide ``message_ttl`` transport option (seconds)
+        with the queue's ``x-message-ttl`` argument (milliseconds) by taking
+        the smaller of the two, and normalizes anything non-positive to 0.
+
+        A non-positive ``message_ttl`` means "unset", never "expire
+        immediately": ``-1`` is the sorted-set transport's own documented
+        no-TTL sentinel (``DEFAULT_MESSAGE_TTL``), so a user migrating
+        between the two transports carries it over. Without the
+        normalization, ``min(-1000, queue_ttl_ms)`` would be negative and
+        every ``ttl_ms > 0`` guard downstream (Lua and Python alike) would
+        read it as "no TTL", silently disabling the queue's own
+        ``x-message-ttl``.
+
+        Args:
+            queue: Queue name whose ``x-message-ttl`` is combined in.
+
+        Returns:
+            The effective TTL in milliseconds, or 0 when no TTL applies.
+        """
+        ttl_ms = 0
+        if self.message_ttl is not None and self.message_ttl > 0:
+            ttl_ms = int(self.message_ttl * 1000)
+        queue_ttl_ms = self._message_ttls.get(queue)
+        if queue_ttl_ms is not None:
+            ttl_ms = queue_ttl_ms if ttl_ms <= 0 else min(ttl_ms, queue_ttl_ms)
+        return max(ttl_ms, 0)
+
     def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:
         """Get a single message from a queue (synchronous).
 
@@ -934,12 +964,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         for stream_key in stream_keys:
             self._ensure_group(stream_key)
 
-        # Effective message TTL in ms: min of channel-level message_ttl (seconds)
-        # and per-queue x-message-ttl (ms); 0 = no TTL
-        ttl_ms = 0 if self.message_ttl is None else int(self.message_ttl * 1000)
-        queue_ttl_ms = self._message_ttls.get(queue)
-        if queue_ttl_ms is not None:
-            ttl_ms = queue_ttl_ms if ttl_ms == 0 else min(ttl_ms, queue_ttl_ms)
+        ttl_ms = self._effective_message_ttl_ms(queue)
 
         with self.conn_or_acquire() as client:
             consume_script = client.register_script(_STREAMS_CONSUME_LUA)
@@ -1101,14 +1126,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         for level in steps:
             self._ensure_group(self._stream_key(queue, level))
 
-        # Effective message TTL in ms (0 = none); per-queue x-message-ttl (ms)
-        # is min'd with the channel-wide message_ttl (seconds)
-        message_ttl_ms = 0
-        if self.message_ttl is not None and self.message_ttl > 0:
-            message_ttl_ms = int(self.message_ttl * 1000)
-        if queue in self._message_ttls:
-            queue_ttl_ms = self._message_ttls[queue]
-            message_ttl_ms = queue_ttl_ms if message_ttl_ms == 0 else min(message_ttl_ms, queue_ttl_ms)
+        message_ttl_ms = self._effective_message_ttl_ms(queue)
 
         # Prefix keys since EVALSHA doesn't auto-prefix KEYS
         delayed_key = f"{self.global_keyprefix}{self._delayed_key(queue)}"
@@ -1339,13 +1357,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         min_idle_ms = int(self.visibility_timeout * 1000)
         qos = cast("QoS", self.qos) if self.qos is not None else None
 
-        # Effective message TTL in ms (0 = no TTL): channel option min per-queue x-message-ttl
-        ttl_ms = 0
-        if self.message_ttl is not None:
-            ttl_ms = int(self.message_ttl * 1000)
-        queue_ttl_ms = self._message_ttls.get(queue)
-        if queue_ttl_ms is not None:
-            ttl_ms = queue_ttl_ms if ttl_ms <= 0 else min(ttl_ms, queue_ttl_ms)
+        ttl_ms = self._effective_message_ttl_ms(queue)
 
         processed = 0
         prefetch_exhausted = False
@@ -1696,12 +1708,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 self._ensure_group(stream_key)
             # Prefix keys manually since EVALSHA doesn't auto-prefix KEYS
             keys = [f"{self.global_keyprefix}{stream_key}" for stream_key in stream_keys]
-            # Effective message TTL in ms (0 = none): per-queue x-message-ttl
-            # takes the minimum with the channel-level message_ttl (seconds)
-            ttl_ms = 0 if self.message_ttl is None else int(self.message_ttl * 1000)
-            if queue in self._message_ttls:
-                queue_ttl_ms = self._message_ttls[queue]
-                ttl_ms = queue_ttl_ms if ttl_ms == 0 else min(ttl_ms, queue_ttl_ms)
+            ttl_ms = self._effective_message_ttl_ms(queue)
 
             command_args: tuple[Any, ...] = (
                 "EVALSHA",
