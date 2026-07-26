@@ -2807,6 +2807,64 @@ class TestStreamsPoller:
         assert channel._consume_read.call_count == 3
         channel._xreadgroup_start.assert_called_once_with()
 
+    def test_register_xreadgroup_bounds_the_drain_loop_when_prefetch_is_unbounded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Test an unbounded QoS still yields the hub back after a bounded number of reads.
+
+        With worker_prefetch_multiplier=0 can_consume_max_estimate returns
+        None, so nothing trims the loop and a deep backlog would run
+        DEFAULT_REQUEUE_BATCH_LIMIT synchronous EVALSHAs back to back in a
+        single hub tick, stalling every timer and every other channel.
+        """
+        monkeypatch.setattr("celery_redis_plus.streams.DEFAULT_UNBOUNDED_PREFETCH_DRAIN_LIMIT", 3)
+        poller = object.__new__(MultiChannelPoller)
+        poller._fd_to_chan = {}
+        poller._chan_to_sock = {}
+        poller.poller = MagicMock()
+
+        channel = MagicMock()
+        channel._in_poll = None
+        channel.qos.can_consume_max_estimate.return_value = None
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 7
+        channel.client.connection._sock = mock_sock
+        # Never runs dry: only the loop's own bound can end it
+        channel._consume_read.return_value = True
+
+        result = poller._register_XREADGROUP(channel)
+
+        assert result is True
+        assert channel._consume_read.call_count == 3
+        # Same treatment as the outer cap exit: the rest of the backlog must
+        # not be left waiting on the hub's poll timeout
+        channel._xreadgroup_start.assert_called_once_with()
+
+    def test_register_xreadgroup_unbounded_limit_does_not_trim_a_bounded_prefetch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Test the unbounded-prefetch bound only applies when there is no headroom estimate."""
+        monkeypatch.setattr("celery_redis_plus.streams.DEFAULT_UNBOUNDED_PREFETCH_DRAIN_LIMIT", 2)
+        poller = object.__new__(MultiChannelPoller)
+        poller._fd_to_chan = {}
+        poller._chan_to_sock = {}
+        poller.poller = MagicMock()
+
+        channel = MagicMock()
+        channel._in_poll = None
+        channel.qos.can_consume_max_estimate.side_effect = [4, 3, 2, 1, 0]
+        mock_sock = MagicMock()
+        mock_sock.fileno.return_value = 7
+        channel.client.connection._sock = mock_sock
+        channel._consume_read.return_value = True
+
+        poller._register_XREADGROUP(channel)
+
+        assert channel._consume_read.call_count == 4
+        channel._xreadgroup_start.assert_not_called()
+
     def test_on_poll_start_registers_active_channels(self) -> None:
         """Test on_poll_start registers queue channels for XREADGROUP and fanout channels for XREAD."""
         poller = object.__new__(MultiChannelPoller)

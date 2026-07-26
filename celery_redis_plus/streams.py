@@ -96,6 +96,7 @@ from .constants import (
     DEFAULT_REQUEUE_BATCH_LIMIT,
     DEFAULT_REQUEUE_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
+    DEFAULT_UNBOUNDED_PREFETCH_DRAIN_LIMIT,
     DEFAULT_VISIBILITY_TIMEOUT,
     DELAYED_KEY_PREFIX,
     HEARTBEAT_INTERVAL_DIVISOR,
@@ -429,6 +430,9 @@ class MultiChannelPoller:
         hub tick, draining every already-available message up to the
         channel's QoS prefetch headroom (or DEFAULT_REQUEUE_BATCH_LIMIT,
         whichever is smaller), instead of delivering only the first hit.
+        With prefetch unbounded (worker_prefetch_multiplier=0) there is no
+        headroom to bound the loop, so DEFAULT_UNBOUNDED_PREFETCH_DRAIN_LIMIT
+        stands in for it and keeps one tick from monopolising the hub.
 
         Channel._consume_read's EVALSHA is synchronous: it sends and parses
         the reply inline and returns on the first hit, unlike the sorted-set
@@ -461,17 +465,28 @@ class MultiChannelPoller:
 
         qos = channel.qos
         delivered_any = False
-        for _ in range(DEFAULT_REQUEUE_BATCH_LIMIT):
-            if qos is not None:
-                remaining = qos.can_consume_max_estimate()
-                if remaining is not None and remaining <= 0:
-                    break
+        hit_cap = True
+        for iteration in range(DEFAULT_REQUEUE_BATCH_LIMIT):
+            remaining = qos.can_consume_max_estimate() if qos is not None else None
+            if remaining is not None and remaining <= 0:
+                hit_cap = False
+                break
+            if remaining is None and iteration >= DEFAULT_UNBOUNDED_PREFETCH_DRAIN_LIMIT:
+                # Unbounded prefetch (worker_prefetch_multiplier=0) has no
+                # headroom to trim this loop, so a deep backlog would run
+                # DEFAULT_REQUEUE_BATCH_LIMIT synchronous EVALSHAs back to
+                # back in one tick, blocking every hub timer and every other
+                # channel meanwhile. Yield sooner on the same terms as the
+                # outer cap: the blocking read below keeps the rest of the
+                # backlog moving on the next tick.
+                break
             try:
                 channel._consume_read()
             except Empty:
+                hit_cap = False
                 break
             delivered_any = True
-        else:
+        if hit_cap:
             # Cap hit without ever seeing Empty, so more may still be waiting
             # and _consume_read only arms on an empty pass. Guard on headroom:
             # arming at zero leaves on_readable refusing to parse the fd that

@@ -31,6 +31,10 @@ DEFAULT_REQUEUE_BATCH_LIMIT = 1000
 # Max XPENDING discovery pages walked per stream per reclaim call
 DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT = 50
 
+# Max synchronous consume calls per hub tick when prefetch is unbounded
+# (worker_prefetch_multiplier=0), where QoS headroom cannot trim the drain loop
+DEFAULT_UNBOUNDED_PREFETCH_DRAIN_LIMIT = 100
+
 # Default TTL for per-message hashes in seconds
 # -1 means no TTL (messages persist until acked or deleted)
 # Set to a positive value (e.g., 259200 for 3 days) to auto-expire orphaned messages
