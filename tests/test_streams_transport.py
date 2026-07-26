@@ -18,6 +18,7 @@ import pytest
 from kombu import Connection
 from kombu.asynchronous import Hub
 from kombu.transport import TRANSPORT_ALIASES, get_transport_cls
+from kombu.utils.encoding import bytes_to_str
 from kombu.utils.eventio import ERR, READ
 from kombu.utils.json import dumps as json_dumps
 from vine import promise
@@ -6075,3 +6076,160 @@ class TestStreamsConsumerCleanup:
         poller.maybe_enqueue_due_messages()
 
         mock_channel._cleanup_consumers.assert_called_once()
+
+
+@pytest.mark.integration
+class TestStreamsCleanupConsumersIntegration:
+    """Integration tests for Channel._cleanup_consumers against real Redis/Valkey.
+
+    _cleanup_consumers depends on the SHAPE of the real xinfo_consumers reply: a
+    list of dicts with 'name' (bytes), 'pending', and 'idle' keys. A prior round
+    on this branch shipped a reply-shape bug (xautoclaim unpacked as a 3-tuple)
+    that all 362 mocked unit tests passed over; mocking xinfo_consumers here
+    would be equally blind to a similar mismatch. This exercises the real
+    client returned by Channel._get_client() (plain redis-py/valkey-py when
+    global_keyprefix is falsy, PrefixedStrictRedis when truthy, via the
+    parametrized global_keyprefix fixture), so both prefixing paths run too.
+    """
+
+    def test_cleanup_deletes_idle_zero_pending_consumer_but_keeps_busy_one(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Two consumers read one message each from the same group; one acks
+        (pending drops to zero) and the other does not (pending stays one).
+        After both go idle past CONSUMER_IDLE_CLEANUP_FACTOR * visibility_timeout,
+        a cleanup pass run under a third consumer identity deletes only the
+        idle, zero-pending consumer and leaves the busy one untouched.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "cleanup-integration-queue"
+        # idle threshold = CONSUMER_IDLE_CLEANUP_FACTOR * visibility_timeout * 1000
+        # = 12 * 0.05 * 1000 = 600ms, comfortably crossed by the sleep below.
+        visibility_timeout = 0.05
+
+        def make_conn(consumer_name: str) -> Connection:
+            return Connection(
+                broker_url,
+                transport="celery_redis_plus.streams:Transport",
+                transport_options={
+                    "visibility_timeout": visibility_timeout,
+                    "consumer_name": consumer_name,
+                    "global_keyprefix": global_keyprefix,
+                },
+            )
+
+        idle_conn = make_conn("idle-worker")
+        busy_conn = make_conn("busy-worker")
+        cleaner_conn = make_conn("cleaner-worker")
+        try:
+            idle_channel = cast("Channel", idle_conn.channel())
+            busy_channel = cast("Channel", busy_conn.channel())
+
+            def make_message(tag: str) -> dict[str, Any]:
+                return {
+                    "body": '{"task": "test"}',
+                    "properties": {
+                        "delivery_tag": tag,
+                        "delivery_info": {"exchange": "", "routing_key": queue},
+                        "headers": {},
+                    },
+                }
+
+            idle_channel._put(queue, make_message("tag-idle"))
+            idle_channel._put(queue, make_message("tag-busy"))
+
+            # Two distinct consumer names each read one entry (XREADGROUP '>'
+            # never redelivers an entry already claimed by the group).
+            consumed_idle = idle_channel._get(queue)
+            assert consumed_idle["properties"]["delivery_tag"] == "tag-idle"
+            consumed_busy = busy_channel._get(queue)
+            assert consumed_busy["properties"]["delivery_tag"] == "tag-busy"
+
+            # idle-worker acks (pending -> 0); busy-worker never acks (pending stays 1)
+            cast("QoS", idle_channel.qos).ack("tag-idle")
+
+            # Let both consumers cross the idle cleanup threshold.
+            time.sleep(1.0)
+
+            cleaner_channel = cast("Channel", cleaner_conn.channel())
+            cleaner_channel._queue_cycle = [queue]
+            cleaner_channel._cleanup_consumers()
+
+            priority = idle_channel._get_message_priority({"properties": {}}, reverse=False)
+            level = priority_to_level(priority, idle_channel.priority_steps)
+            stream_key = idle_channel._stream_key(queue, level)
+            with cleaner_channel.conn_or_acquire() as client:
+                remaining = client.xinfo_consumers(stream_key, cleaner_channel.consumer_group)
+            remaining_names = {bytes_to_str(consumer["name"]) for consumer in remaining}
+        finally:
+            idle_conn.close()
+            busy_conn.close()
+            cleaner_conn.close()
+
+        assert "idle-worker" not in remaining_names
+        assert "busy-worker" in remaining_names
+
+
+@pytest.mark.integration
+class TestStreamsSizePurgeIntegration:
+    """Integration tests for Channel._size and Channel._purge against real Redis/Valkey.
+
+    Exercises the real XLEN/ZCARD/DEL replies through the real client (plain
+    redis-py/valkey-py when global_keyprefix is falsy, PrefixedStrictRedis when
+    truthy, via the parametrized global_keyprefix fixture), so the prefixing
+    path noted in the carry-forward notes for DEL/XLEN/ZCARD actually runs.
+    """
+
+    def test_size_and_purge_count_priorities_and_delayed_messages(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """_size sums entries across priority-level streams plus the delayed
+        zset; _purge returns that same count and leaves the queue empty.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "size-purge-integration-queue"
+
+        conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={"global_keyprefix": global_keyprefix},
+        )
+        try:
+            channel = cast("Channel", conn.channel())
+
+            def make_message(tag: str, priority: int, eta: float | None = None) -> dict[str, Any]:
+                properties: dict[str, Any] = {
+                    "delivery_tag": tag,
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                    "priority": priority,
+                }
+                if eta is not None:
+                    properties["eta"] = eta
+                return {"body": '{"task": "test"}', "properties": properties}
+
+            # Three immediate messages across three different priority streams...
+            channel._put(queue, make_message("tag-p0", priority=0))
+            channel._put(queue, make_message("tag-p5", priority=5))
+            channel._put(queue, make_message("tag-p9", priority=9))
+            # ...plus one native-delayed message staged in the delayed zset
+            # (DEFAULT_REQUEUE_CHECK_INTERVAL is patched to 2s in conftest, so
+            # a 10s eta is comfortably past the native-delayed threshold).
+            channel._put(queue, make_message("tag-delayed", priority=0, eta=time.time() + 10))
+
+            assert channel._size(queue) == 4
+
+            purged = channel._purge(queue)
+
+            assert purged == 4
+            assert channel._size(queue) == 0
+        finally:
+            conn.close()
