@@ -18,12 +18,22 @@
 -- 'inactive' field entirely (7.2+ only), so fields are scanned by name
 -- rather than by position, and 'inactive' is never read.
 -- A missing stream or consumer group must not raise: the XINFO call is
--- wrapped in pcall and treated as "nothing to clean" on failure.
+-- wrapped in pcall and treated as "nothing to clean" on failure. Any other
+-- XINFO failure (WRONGTYPE, OOM, ...) is not raised either, but is reported
+-- back distinctly so the Python side can log it instead of the failure
+-- going completely silent (verified error text below against redis:7-alpine,
+-- valkey/valkey:latest, and redis:6.2-alpine: a missing key replies
+-- "ERR no such key", a missing group replies "NOGROUP ...", every other
+-- failure is something else).
 -- KEYS: [1] = stream:{queue}:{level} (passed with global_keyprefix applied)
 -- ARGV: [1] = consumer group name
 --       [2] = this channel's own consumer name (never deleted)
 --       [3] = idle threshold in ms
--- Returns: array of consumer names deleted
+-- Returns: array of consumer names deleted, on the expected no-op path, or
+--   on any other XINFO failure: a two-element array {-1, error message}.
+--   -1 is a Lua number, so it decodes as a RESP integer; a deleted
+--   consumer name always decodes as a bulk string, so the two replies
+--   cannot be confused by position.
 
 local stream_key = KEYS[1]
 local group = ARGV[1]
@@ -32,7 +42,11 @@ local idle_threshold_ms = tonumber(ARGV[3])
 
 local ok, consumers = pcall(redis.call, 'XINFO', 'CONSUMERS', stream_key, group)
 if not ok then
-    return {}
+    local message = type(consumers) == 'string' and consumers or tostring(consumers)
+    if message:find('no such key', 1, true) or message:find('NOGROUP', 1, true) then
+        return {}
+    end
+    return {-1, message}
 end
 
 local deleted = {}

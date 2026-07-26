@@ -6113,6 +6113,22 @@ class TestStreamsConsumerCleanup:
         called_keys = [c.kwargs["keys"][0] for c in mock_script.call_args_list]
         assert called_keys == ["stream:myq:9", "stream:myq:0"]
 
+    def test_cleanup_logs_warning_on_unexpected_script_error_sentinel(self) -> None:
+        """A [-1, message] reply (N6: an XINFO failure the script cannot treat as a no-op) is logged, not raised."""
+        channel, _mock_client, mock_script = self._make_channel()
+        mock_script.return_value = [-1, b"WRONGTYPE Operation against a key holding the wrong kind of value"]
+
+        with (
+            patch.object(Channel, "consumer_group", new_callable=PropertyMock, return_value="celery"),
+            patch.object(Channel, "consumer_name", new_callable=PropertyMock, return_value="worker-1"),
+            patch("celery_redis_plus.streams.logger") as mock_logger,
+        ):
+            channel._cleanup_consumers()  # Must not raise
+
+        mock_logger.warning.assert_called_once()
+        logged_message = mock_logger.warning.call_args.args[2]
+        assert "WRONGTYPE" in logged_message
+
     def test_cleanup_survives_one_stream_failing_and_still_processes_the_next(self) -> None:
         """A script-invocation error on one stream is isolated; the next stream still runs (I3)."""
         # Regression test: with a single stream key, deleting the per-stream
@@ -6246,9 +6262,6 @@ class TestStreamsCleanupConsumersIntegration:
             # idle-worker acks (pending -> 0); busy-worker never acks (pending stays 1)
             cast("QoS", idle_channel.qos).ack("tag-idle")
 
-            # Let both consumers cross the idle cleanup threshold.
-            time.sleep(1.0)
-
             priority = idle_channel._get_message_priority({"properties": {}}, reverse=False)
             level = priority_to_level(priority, idle_channel.priority_steps)
             stream_key = idle_channel._stream_key(queue, level)
@@ -6257,6 +6270,23 @@ class TestStreamsCleanupConsumersIntegration:
                 with channel.conn_or_acquire() as client:
                     remaining = client.xinfo_consumers(stream_key, channel.consumer_group)
                 return {bytes_to_str(consumer["name"]) for consumer in remaining}
+
+            cleaner_channel = cast("Channel", cleaner_conn.channel())
+            cleaner_channel._queue_cycle = [queue]
+
+            # idle-worker already has zero pending here (N2: the idle-threshold
+            # guard, not the pending guard, must be what spares it). Running
+            # cleanup under a third identity immediately, before either
+            # consumer has gone idle past the threshold, must still leave
+            # idle-worker in place. Deleting the `idle > idle_threshold_ms`
+            # clause from the Lua script makes this assertion fail.
+            cleaner_channel._cleanup_consumers()
+            names_before_idle_threshold = remaining_consumer_names(cleaner_channel)
+            assert "idle-worker" in names_before_idle_threshold
+            assert "busy-worker" in names_before_idle_threshold
+
+            # Let both consumers cross the idle cleanup threshold.
+            time.sleep(1.0)
 
             # A consumer never deletes itself, even though idle-worker otherwise
             # meets every deletion criterion (idle past threshold, zero pending):
@@ -6270,8 +6300,6 @@ class TestStreamsCleanupConsumersIntegration:
 
             # A separate identity that is not itself a consumer of this stream
             # deletes the idle, zero-pending peer and spares the busy one.
-            cleaner_channel = cast("Channel", cleaner_conn.channel())
-            cleaner_channel._queue_cycle = [queue]
             cleaner_channel._cleanup_consumers()
             remaining_names = remaining_consumer_names(cleaner_channel)
         finally:
@@ -6282,15 +6310,60 @@ class TestStreamsCleanupConsumersIntegration:
         assert "idle-worker" not in remaining_names
         assert "busy-worker" in remaining_names
 
+    def test_cleanup_script_classifies_missing_and_unexpected_errors(
+        self,
+        redis_client: Any,
+        clear_redis: None,
+    ) -> None:
+        """The script's pcall around XINFO CONSUMERS treats a missing stream
+        or a missing consumer group as a silent no-op ([]), but reports any
+        other XINFO failure back distinctly ([-1, message]) instead of also
+        treating it as a no-op.
+
+        Audit note (N2/N6): deleting the no-such-key/NOGROUP match clause
+        would make every XINFO failure look like an ordinary no-op, and
+        nothing else in the suite would notice; this calls the real script
+        against a real server for all three outcomes so a regression there
+        goes red here.
+        """
+        script = redis_client.register_script(_STREAMS_CLEANUP_CONSUMERS_LUA)
+
+        missing_key_result = script(keys=["cleanup-script-missing-stream"], args=["celery", "worker-1", 1000])
+        assert missing_key_result == []
+
+        # Stream exists, but its consumer group does not: constructed via a
+        # raw XADD, bypassing _ensure_group's MKSTREAM+XGROUP CREATE pairing
+        # so the group is genuinely absent (not reachable through the public
+        # Channel API, which always creates both together).
+        no_group_key = "cleanup-script-no-group-stream"
+        redis_client.xadd(no_group_key, {"body": "x"})
+        no_group_result = script(keys=[no_group_key], args=["celery", "worker-1", 1000])
+        assert no_group_result == []
+
+        # A key of the wrong type is a real, unexpected error and must not
+        # be classified as a no-op.
+        wrong_type_key = "cleanup-script-wrong-type"
+        redis_client.set(wrong_type_key, "not-a-stream")
+        wrong_type_result = script(keys=[wrong_type_key], args=["celery", "worker-1", 1000])
+        assert wrong_type_result[0] == -1
+        message = wrong_type_result[1]
+        if isinstance(message, bytes):
+            message = message.decode()
+        assert "WRONGTYPE" in message
+
 
 @pytest.mark.integration
 class TestStreamsSizePurgeIntegration:
-    """Integration tests for Channel._size and Channel._purge against real Redis/Valkey.
+    """Integration tests for Channel._size, Channel._purge, and Channel._has_queue against real Redis/Valkey.
 
-    Exercises the real XLEN/ZCARD/DEL replies through the real client (plain
-    redis-py/valkey-py when global_keyprefix is falsy, PrefixedStrictRedis when
-    truthy, via the parametrized global_keyprefix fixture), so the prefixing
-    path noted in the carry-forward notes for DEL/XLEN/ZCARD actually runs.
+    Exercises the real XLEN/ZCARD/DEL/EXISTS replies through the real client
+    (plain redis-py/valkey-py when global_keyprefix is falsy, PrefixedStrictRedis
+    when truthy, via the parametrized global_keyprefix fixture), so the
+    prefixing path noted in the carry-forward notes for DEL/XLEN/ZCARD/EXISTS
+    actually runs. The default-priority message below lands in
+    stream:{queue}:0, the LAST key _has_queue passes to EXISTS, which is
+    exactly the position a first-key-only prefix bug would miss (Fix round 2,
+    N1).
     """
 
     def test_size_and_purge_count_priorities_and_delayed_messages(

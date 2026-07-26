@@ -1521,10 +1521,24 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                         # Prefix manually since EVALSHA doesn't auto-prefix KEYS
                         prefixed_stream_key = f"{self.global_keyprefix}{stream_key}"
                         try:
-                            cleanup_script(
+                            result = cleanup_script(
                                 keys=[prefixed_stream_key],
                                 args=[self.consumer_group, self.consumer_name, idle_threshold_ms],
                             )
+                            # A missing stream or group is a silent no-op (empty
+                            # list). Any other XINFO failure comes back as
+                            # [-1, message] instead (see the script), which is
+                            # otherwise unobservable since the write itself
+                            # never raises for that case.
+                            if result and isinstance(result[0], int):
+                                message = result[1]
+                                if isinstance(message, bytes):
+                                    message = message.decode()
+                                logger.warning(
+                                    "Consumer cleanup could not inspect %s: %s",
+                                    prefixed_stream_key,
+                                    message,
+                                )
                         except self.ResponseError:
                             # One stream failing must not abort hygiene for the
                             # remaining streams and queues this cycle.
