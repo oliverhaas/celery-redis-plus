@@ -1559,10 +1559,9 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                                 keys=[prefixed_stream_key],
                                 args=[self.consumer_group, self.consumer_name, idle_threshold_ms],
                             )
-                            # Ordinary replies are lists of consumer names, so
-                            # only an integer first element can be the script's
-                            # [-1, message] failure sentinel. Matching the shape
-                            # rather than indexing also excludes bytes, which
+                            # Ordinary replies are consumer names, so only an
+                            # integer first element is the script's [-1, msg]
+                            # sentinel. Match the shape, not result[0]: bytes
                             # would otherwise index to an int.
                             match result:
                                 case [int(), message]:
