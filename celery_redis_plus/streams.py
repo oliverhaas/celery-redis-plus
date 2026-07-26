@@ -1689,10 +1689,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                                 case [int(), message]:
                                     if isinstance(message, bytes):
                                         message = message.decode()
-                                    # These conditions are persistent (a WRONGTYPE key
-                                    # does not clear itself), so shout once per stream
-                                    # and mutter afterwards rather than flooding every
-                                    # cycle forever.
+                                    # Warn once per stream, then drop to debug:
+                                    # a WRONGTYPE key does not clear itself.
                                     log = (
                                         logger.debug
                                         if prefixed_stream_key in self._warned_cleanup_streams
