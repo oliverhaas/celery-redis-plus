@@ -1694,3 +1694,115 @@ class TestStreamsSizePurgeIntegration:
             assert channel._has_queue(queue) is False
         finally:
             conn.close()
+
+
+@pytest.mark.integration
+class TestStreamsBlockingPriority:
+    """Strict priority ordering across levels through the blocking XREADGROUP wait."""
+
+    def test_priority_restored_after_blocking_wake(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Test the wake delivers one entry, then the non-blocking pass restores high-before-low order."""
+        with celery_app.connection() as conn_consumer, celery_app.connection() as conn_publisher:
+            channel = cast("Channel", conn_consumer.default_channel)
+            publisher = cast("Channel", conn_publisher.default_channel)
+
+            # Defensive cleanup of EVERY level stream (steps default
+            # [0, 3, 6, 9]): earlier tests in this file leave unconsumed
+            # entries behind, and the blocking read watches all levels
+            redis_client.delete(
+                f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0",
+                f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:3",
+                f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:6",
+                f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:9",
+                f"{global_keyprefix}{DELAYED_KEY_PREFIX}celery",
+            )
+
+            # Register the queue as watched. Manual equivalent of
+            # basic_consume + _update_queue_cycle (Task 3 Cycle 3): this test
+            # drives _consume_read/_xreadgroup_read directly and must not
+            # install a message callback
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            # Widen the BLOCK window from the conftest-patched 1s to the 2s
+            # test ceiling so slow container I/O cannot time out the armed
+            # read before the publishes below land (channel.connection is the
+            # Transport; the instance attribute shadows the patched class
+            # attribute for this connection only)
+            channel.connection.polling_interval = 2
+
+            # Pin a real connection from the pool onto the client, same as
+            # MultiChannelPoller._client_registered does before the event
+            # loop's first _register_XREADGROUP call. _consume_read and
+            # _xreadgroup_start/_read below talk to this connection object
+            # directly (raw EVALSHA/send_command), so without this the first
+            # call crashes on client.connection being None: this test drives
+            # the consume methods by hand instead of through the poller, so
+            # it must perform this one setup step itself.
+            if channel.client.connection is None:
+                channel.client.connection = channel.client.connection_pool.get_connection()
+
+            # Every level stream is empty: the non-blocking pass misses on
+            # all of them, arms the blocking XREADGROUP (COUNT 1, level
+            # streams highest first), and raises Empty with _in_poll set
+            with pytest.raises(Empty):
+                channel._consume_read()
+            assert channel._in_poll is not None
+
+            time.sleep(0.2)  # let the server park the blocked consumer
+
+            # Publish while the consumer is blocked: low-1 arrives first and
+            # wakes the blocked read (COUNT 1 serves exactly that entry);
+            # high and low-2 arrive after the wake and accumulate in their
+            # level streams. Publishing MUST use a second connection: the
+            # consumer's client socket has the armed XREADGROUP pending
+            for marker, priority in [("low-1", 0), ("high", 9), ("low-2", 0)]:
+                publisher._put(
+                    "celery",
+                    {
+                        "body": f'{{"marker": "{marker}"}}',
+                        "properties": {
+                            "delivery_tag": f"block-{marker}",
+                            "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                            "priority": priority,
+                            "headers": {},
+                        },
+                    },
+                )
+
+            # XREADGROUP registers entries in the PEL without removing them,
+            # so stream lengths reflect all three publishes
+            assert redis_client.xlen(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0") == 2
+            assert redis_client.xlen(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:9") == 1
+
+            with patch.object(channel.connection, "_deliver") as mock_deliver:
+                # Drain the blocking reply: the wake delivered exactly the
+                # one entry that unblocked the read (low-1), out of priority
+                # order, per the spec's COUNT 1 design
+                assert channel._xreadgroup_read() is True
+                # _in_poll cleared: the poller's next registration runs the
+                # non-blocking pass instead of re-arming BLOCK
+                assert channel._in_poll is None
+
+                # The next non-blocking passes restore strict priority order:
+                # high (level 9) is delivered before low-2 (level 0) even
+                # though low-2 was published into a non-empty stream
+                assert channel._consume_read() is True
+                assert channel._consume_read() is True
+
+            deliveries = [(call.args[0]["body"], call.args[1]) for call in mock_deliver.call_args_list]
+            assert deliveries == [
+                ('{"marker": "low-1"}', "celery"),
+                ('{"marker": "high"}', "celery"),
+                ('{"marker": "low-2"}', "celery"),
+            ]
+
+            # Nothing new remains: each entry was delivered exactly once
+            with pytest.raises(Empty):
+                channel._get("celery")
