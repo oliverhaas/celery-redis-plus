@@ -5,17 +5,27 @@ from __future__ import annotations
 import time
 from queue import Empty
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from kombu import Connection
+from kombu.asynchronous import Hub
+from kombu.utils.encoding import bytes_to_str
+from kombu.utils.json import dumps as json_dumps
 
 from celery_redis_plus.constants import (
     DEFAULT_CONSUMER_GROUP,
     DELAYED_KEY_PREFIX,
+    SHUTDOWN_IDLE_MS,
     STREAM_KEY_PREFIX,
 )
-from celery_redis_plus.streams import Channel, QoS, Transport
+from celery_redis_plus.streams import (
+    _STREAMS_CLEANUP_CONSUMERS_LUA,
+    Channel,
+    QoS,
+    Transport,
+    priority_to_level,
+)
 
 if TYPE_CHECKING:
     from celery import Celery
@@ -908,3 +918,779 @@ class TestStreamsPoisonIntegration:
         finally:
             app_a.close()
             app_b.close()
+
+
+@pytest.mark.integration
+class TestStreamsShutdownIntegration:
+    """Graceful shutdown: XCLAIM IDLE makes in-flight entries instantly reclaimable.
+
+    Exercises the real client returned by Channel._get_client() (plain
+    redis-py/valkey-py when global_keyprefix is falsy, PrefixedStrictRedis
+    when truthy, via the parametrized global_keyprefix fixture), so both
+    XCLAIM prefixing paths actually run against a live server.
+    """
+
+    def test_restore_unacked_once_marks_in_flight_reclaimable(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Test that restore_unacked_once applies XCLAIM IDLE so pending entries look long-idle."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            redis_client.delete(
+                f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0",
+                f"{global_keyprefix}{DELAYED_KEY_PREFIX}celery",
+            )
+
+            delivery_tag = f"shutdown-idle-{time.time()}"
+            message = {
+                "body": '{"task": "test.add", "args": [1, 2]}',
+                "properties": {
+                    "delivery_tag": delivery_tag,
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {},
+                },
+            }
+            channel._put("celery", message)
+            channel._get("celery")
+
+            qos = cast("QoS", channel.qos)
+            assert delivery_tag in qos._in_flight
+
+            qos.restore_unacked_once()
+
+            # Entry still exists (no payload movement) but its idle time was set far
+            # above any sane visibility timeout, so any peer can claim it instantly
+            assert redis_client.xlen(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0") == 1
+            pending = channel.client.xpending_range(
+                f"{STREAM_KEY_PREFIX}celery:0",
+                DEFAULT_CONSUMER_GROUP,
+                min="-",
+                max="+",
+                count=10,
+            )
+            assert len(pending) == 1
+            # Allow 1s slack for server-side rounding between XCLAIM and XPENDING
+            assert pending[0]["time_since_delivered"] >= SHUTDOWN_IDLE_MS - 1000
+
+    def test_restore_unacked_once_releases_message_for_instant_peer_reclaim(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """The graceful shutdown release lets a peer reclaim the message immediately.
+
+        Sequence: publish and consume via one channel ("producer-worker") so
+        the entry sits in its PEL, then call the real producer_channel.close()
+        (the production path: a Consumer bootstep closing its channel while
+        the message is still in flight), not restore_unacked_once() directly.
+        close() runs virtual.Channel.close() (which reaches
+        QoS.restore_unacked_once()) before _disconnect_pools()/_close_clients()
+        tear the channel's pool down, so whatever pool conn_or_acquire() uses
+        during the release is disconnected afterward rather than leaked. Then
+        read XPENDING directly to confirm the entry's idle time is now far
+        above visibility_timeout while
+        times_delivered is untouched by the release itself, then confirm a
+        second channel's reclaim pass picks the entry up right away, well
+        inside a visibility_timeout deliberately set long enough that a
+        natural timeout expiry could not explain the pickup.
+
+        This subsumes a simpler two-app "restore then peer reclaims" check
+        (dropped, no assertion lost): everything that variant would show
+        (peer claims == 1, matching delivery_tag) is asserted here too, via
+        the heavier, more production-realistic path (real close(), plus the
+        pre-claim times_delivered/idle inspection, plus the elapsed-time
+        proof that the pickup is not just a natural visibility_timeout
+        expiry).
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "shutdown-integration-queue"
+        visibility_timeout = 20.0
+
+        producer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "producer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        reclaimer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "reclaimer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        try:
+            producer_channel = cast("Channel", producer_conn.channel())
+
+            message = {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-integration-shutdown",
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                },
+            }
+            producer_channel._put(queue, message)
+
+            # Consume into the PEL as "producer-worker", standing in for a
+            # worker whose Consumer bootstep is closing while the message is
+            # still in flight.
+            consumed = producer_channel._get(queue)
+            assert consumed["properties"]["delivery_tag"] == "tag-integration-shutdown"
+
+            producer_qos = cast("QoS", producer_channel.qos)
+            stream_key, _message_id = producer_qos._in_flight["tag-integration-shutdown"]
+
+            reclaimer_channel = cast("Channel", reclaimer_conn.channel())
+            delivered: list[Any] = []
+            reclaimer_channel.basic_consume(
+                queue,
+                no_ack=False,
+                callback=delivered.append,
+                consumer_tag="reclaimer-ctag",
+            )
+
+            # No real Celery worker pool is registered for this connection;
+            # patching just skips the executor-wait branch (covered by unit
+            # tests) so this test isolates the XCLAIM IDLE release itself.
+            # close(), not restore_unacked_once() directly: exercises the
+            # real production shutdown path (see docstring).
+            with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=None):
+                producer_channel.close()
+
+            assert producer_channel.closed is True
+            assert producer_qos._in_flight == {}
+
+            with reclaimer_channel.conn_or_acquire() as client:
+                pending_after = client.xpending_range(
+                    stream_key,
+                    reclaimer_channel.consumer_group,
+                    min="-",
+                    max="+",
+                    count=10,
+                )
+            assert len(pending_after) == 1
+            entry = pending_after[0]
+            # Idle time is now enormous: far above visibility_timeout (20s = 20000ms).
+            assert entry["time_since_delivered"] >= SHUTDOWN_IDLE_MS
+            # The release itself never bumps times_delivered: still 1, the
+            # count from the original XREADGROUP delivery.
+            assert int(entry["times_delivered"]) == 1
+
+            start = time.monotonic()
+            processed = reclaimer_channel._reclaim_and_deliver(queue, budget=10)
+            elapsed = time.monotonic() - start
+        finally:
+            producer_conn.close()
+            reclaimer_conn.close()
+
+        assert processed == 1
+        assert len(delivered) == 1
+        assert delivered[0].delivery_tag == "tag-integration-shutdown"
+        # Reclaimed well inside the visibility_timeout window: this proves
+        # the pickup came from the artificial idle release, not from
+        # visibility_timeout naturally elapsing.
+        assert elapsed < visibility_timeout / 2
+
+    def test_deferred_ack_during_close_restore_window_still_fully_acks(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """A hub.call_soon()-deferred ack drained during close() leaves no PEL or stream entry.
+
+        F1 regression (Fix round 3): QoS.ack/reject's collected-channel no-op
+        guard was keyed off channel.closed, but virtual.Channel.close() sets
+        `closed = True` for a genuine shutdown too, well before it reaches
+        restore_unacked_once(). Graceful shutdown's _drain_hub_callbacks()
+        runs inside that same restore_unacked_once() call, specifically to
+        flush acks from tasks that finished just before shutdown (scheduled
+        via hub.call_soon()). Keying the no-op off `closed` silently dropped
+        every one of those acks, leaving the PEL entry and stream entry
+        behind (and, via the sibling restore path, given an artificial
+        SHUTDOWN_IDLE_MS idle time), so a peer's reclaim pass would
+        immediately redeliver an already-completed task. Reproduces the
+        reviewer's repro shape directly: a real kombu Hub, a message acked
+        via hub.call_soon(message.ack), then a real Channel.close().
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "graceful-shutdown-ack-queue"
+        visibility_timeout = 20.0
+
+        producer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "producer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        hub = Hub()
+        try:
+            producer_channel = cast("Channel", producer_conn.channel())
+
+            message = {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-graceful-shutdown-ack",
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                },
+            }
+            producer_channel._put(queue, message)
+            # basic_get (not the raw _get) returns a real Message wired to
+            # this channel, so message.ack() below exercises the exact same
+            # call chain a completed task's deferred ack goes through in
+            # production.
+            consumed = producer_channel.basic_get(queue, no_ack=False)
+            assert consumed is not None
+            assert consumed.delivery_tag == "tag-graceful-shutdown-ack"
+
+            producer_qos = cast("QoS", producer_channel.qos)
+            stream_key, message_id = producer_qos._in_flight["tag-graceful-shutdown-ack"]
+
+            # Wire a real Hub onto the channel's connection cycle, exactly as
+            # Transport.register_with_event_loop() does in production, and
+            # defer the ack the way a just-finished task's completion
+            # callback does: call_soon(), not a direct call.
+            producer_channel.connection.cycle._loop = hub
+            hub.call_soon(consumed.ack)
+
+            # No worker pool registered for this connection: isolates the
+            # deferred-ack drain from the executor-wait branch (covered by
+            # the test above and unit tests), so this test exercises only
+            # the ack-during-restore-window guard.
+            with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=None):
+                producer_channel.close()
+
+            assert producer_channel.closed is True
+            assert producer_qos._in_flight == {}
+
+            inspector_conn = Connection(
+                broker_url,
+                transport="celery_redis_plus.streams:Transport",
+                transport_options={
+                    "visibility_timeout": visibility_timeout,
+                    "consumer_name": "inspector-worker",
+                    "global_keyprefix": global_keyprefix,
+                },
+            )
+            try:
+                inspector_channel = cast("Channel", inspector_conn.channel())
+                with inspector_channel.conn_or_acquire() as client:
+                    pending_after = client.xpending_range(
+                        stream_key,
+                        inspector_channel.consumer_group,
+                        min="-",
+                        max="+",
+                        count=10,
+                    )
+                    stream_entries = client.xrange(stream_key, message_id, message_id)
+                # XACK removed the PEL entry...
+                assert pending_after == []
+                # ...and XDEL removed the stream entry itself.
+                assert stream_entries == []
+            finally:
+                inspector_conn.close()
+        finally:
+            hub.close()
+            producer_conn.close()
+
+    def test_connection_collect_does_not_release_pel_or_shutdown_executor(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Connection.collect() must not touch in-flight PEL entries or the executor.
+
+        collect() is kombu's reconnect-cleanup escape hatch (celery calls it from
+        on_connection_error_after_connected after a lost broker connection, not
+        on a genuine shutdown), so this drives the real Connection.collect(),
+        not Transport._collect directly, to prove kombu's dispatch actually
+        finds and calls our _collect hook. A worker pool is registered for
+        this connection so a stray executor.shutdown() would be observable;
+        the PEL entry must be left exactly as XREADGROUP delivered it, for a
+        peer to reclaim only after the visibility timeout naturally elapses,
+        same as any other unreleased in-flight message.
+
+        kombu's Connection.collect() severs the transport from its owning
+        Connection unconditionally (Connection._do_close_transport sets
+        transport.client = None even when a _collect hook handled the
+        channels), so producer_conn/producer_channel are unusable for
+        anything afterward, by kombu's own design, not because of a defect
+        here. The post-collect state is inspected through a separate,
+        independent connection instead, exactly as a peer reclaiming after a
+        real lost connection would.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "collect-integration-queue"
+        visibility_timeout = 20.0
+
+        producer_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "producer-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        inspector_conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={
+                "visibility_timeout": visibility_timeout,
+                "consumer_name": "inspector-worker",
+                "global_keyprefix": global_keyprefix,
+            },
+        )
+        try:
+            producer_channel = cast("Channel", producer_conn.channel())
+            inspector_channel = cast("Channel", inspector_conn.channel())
+
+            message = {
+                "body": '{"task": "test"}',
+                "properties": {
+                    "delivery_tag": "tag-integration-collect",
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                },
+            }
+            producer_channel._put(queue, message)
+            consumed = producer_channel._get(queue)
+            assert consumed["properties"]["delivery_tag"] == "tag-integration-collect"
+
+            producer_qos = cast("QoS", producer_channel.qos)
+            in_flight_before = dict(producer_qos._in_flight)
+            stream_key, _message_id = in_flight_before["tag-integration-collect"]
+
+            mock_executor = MagicMock()
+            mock_pool = MagicMock()
+            mock_pool.executor = mock_executor
+
+            with patch("celery_redis_plus.streams._get_worker_pool_for_channel", return_value=mock_pool):
+                producer_conn.collect()
+
+            mock_executor.shutdown.assert_not_called()
+            # The message is still owned by this worker: metadata untouched.
+            assert producer_qos._in_flight == in_flight_before
+
+            with inspector_channel.conn_or_acquire() as client:
+                pending_after = client.xpending_range(
+                    stream_key,
+                    inspector_channel.consumer_group,
+                    min="-",
+                    max="+",
+                    count=10,
+                )
+            assert len(pending_after) == 1
+            entry = pending_after[0]
+            # Idle time is small (a fraction of a second since XREADGROUP),
+            # nowhere near the artificial SHUTDOWN_IDLE_MS a release would set.
+            assert entry["time_since_delivered"] < SHUTDOWN_IDLE_MS
+            assert int(entry["times_delivered"]) == 1
+        finally:
+            producer_conn.close()
+            inspector_conn.close()
+
+
+@pytest.mark.integration
+class TestStreamsTTL:
+    """Message TTL (x-message-ttl, lazy drop) and queue TTL (x-expires, PEXPIRE refresh)."""
+
+    def test_expired_message_dropped_on_consume(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Test that entries older than the queue's x-message-ttl are dropped at delivery time."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            redis_client.delete(
+                f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0",
+                f"{global_keyprefix}{DELAYED_KEY_PREFIX}celery",
+            )
+
+            # Declare queue with a short message TTL (1 second)
+            channel._new_queue("celery", arguments={"x-message-ttl": 1000})
+
+            message = {
+                "body": '{"task": "test.add", "args": [1, 2]}',
+                "properties": {
+                    "delivery_tag": "ttl-expired-test",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {},
+                },
+            }
+            channel._put("celery", message)
+            assert redis_client.xlen(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0") == 1
+
+            time.sleep(1.5)  # entry id timestamp is now older than the 1s TTL
+
+            with pytest.raises(Empty):
+                channel._get("celery")
+
+            # The expired entry was acked and deleted, not left behind
+            assert redis_client.xlen(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0") == 0
+
+    def test_expired_delayed_message_dropped_by_pump(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Test that the delayed pump drops staged messages whose message TTL already expired."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            redis_client.delete(
+                f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0",
+                f"{global_keyprefix}{DELAYED_KEY_PREFIX}celery",
+            )
+
+            channel._new_queue("celery", arguments={"x-message-ttl": 1000})
+
+            payload = {
+                "body": "test",
+                "properties": {
+                    "delivery_tag": "ttl-delayed-expired",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {},
+                },
+            }
+            # Stage a member that became due 5s ago: older than the 1s TTL
+            due_ms = (time.time() - 5) * 1000
+            channel.client.zadd(f"{DELAYED_KEY_PREFIX}celery", {json_dumps(payload): due_ms})
+
+            moved = channel._move_delayed("celery")
+
+            assert moved == 0
+            # Dropped from the zset without ever reaching a stream
+            assert redis_client.zcard(f"{global_keyprefix}{DELAYED_KEY_PREFIX}celery") == 0
+            assert redis_client.xlen(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0") == 0
+
+    def test_queue_expires_sets_pexpire_on_stream_and_delayed_keys(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Test that the x-expires refresh applies PEXPIRE to level streams and the delayed zset."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            redis_client.delete(
+                f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0",
+                f"{global_keyprefix}{DELAYED_KEY_PREFIX}celery",
+            )
+
+            # Set _expires directly to use a short TTL for a fast test
+            # (validation in _new_queue enforces >= 10s, but PEXPIRE itself takes any value)
+            channel._expires["celery"] = 2000
+
+            immediate_msg = {
+                "body": "test",
+                "properties": {
+                    "delivery_tag": "expires-stream-key",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {},
+                },
+            }
+            channel._put("celery", immediate_msg)  # creates stream:celery:0
+
+            delayed_msg = {
+                "body": "test",
+                "properties": {
+                    "delivery_tag": "expires-delayed-key",
+                    "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                    "headers": {},
+                    "eta": time.time() + 120,
+                },
+            }
+            channel._put("celery", delayed_msg)  # creates delayed:celery
+
+            channel._refresh_queue_expires()
+
+            stream_ttl = redis_client.pttl(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0")
+            assert 0 < stream_ttl <= 2000
+            delayed_ttl = redis_client.pttl(f"{global_keyprefix}{DELAYED_KEY_PREFIX}celery")
+            assert 0 < delayed_ttl <= 2000
+
+            # Wait for the TTL to expire (no refresh)
+            time.sleep(2.5)
+
+            assert not redis_client.exists(f"{global_keyprefix}{STREAM_KEY_PREFIX}celery:0")
+            assert not redis_client.exists(f"{global_keyprefix}{DELAYED_KEY_PREFIX}celery")
+
+
+@pytest.mark.integration
+class TestStreamsHygiene:
+    """Consumer-group hygiene: XGROUP DELCONSUMER for long-idle consumers.
+
+    _cleanup_consumers depends on the SHAPE of the real xinfo_consumers reply: a
+    list of dicts with 'name' (bytes), 'pending', and 'idle' keys. A prior round
+    on this branch shipped a reply-shape bug (xautoclaim unpacked as a 3-tuple)
+    that all 362 mocked unit tests passed over; mocking xinfo_consumers here
+    would be equally blind to a similar mismatch. This exercises the real
+    client returned by Channel._get_client() (plain redis-py/valkey-py when
+    global_keyprefix is falsy, PrefixedStrictRedis when truthy, via the
+    parametrized global_keyprefix fixture), so both prefixing paths run too.
+    """
+
+    def test_cleanup_deletes_idle_zero_pending_consumer_but_keeps_busy_one(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Two consumers read one message each from the same group; one acks
+        (pending drops to zero) and the other does not (pending stays one).
+        After both go idle past CONSUMER_IDLE_CLEANUP_FACTOR * visibility_timeout,
+        a cleanup pass run under the idle consumer's own identity leaves it in
+        place (the script never deletes its caller, even though idle-worker
+        otherwise meets every deletion criterion), and a later pass run under a
+        third, uninvolved consumer identity then deletes only the idle,
+        zero-pending consumer and leaves the busy one untouched.
+
+        Subsumes the brief's two simpler single-assertion tests (idle+acked
+        gets deleted; busy+never-acked survives), no assertion lost: both
+        outcomes are asserted here too, plus the self-exclusion guard and the
+        immediate-before-threshold guard that the simpler versions did not
+        cover at all.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "cleanup-integration-queue"
+        # idle threshold = CONSUMER_IDLE_CLEANUP_FACTOR * visibility_timeout * 1000
+        # = 12 * 0.05 * 1000 = 600ms, comfortably crossed by the sleep below.
+        visibility_timeout = 0.05
+
+        def make_conn(consumer_name: str) -> Connection:
+            return Connection(
+                broker_url,
+                transport="celery_redis_plus.streams:Transport",
+                transport_options={
+                    "visibility_timeout": visibility_timeout,
+                    "consumer_name": consumer_name,
+                    "global_keyprefix": global_keyprefix,
+                },
+            )
+
+        idle_conn = make_conn("idle-worker")
+        busy_conn = make_conn("busy-worker")
+        cleaner_conn = make_conn("cleaner-worker")
+        try:
+            idle_channel = cast("Channel", idle_conn.channel())
+            busy_channel = cast("Channel", busy_conn.channel())
+
+            def make_message(tag: str) -> dict[str, Any]:
+                return {
+                    "body": '{"task": "test"}',
+                    "properties": {
+                        "delivery_tag": tag,
+                        "delivery_info": {"exchange": "", "routing_key": queue},
+                        "headers": {},
+                    },
+                }
+
+            idle_channel._put(queue, make_message("tag-idle"))
+            idle_channel._put(queue, make_message("tag-busy"))
+
+            # Two distinct consumer names each read one entry (XREADGROUP '>'
+            # never redelivers an entry already claimed by the group).
+            consumed_idle = idle_channel._get(queue)
+            assert consumed_idle["properties"]["delivery_tag"] == "tag-idle"
+            consumed_busy = busy_channel._get(queue)
+            assert consumed_busy["properties"]["delivery_tag"] == "tag-busy"
+
+            # idle-worker acks (pending -> 0); busy-worker never acks (pending stays 1)
+            cast("QoS", idle_channel.qos).ack("tag-idle")
+
+            priority = idle_channel._get_message_priority({"properties": {}}, reverse=False)
+            level = priority_to_level(priority, idle_channel.priority_steps)
+            stream_key = idle_channel._stream_key(queue, level)
+
+            def remaining_consumer_names(channel: Channel) -> set[str]:
+                with channel.conn_or_acquire() as client:
+                    remaining = client.xinfo_consumers(stream_key, channel.consumer_group)
+                return {bytes_to_str(consumer["name"]) for consumer in remaining}
+
+            cleaner_channel = cast("Channel", cleaner_conn.channel())
+            cleaner_channel._queue_cycle = [queue]
+
+            # idle-worker already has zero pending here (N2: the idle-threshold
+            # guard, not the pending guard, must be what spares it). Running
+            # cleanup under a third identity immediately, before either
+            # consumer has gone idle past the threshold, must still leave
+            # idle-worker in place. Deleting the `idle > idle_threshold_ms`
+            # clause from the Lua script makes this assertion fail.
+            cleaner_channel._cleanup_consumers()
+            names_before_idle_threshold = remaining_consumer_names(cleaner_channel)
+            assert "idle-worker" in names_before_idle_threshold
+            assert "busy-worker" in names_before_idle_threshold
+
+            # Let both consumers cross the idle cleanup threshold.
+            time.sleep(1.0)
+
+            # A consumer never deletes itself, even though idle-worker otherwise
+            # meets every deletion criterion (idle past threshold, zero pending):
+            # the script's own_consumer exclusion is evaluated for "idle-worker"
+            # here, not for "cleaner-worker" below.
+            idle_channel._queue_cycle = [queue]
+            idle_channel._cleanup_consumers()
+            names_after_self_cleanup = remaining_consumer_names(idle_channel)
+            assert "idle-worker" in names_after_self_cleanup
+            assert "busy-worker" in names_after_self_cleanup
+
+            # A separate identity that is not itself a consumer of this stream
+            # deletes the idle, zero-pending peer and spares the busy one.
+            cleaner_channel._cleanup_consumers()
+            remaining_names = remaining_consumer_names(cleaner_channel)
+        finally:
+            idle_conn.close()
+            busy_conn.close()
+            cleaner_conn.close()
+
+        assert "idle-worker" not in remaining_names
+        assert "busy-worker" in remaining_names
+
+    def test_cleanup_script_classifies_missing_and_unexpected_errors(
+        self,
+        redis_client: Any,
+        clear_redis: None,
+    ) -> None:
+        """The script's pcall around XINFO CONSUMERS treats a missing stream
+        or a missing consumer group as a silent no-op ([]), but reports any
+        other XINFO failure back distinctly ([-1, message]) instead of also
+        treating it as a no-op.
+
+        Audit note (N2/N6): deleting the no-such-key/NOGROUP match clause
+        would make every XINFO failure look like an ordinary no-op, and
+        nothing else in the suite would notice; this calls the real script
+        against a real server for all three outcomes so a regression there
+        goes red here.
+        """
+        script = redis_client.register_script(_STREAMS_CLEANUP_CONSUMERS_LUA)
+
+        missing_key_result = script(keys=["cleanup-script-missing-stream"], args=["celery", "worker-1", 1000])
+        assert missing_key_result == []
+
+        # Stream exists, but its consumer group does not: constructed via a
+        # raw XADD, bypassing _ensure_group's MKSTREAM+XGROUP CREATE pairing
+        # so the group is genuinely absent (not reachable through the public
+        # Channel API, which always creates both together).
+        no_group_key = "cleanup-script-no-group-stream"
+        redis_client.xadd(no_group_key, {"body": "x"})
+        no_group_result = script(keys=[no_group_key], args=["celery", "worker-1", 1000])
+        assert no_group_result == []
+
+        # A key of the wrong type is a real, unexpected error and must not
+        # be classified as a no-op.
+        wrong_type_key = "cleanup-script-wrong-type"
+        redis_client.set(wrong_type_key, "not-a-stream")
+        wrong_type_result = script(keys=[wrong_type_key], args=["celery", "worker-1", 1000])
+        assert wrong_type_result[0] == -1
+        message = wrong_type_result[1]
+        if isinstance(message, bytes):
+            message = message.decode()
+        assert "WRONGTYPE" in message
+
+
+@pytest.mark.integration
+class TestStreamsSizePurgeIntegration:
+    """Integration tests for Channel._size, Channel._purge, and Channel._has_queue against real Redis/Valkey.
+
+    Exercises the real XLEN/ZCARD/DEL/EXISTS replies through the real client
+    (plain redis-py/valkey-py when global_keyprefix is falsy, PrefixedStrictRedis
+    when truthy, via the parametrized global_keyprefix fixture), so the
+    prefixing path noted in the carry-forward notes for DEL/XLEN/ZCARD/EXISTS
+    actually runs. The default-priority message below lands in
+    stream:{queue}:0, the LAST key _has_queue passes to EXISTS, which is
+    exactly the position a first-key-only prefix bug would miss (Fix round 2,
+    N1).
+    """
+
+    def test_size_and_purge_count_priorities_and_delayed_messages(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """_size sums entries across priority-level streams plus the delayed
+        zset; _purge returns that same count and leaves the queue empty;
+        _has_queue reports True while a level stream or the delayed zset
+        exists and False once none of them do.
+        """
+        host, port, _image = redis_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "size-purge-integration-queue"
+        missing_queue = "size-purge-integration-queue-never-declared"
+
+        conn = Connection(
+            broker_url,
+            transport="celery_redis_plus.streams:Transport",
+            transport_options={"global_keyprefix": global_keyprefix},
+        )
+        try:
+            channel = cast("Channel", conn.channel())
+
+            def make_message(tag: str, priority: int, eta: float | None = None) -> dict[str, Any]:
+                properties: dict[str, Any] = {
+                    "delivery_tag": tag,
+                    "delivery_info": {"exchange": "", "routing_key": queue},
+                    "headers": {},
+                    "priority": priority,
+                }
+                if eta is not None:
+                    properties["eta"] = eta
+                return {"body": '{"task": "test"}', "properties": properties}
+
+            assert channel._has_queue(missing_queue) is False
+
+            # A lone default-priority message lands in stream:{queue}:0, the
+            # LAST key _has_queue passes to EXISTS (_stream_keys_for_queue
+            # returns highest level first). Checking _has_queue here, before
+            # any higher-priority stream exists, is what actually exercises
+            # the first-key-only prefix bug (Fix round 2, N1): the
+            # higher-priority streams added below would otherwise make the
+            # first EXISTS key match regardless of whether the rest prefixed
+            # correctly, masking the bug.
+            channel._put(queue, make_message("tag-p0", priority=0))
+            assert channel._has_queue(queue) is True
+
+            # Two more immediate messages across two other priority streams...
+            channel._put(queue, make_message("tag-p5", priority=5))
+            channel._put(queue, make_message("tag-p9", priority=9))
+            # ...plus one native-delayed message staged in the delayed zset
+            # (DEFAULT_REQUEUE_CHECK_INTERVAL is patched to 2s in conftest, so
+            # a 10s eta is comfortably past the native-delayed threshold).
+            channel._put(queue, make_message("tag-delayed", priority=0, eta=time.time() + 10))
+
+            assert channel._size(queue) == 4
+            assert channel._has_queue(queue) is True
+
+            purged = channel._purge(queue)
+
+            assert purged == 4
+            assert channel._size(queue) == 0
+            assert channel._has_queue(queue) is False
+        finally:
+            conn.close()
