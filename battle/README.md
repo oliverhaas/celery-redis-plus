@@ -186,27 +186,36 @@ appends the headline numbers to the tracked `battle/RESULTS.md`.
 
 ## Measured task loss
 
-The headline A/B. Two 90-minute `chaos` runs at 16 workers x 16 concurrency,
-threads pool, seed 42, `--no-delayed --drain-timeout 600`. Countdown tasks are
-excluded so nothing sits unacked in a worker timer, and the drain window is six
-times kombu's restore sweep, so an outstanding task at the end is a lost task
-rather than a slow one.
+The headline A/B. Four 90-minute `chaos` runs at 16 workers x 16 concurrency,
+seed 42, one per transport on each pool. Three of them use
+`--no-delayed --drain-timeout 600`: countdown tasks are excluded so nothing sits
+unacked in a worker timer, and the drain window is six times kombu's restore
+sweep, so an outstanding task at the end is a lost task rather than a slow one.
+The plus prefork run predates those flags and ran the default mix against a
+profile-derived drain.
 
-| metric | plus | stock |
-|---|---|---|
-| submitted | 2,969,929 | 2,969,957 |
-| **never executed** | **0** | **23** |
-| drain | clean | TIMED OUT |
-| kills (of which hard SIGKILL) | 320 (128) | 334 (133) |
-| **losses per hard kill** | **0.000** | **0.173** |
-| duplicates, hard / soft / unattributed | 28 / 0 / 0 | 115 / 19 / 0 |
-| verdict | PASS | report-only |
+| metric | plus threads | stock threads | plus prefork | stock prefork |
+|---|---|---|---|---|
+| submitted | 2,969,929 | 2,969,967 | 2,969,873 | 2,969,952 |
+| **never executed** | **0** | **27** | **0** | **17** |
+| drain | clean | TIMED OUT | clean | TIMED OUT |
+| kills (of which hard SIGKILL) | 320 (128) | 335 (133) | 290 (116) | 304 (122) |
+| **losses per hard kill** | **0.000** | **0.203** | **0.000** | **0.139** |
+| duplicates, hard / soft / unattributed | 28 / 0 / 0 | 109 / 17 / 0 | 129 / 0 / 0 | 43 / 0 / 12 |
+| verdict | PASS | report-only | PASS | report-only |
 
-Stock loses roughly one task per five SIGKILLs, and delivers 4.8x the
-duplicates while doing it. The loss rate is stable at 0.173-0.203 per hard kill
-across both pools, across a 150s and a 600s drain window, and with and without
-countdown tasks in the mix, which is what identifies it as a fixed race window
-rather than an artefact of the measurement.
+Stock loses roughly one task per five to seven SIGKILLs. The rate holds between
+0.14 and 0.20 per hard kill across five stock runs, on both pools, across a 150s
+and a 600s drain window, and with and without countdown tasks in the mix, which
+is what identifies it as a fixed race window rather than an artefact of the
+measurement.
+
+Duplicate *counts* do not separate the transports, and the threads pair alone
+would mislead: plus prefork produced the most of the four. Attribution does
+separate them. Both plus runs left zero duplicates that could not be pinned to a
+kill, while stock prefork left 12 unattributable, and stock threads duplicated
+across 17 soft kills, which are shutdowns that restore their own unacked messages
+and should not need a redelivery at all.
 
 There is a window in kombu's consume path that accounts for this. `BRPOP`
 removes the message from the queue, then the transport JSON-decodes it,
@@ -214,8 +223,9 @@ constructs a `Message`, and only then records it as unacked through
 `QoS.append`. Between the pop and that record the message exists solely in
 worker memory: it is off the broker and the broker holds no evidence it ever
 existed, so a SIGKILL there destroys it and no visibility timeout can recover
-it. Prefork and threads lose at the same rate because all of those steps run on
-the hub thread either way.
+it. Both pools lose, because all of those steps run on the hub thread either way.
+Prefork measures somewhat lower (0.14 and 0.18) than threads (0.17 to 0.20),
+which the window's position does not explain and this harness does not resolve.
 
 `transport_consume_message.lua` closes it. The `ZPOPMIN` and the
 `messages_index` rescore happen inside one script, so the message is recorded
@@ -225,14 +235,11 @@ message is unrecoverable.
 
 ### Destroyed, not stranded
 
-The A/B above establishes that stock loses tasks, not where they went: it
-predates `check_broker_clean` understanding stock's key shapes, so it never
-looked at stock's broker. A repeat run with the stock-aware scan settles it.
-27 of 2,969,967 never executed over 335 kills (133 hard), 0.203 per hard kill,
-and at the 600s timeout the broker reads
-`{'queues': {}, 'indices': {}, 'message_hashes': 0}`.
+The table above establishes that stock loses tasks, not where they went. The
+stock-aware broker scan answers that: on both stock runs, at the 600s timeout the
+broker reads `{'queues': {}, 'indices': {}, 'message_hashes': 0}`.
 
-Three things separate destroyed from stranded:
+Three things separate destroyed from stranded, and both pools show all three:
 
 - **Nothing is on the broker.** Every queue list, `unacked`, and
   `unacked_index` is empty, and no `unacked` entry belongs to an
@@ -242,15 +249,18 @@ Three things separate destroyed from stranded:
 - **Every one has `task-sent` and no `task-received`.** Celery emits
   `task-received` after `QoS.append`, so its absence places the death before
   the unacked record while the message was already off the queue. Event loss
-  does not explain it: `task-received` loss ran at 0.03% in this run, so 27
-  independent misses is not a number that happens.
-- **All 27 land within 0.04s of a hard SIGKILL.** Soft kills lose nothing, and
-  13 of 16 containers are implicated, so this is a fleet-wide race and not one
-  sick worker.
+  does not explain it. On threads, `task-received` loss ran at 0.03%, so 27
+  independent misses is not a number that happens; on prefork it ran at 0.00%
+  across all four event types, which leaves the 17 misses no measurement noise
+  to hide in at all.
+- **They cluster on the SIGKILLs.** All 27 land within 0.04s of one on threads,
+  all 17 within 0.098s on prefork. Soft kills lose nothing, and 13 of 16 and 9
+  of 16 containers respectively are implicated, so this is a fleet-wide race and
+  not one sick worker.
 
-The type split points at the consume path rather than the task body: fast 23,
-slow 3, cpu 1, against an 81.5 / 12.3 / 6.2% arrival mix. Losses track how
-often a task type arrives, not how long it runs.
+The type split points at the consume path rather than the task body: fast 34,
+slow 8, cpu 2 across the two runs, against an 81.5 / 12.3 / 6.2% arrival mix.
+Losses track how often a task type arrives, not how long it runs.
 
 ## Measured A/B example
 
