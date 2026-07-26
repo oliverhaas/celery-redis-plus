@@ -233,15 +233,20 @@ def _release_channel_on_collect(channel: Any) -> None:
     would kill the shared thread pool executor and, for the streams transport,
     release PEL entries out from under still-running local tasks.
 
-    Sets ``channel.closed`` first so a later stray ``Channel.close()`` call on
-    this same (about-to-be-discarded) channel object is a no-op, and cancels the
-    QoS's collect-time Finalize so it cannot fire this same restore path again at
+    Sets ``channel._collected`` so QoS.ack/reject can key their collected-channel
+    no-op off a flag that ONLY this function ever sets, distinct from kombu's own
+    ``channel.closed`` (which virtual.Channel.close() also sets, for a genuine
+    shutdown, well before restore_unacked_once() runs). Also sets
+    ``channel.closed`` so a later stray ``Channel.close()`` call on this same
+    (about-to-be-discarded) channel object is a no-op, and cancels the QoS's
+    collect-time Finalize so it cannot fire this same restore path again at
     process exit.
 
     Shared by this module's Transport and the streams transport's Transport.
     """
-    if getattr(channel, "closed", False):
+    if getattr(channel, "_collected", False):
         return
+    channel._collected = True
     channel.closed = True
 
     qos = getattr(channel, "_qos", None)
@@ -487,14 +492,20 @@ class QoS(virtual.QoS):
         self._fanout_tags: set[str] = set()
 
     def ack(self, delivery_tag: str) -> None:
-        if self.channel.closed:
+        if self.channel._collected:
             # The channel was released by Transport._collect on a lost
             # connection, not a real shutdown: there is no client left to
             # talk to (conn_or_acquire() would try to rebuild a pool that
             # kombu's Connection.collect() has already severed from a
             # client), and the broker still owns this entry, so a peer will
             # reclaim it after the visibility timeout. Nothing to do here.
-            logger.debug("Skipping ack for delivery_tag %r: channel is closed", delivery_tag)
+            # Note: this checks channel._collected, NOT channel.closed.
+            # virtual.Channel.close() sets `closed = True` for a genuine
+            # shutdown too, well before it calls restore_unacked_once(), so
+            # keying off `closed` would silently drop acks that arrive (via a
+            # deferred hub callback) during that restore window.
+            logger.debug("Skipping ack for delivery_tag %r: channel was collected", delivery_tag)
+            self._fanout_tags.discard(delivery_tag)
             super().ack(delivery_tag)
             return
         # Fanout messages don't need Redis cleanup (no consumer groups)
@@ -506,12 +517,13 @@ class QoS(virtual.QoS):
         super().ack(delivery_tag)
 
     def reject(self, delivery_tag: str, requeue: bool = False) -> None:
-        if self.channel.closed:
+        if self.channel._collected:
             # See ack(): the channel is gone, so requeueing/removing from
             # indices has nothing left to talk to. A peer reclaims this entry
             # after the visibility timeout, same as any other in-flight
             # message on a lost connection.
-            logger.debug("Skipping reject for delivery_tag %r: channel is closed", delivery_tag)
+            logger.debug("Skipping reject for delivery_tag %r: channel was collected", delivery_tag)
+            self._fanout_tags.discard(delivery_tag)
             super().ack(delivery_tag)
             return
         # Fanout messages: requeue not supported (fire-and-forget broadcast)
@@ -1058,6 +1070,14 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
 
     _async_pool: Any = None
     _pool: Any = None
+
+    # Set only by _release_channel_on_collect(). Distinct from kombu's own
+    # `closed`: virtual.Channel.close() also sets `closed = True` for a
+    # genuine shutdown, well before restore_unacked_once() runs, so `closed`
+    # cannot be used to detect a lost-connection collect. A class attribute
+    # (not an __init__ assignment) so it defaults to False even on test
+    # doubles built via object.__new__(Channel), which skip __init__.
+    _collected: bool = False
 
     from_transport_options = virtual.Channel.from_transport_options + (
         "sep",
@@ -1722,14 +1742,18 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                 for queue in self._fanout_queues:
                     if queue in self.auto_delete_queues:
                         self.queue_delete(queue, client=client)
-        super().close()
-        if not already_closed:
-            # Runs after super().close() (which calls restore_unacked_once)
-            # on purpose: conn_or_acquire() can lazily rebuild self._pool
-            # during the restore, and that rebuilt pool must be disconnected
-            # too, not just whatever pool existed before restore ran.
-            self._disconnect_pools()
-            self._close_clients()
+        try:
+            super().close()
+        finally:
+            if not already_closed:
+                # Runs after super().close() (which calls restore_unacked_once)
+                # on purpose: conn_or_acquire() can lazily rebuild self._pool
+                # during the restore, and that rebuilt pool must be disconnected
+                # too, not just whatever pool existed before restore ran. The
+                # try/finally ensures this teardown still runs even if
+                # super().close() raises.
+                self._disconnect_pools()
+                self._close_clients()
 
     def _close_clients(self) -> None:
         for name in ("client", "subclient"):
