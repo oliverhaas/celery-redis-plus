@@ -1101,6 +1101,56 @@ class TestStreamsPoisonIntegration:
             app_a.close()
             app_b.close()
 
+    def test_dead_letter_stream_inside_the_queue_namespace_is_rejected(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Test a dead-letter stream pointing into the queue namespace fails at setup.
+
+        A poisoned message copied into a queue's own level stream is
+        immortal: it gets redelivered, exceeds the restore cap again, and is
+        copied again, forever. Catching that at connection time beats
+        discovering it in production.
+        """
+        host, port, _image = redis_container
+        app = _make_streams_app(
+            host,
+            port,
+            global_keyprefix,
+            max_restore_count=0,
+            dead_letter_stream=f"{STREAM_KEY_PREFIX}celery:0",
+        )
+        try:
+            with app.connection() as conn, pytest.raises(ValueError, match="dead_letter_stream") as excinfo:
+                conn.channel()
+            assert STREAM_KEY_PREFIX in str(excinfo.value)
+        finally:
+            app.close()
+
+    def test_dead_letter_stream_outside_the_queue_namespace_is_accepted(
+        self,
+        redis_container: tuple[str, int, str],
+        clear_redis: None,
+        global_keyprefix: str,
+    ) -> None:
+        """Test the rejection is limited to the queue namespace and does not ban ordinary names."""
+        host, port, _image = redis_container
+        app = _make_streams_app(
+            host,
+            port,
+            global_keyprefix,
+            max_restore_count=0,
+            dead_letter_stream="streams-that-merely-start-similarly",
+        )
+        try:
+            with app.connection() as conn:
+                channel = cast("Channel", conn.channel())
+                assert channel.dead_letter_stream == "streams-that-merely-start-similarly"
+        finally:
+            app.close()
+
 
 @pytest.mark.integration
 class TestStreamsShutdownIntegration:

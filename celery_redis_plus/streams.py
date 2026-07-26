@@ -48,7 +48,11 @@ Transport Options
   overridden back to the derived default and a warning is logged
 * ``max_restore_count``: Delivery-count cap before poisoned messages are dropped or
   dead-lettered (default: None = no limit)
-* ``dead_letter_stream``: Stream to copy poisoned messages to (default: None)
+* ``dead_letter_stream``: Stream to copy poisoned messages to (default: None).
+  Capped at ``DEFAULT_STREAM_MAXLEN`` entries (approximate trim) and prefixed
+  with ``global_keyprefix`` like every other key. Must not start with the
+  ``stream:`` queue namespace: a poisoned message copied into a queue's own
+  level stream would be redelivered and re-dead-lettered forever
 * ``consumer_group``: Consumer group name on every queue stream (default: "celery")
 * ``consumer_name``: Stable per-worker consumer identity (default: the worker
   nodename when available, else ``hostname:pid``)
@@ -797,6 +801,20 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         self._warned_cleanup_streams: set[str] = set()
         # Queues already reported as hitting the delayed-move limit (warn-once)
         self._warned_delayed_limit: set[str] = set()
+
+        # A dead-letter stream inside the transport's own stream namespace can
+        # be a queue's level stream, and a poisoned message copied back into
+        # the queue it was just dropped from is immortal: it is redelivered,
+        # exceeds the restore cap again, and is copied again, forever. Reject
+        # at setup rather than discover it in production.
+        if self.dead_letter_stream is not None and str(self.dead_letter_stream).startswith(STREAM_KEY_PREFIX):
+            message = (
+                f"dead_letter_stream {self.dead_letter_stream!r} must not start with "
+                f"{STREAM_KEY_PREFIX!r}: that namespace holds the queue level streams this "
+                f"transport consumes from, so poisoned messages copied there would be "
+                f"redelivered and re-dead-lettered forever."
+            )
+            raise ValueError(message)
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -1609,7 +1627,7 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
                                     name=self.dead_letter_stream,
                                     fields={"payload": payload_field},
                                     id="*",
-                                    maxlen=10000,
+                                    maxlen=DEFAULT_STREAM_MAXLEN,
                                     approximate=True,
                                 )
                             ack_script(keys=[prefixed_stream], args=[self.consumer_group, message_id_str, ""])

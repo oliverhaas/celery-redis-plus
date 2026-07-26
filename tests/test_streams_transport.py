@@ -30,6 +30,7 @@ from celery_redis_plus.constants import (
     DEFAULT_PRIORITY_STEPS,
     DEFAULT_RECLAIM_DISCOVERY_PAGE_LIMIT,
     DEFAULT_REQUEUE_BATCH_LIMIT,
+    DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
     DELAYED_KEY_PREFIX,
     HEARTBEAT_INTERVAL_DIVISOR,
@@ -4977,7 +4978,7 @@ class TestStreamsPoison:
             name="dead-letters",
             fields={"payload": payload_json.encode()},
             id="*",
-            maxlen=10000,
+            maxlen=DEFAULT_STREAM_MAXLEN,
             approximate=True,
         )
         mock_ack_script.assert_called_once_with(

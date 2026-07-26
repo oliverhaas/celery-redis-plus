@@ -162,7 +162,7 @@ app.config_from_object({
 | `visibility_timeout` | `int` | `300` | Seconds of heartbeat silence before a worker's in-flight messages are reclaimed by peers. NOT a task duration limit |
 | `heartbeat_interval` | `float` | `visibility_timeout / 5` | Interval of the `XCLAIM ... JUSTID` heartbeat on in-flight messages |
 | `max_restore_count` | `int` | `None` | Involuntary-redelivery cap; messages exceeding it are dropped (or dead-lettered). A graceful-shutdown handoff also adds one to the count (the peer reclaims it on its next reclaim pass), so leave headroom for rolling restarts |
-| `dead_letter_stream` | `str` | `None` | Stream to copy poisoned messages to before dropping them (capped at about 10000 entries) |
+| `dead_letter_stream` | `str` | `None` | Stream to copy poisoned messages to before dropping them (capped at about 10000 entries). Prefixed with `global_keyprefix` like every other key. Must not start with `stream:`, the queue namespace: a copy into a queue's own level stream would be redelivered and re-dead-lettered forever, so that value is rejected at connection setup |
 | `consumer_group` | `str` | `"celery"` | Consumer group name used on every queue stream |
 | `consumer_name` | `str` | `None` | Stable per-worker consumer identity; defaults to the worker nodename when available, else `hostname:pid` |
 | `global_keyprefix` | `str` | `""` | Prefix for all Redis keys |

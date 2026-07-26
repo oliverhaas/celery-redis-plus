@@ -68,7 +68,7 @@ Streams transport options (set via `broker_transport_options`):
 | `visibility_timeout` | `300` | Seconds of heartbeat silence before in-flight messages are reclaimed |
 | `heartbeat_interval` | `visibility_timeout / 5` | Cadence of the `XCLAIM ... JUSTID` heartbeat |
 | `max_restore_count` | `None` | Involuntary-redelivery cap before drop/dead-letter (a graceful-shutdown handoff also counts as one; leave headroom for rolling restarts) |
-| `dead_letter_stream` | `None` | Stream to copy poisoned messages to before dropping them |
+| `dead_letter_stream` | `None` | Stream to copy poisoned messages to before dropping them (must not start with `stream:`, the queue namespace) |
 | `consumer_group` | `"celery"` | Consumer group name on every queue stream |
 | `consumer_name` | auto | Stable per-worker consumer identity (defaults to the worker nodename when available, else `hostname:pid`) |
 | `global_keyprefix` | `""` | Prefix for all Redis keys |
