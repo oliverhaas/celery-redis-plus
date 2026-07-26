@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from queue import Empty
 from typing import TYPE_CHECKING, Any, cast
@@ -12,6 +13,8 @@ from kombu import Connection
 from kombu.asynchronous import Hub
 from kombu.utils.encoding import bytes_to_str
 from kombu.utils.json import dumps as json_dumps
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.waiting_utils import wait_for_logs
 
 from celery_redis_plus.constants import (
     DEFAULT_CONSUMER_GROUP,
@@ -28,7 +31,18 @@ from celery_redis_plus.streams import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from celery import Celery
+
+# Redis 6.2 is the streams transport's actual version floor: XPENDING ... IDLE
+# and the exclusive stream ID ranges used by Channel._reclaim_and_deliver's
+# discover-then-claim pass both need it (the sorted-set transport's floor is
+# 7.0+ for BZMPOP, an unrelated requirement). The shared redis_container
+# fixture only ever parametrizes over redis:latest/valkey:latest, so nothing
+# else in this file exercises 6.2 at all; this constant and the
+# redis_62_container fixture below exist solely to close that gap.
+REDIS_62_IMAGE = "redis:6.2-alpine"
 
 
 @pytest.fixture
@@ -86,6 +100,24 @@ def _make_streams_app(host: str, port: int, global_keyprefix: str, **transport_o
     if options:
         app.conf.update(broker_transport_options=options)
     return app
+
+
+@pytest.fixture(scope="session")
+def redis_62_container() -> Generator[tuple[str, int, str]]:
+    """Start a single, non-parametrized redis:6.2-alpine container.
+
+    Deliberately separate from the shared `redis_container` fixture instead
+    of a third `params` entry on it: that fixture backs every other class in
+    this file, so adding 6.2 there would triple the run time of the whole
+    suite just to prove the floor once. Session-scoped for the same reason
+    `redis_container` is: one container for every test in
+    TestStreamsRedis62Floor below, not one per test.
+    """
+    with DockerContainer(REDIS_62_IMAGE).with_exposed_ports(6379) as container:
+        wait_for_logs(container, "Ready to accept connections")
+        host = container.get_container_host_ip()
+        port = container.get_exposed_port(6379)
+        yield host, int(port), REDIS_62_IMAGE
 
 
 @pytest.mark.integration
@@ -1806,3 +1838,310 @@ class TestStreamsBlockingPriority:
             # Nothing new remains: each entry was delivered exactly once
             with pytest.raises(Empty):
                 channel._get("celery")
+
+
+@pytest.mark.integration
+class TestStreamsRedis62Floor:
+    """Proves the streams transport's actual version floor: Redis 6.2, not 7.0+.
+
+    7.0+ is the sorted-set transport's floor (BZMPOP); it does not apply
+    here. The streams transport instead needs Redis 6.2 for XPENDING ... IDLE
+    and the exclusive stream ID ranges used by the discover-then-claim
+    reclaim pass (Channel._reclaim_and_deliver; XAUTOCLAIM is not part of
+    this design at all, see carry-forward.md section 4). Every other
+    integration test in this file runs against redis:latest/valkey:latest via
+    the shared redis_container fixture, so none of them actually exercise
+    6.2. This class is intentionally small and non-parametrized (one
+    dedicated redis_62_container, no global_keyprefix matrix): just enough
+    to prove publish/consume/ack, the consumer-cleanup Lua script, and the
+    XPENDING-IDLE-then-XCLAIM reclaim path all work on the floor version.
+    """
+
+    def test_publish_consume_ack_roundtrip(
+        self,
+        redis_62_container: tuple[str, int, str],
+    ) -> None:
+        """Test basic publish/consume/ack against Redis 6.2 (XADD, XREADGROUP, XACK+XDEL)."""
+        host, port, _image = redis_62_container
+        app = _make_streams_app(host, port, "")
+        try:
+            with app.connection() as conn:
+                channel = cast("Channel", conn.default_channel)
+
+                delivery_tag = "redis62-roundtrip"
+                message = {
+                    "body": '{"task": "test.add", "args": [1, 2]}',
+                    "properties": {
+                        "delivery_tag": delivery_tag,
+                        "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                        "headers": {},
+                    },
+                }
+                channel._put("celery", message)
+                assert channel.client.xlen(f"{STREAM_KEY_PREFIX}celery:0") == 1
+
+                consumed = channel._get("celery")
+                assert consumed["properties"]["delivery_tag"] == delivery_tag
+
+                qos = cast("QoS", channel.qos)
+                assert delivery_tag in qos._in_flight
+                qos.ack(delivery_tag)
+
+                assert delivery_tag not in qos._in_flight
+                assert channel.client.xlen(f"{STREAM_KEY_PREFIX}celery:0") == 0
+        finally:
+            app.close()
+
+    def test_cleanup_consumers_script_deletes_idle_consumer(
+        self,
+        redis_62_container: tuple[str, int, str],
+    ) -> None:
+        """Test _cleanup_consumers deletes an idle, zero-pending peer on Redis 6.2.
+
+        Exercises the real XINFO CONSUMERS reply shape (a list of dicts with
+        'name', 'pending', 'idle' keys) and XGROUP DELCONSUMER through
+        _STREAMS_CLEANUP_CONSUMERS_LUA, driven by a third identity so the
+        script's own-consumer exclusion is not what spares the deleted one.
+        """
+        host, port, _image = redis_62_container
+        broker_url = f"redis://{host}:{port}/0"
+        queue = "redis62-cleanup-queue"
+        # idle threshold = CONSUMER_IDLE_CLEANUP_FACTOR * visibility_timeout * 1000
+        # = 12 * 0.05 * 1000 = 600ms
+        visibility_timeout = 0.05
+
+        def make_conn(consumer_name: str) -> Connection:
+            return Connection(
+                broker_url,
+                transport="celery_redis_plus.streams:Transport",
+                transport_options={
+                    "visibility_timeout": visibility_timeout,
+                    "consumer_name": consumer_name,
+                },
+            )
+
+        idle_conn = make_conn("idle-worker")
+        busy_conn = make_conn("busy-worker")
+        cleaner_conn = make_conn("cleaner-worker")
+        try:
+            idle_channel = cast("Channel", idle_conn.channel())
+            busy_channel = cast("Channel", busy_conn.channel())
+
+            def make_message(tag: str) -> dict[str, Any]:
+                return {
+                    "body": '{"task": "test"}',
+                    "properties": {
+                        "delivery_tag": tag,
+                        "delivery_info": {"exchange": "", "routing_key": queue},
+                        "headers": {},
+                    },
+                }
+
+            idle_channel._put(queue, make_message("tag-idle"))
+            idle_channel._put(queue, make_message("tag-busy"))
+
+            consumed_idle = idle_channel._get(queue)
+            assert consumed_idle["properties"]["delivery_tag"] == "tag-idle"
+            consumed_busy = busy_channel._get(queue)
+            assert consumed_busy["properties"]["delivery_tag"] == "tag-busy"
+
+            # idle-worker acks (pending -> 0); busy-worker never acks (pending stays 1)
+            cast("QoS", idle_channel.qos).ack("tag-idle")
+
+            priority = idle_channel._get_message_priority({"properties": {}}, reverse=False)
+            level = priority_to_level(priority, idle_channel.priority_steps)
+            stream_key = idle_channel._stream_key(queue, level)
+
+            time.sleep(1.0)  # cross the idle cleanup threshold
+
+            cleaner_channel = cast("Channel", cleaner_conn.channel())
+            cleaner_channel._queue_cycle = [queue]
+            cleaner_channel._cleanup_consumers()
+
+            with cleaner_channel.conn_or_acquire() as client:
+                remaining = client.xinfo_consumers(stream_key, cleaner_channel.consumer_group)
+            remaining_names = {bytes_to_str(consumer["name"]) for consumer in remaining}
+        finally:
+            idle_conn.close()
+            busy_conn.close()
+            cleaner_conn.close()
+
+        assert "idle-worker" not in remaining_names
+        assert "busy-worker" in remaining_names
+
+    def test_reclaim_via_xpending_idle_and_xclaim(
+        self,
+        redis_62_container: tuple[str, int, str],
+    ) -> None:
+        """Test the discover-then-claim reclaim pass on Redis 6.2.
+
+        Covers Channel._reclaim_and_deliver's two real-server dependencies:
+        read-only `XPENDING ... IDLE` discovery (Redis 6.2+) followed by a
+        counting `XCLAIM` with a real min_idle_time, never XAUTOCLAIM.
+        """
+        host, port, _image = redis_62_container
+        app_a = _make_streams_app(host, port, "", visibility_timeout=2, consumer_name="worker-a")
+        app_b = _make_streams_app(host, port, "", visibility_timeout=2, consumer_name="worker-b")
+        try:
+            with app_a.connection() as conn_a, app_b.connection() as conn_b:
+                channel_a = cast("Channel", conn_a.default_channel)
+                channel_b = cast("Channel", conn_b.default_channel)
+
+                delivery_tag = "redis62-reclaim-test"
+                message = {
+                    "body": '{"task": "test.add", "args": [1, 2]}',
+                    "properties": {
+                        "delivery_tag": delivery_tag,
+                        "delivery_info": {"exchange": "celery", "routing_key": "celery"},
+                        "headers": {},
+                    },
+                }
+                channel_a._put("celery", message)
+                channel_a._get("celery")  # worker-a never acks
+
+                with patch.object(channel_b.connection, "_deliver") as mock_deliver:
+                    assert channel_b._reclaim_and_deliver("celery", 10) == 0
+
+                    time.sleep(2.5)  # idle now exceeds visibility_timeout=2
+
+                    claimed = channel_b._reclaim_and_deliver("celery", 10)
+
+                    assert claimed == 1
+                    payload, queue = mock_deliver.call_args[0]
+                    assert queue == "celery"
+                    assert payload["properties"]["delivery_tag"] == delivery_tag
+                    assert payload["properties"]["headers"]["x-restore-count"] == 1
+
+                pending = channel_b.client.xpending_range(
+                    f"{STREAM_KEY_PREFIX}celery:0",
+                    DEFAULT_CONSUMER_GROUP,
+                    min="-",
+                    max="+",
+                    count=10,
+                )
+                assert len(pending) == 1
+                assert pending[0]["consumer"] == b"worker-b"
+        finally:
+            app_a.close()
+            app_b.close()
+
+
+@pytest.mark.integration
+class TestStreamsThroughput:
+    """Consume-throughput: the on_tick EVALSHA pass must keep the hub loop hot on its own.
+
+    Added per plan-owner ruling after Task 7 review. Channel._consume_read
+    sends AND parses each EVALSHA synchronously inside on_tick and returns on
+    the first hit, so no command is left in flight for a reply to wake the
+    hub with. The sorted-set sibling transport does the opposite:
+    _register_BZMPOP calls _bzmpop_start(), which sends and defers the read
+    to on_readable, so the blocking reply itself wakes the poll and keeps the
+    loop hot. The reviewer's concern: with no other hub fds to wake it, a
+    streams worker might fall back to delivering only one message per
+    polling_interval (the XREADGROUP BLOCK timeout), turning a batch of N
+    messages into roughly N x polling_interval seconds instead of draining
+    near-instantly.
+
+    This MUST run under a non-prefork pool: the prefork pool's own fds would
+    wake the hub regardless and mask exactly the behavior under test. Uses
+    the "threads" pool (celery.concurrency.thread.TaskPool) rather than the
+    default "solo" so tasks also execute with genuine concurrency, closer to
+    a real deployment, while still keeping the worker's own execution off
+    any fd the streams poller could be piggy-backing on.
+
+    celery_worker_parameters bumps concurrency well past count: celery's
+    testing start_worker() defaults concurrency=1, and worker_prefetch_multiplier
+    defaults to 4, so initial_prefetch_count = concurrency x multiplier = 4.
+    With the default concurrency, this test measured the QoS prefetch window
+    (batches of exactly 4, gated by the hub's own tick cadence between
+    batches) instead of the on_tick drain behavior it exists to check - an
+    unrelated confound from the test harness, not from the transport. Raising
+    concurrency here gives prefetch_count >> count so the whole burst fits
+    inside a single drain pass, isolating what this test is actually meant to
+    catch.
+    """
+
+    @pytest.fixture
+    def celery_worker_pool(self) -> str:
+        """Non-prefork pool, per the ruling: prefork's own fds would mask the finding."""
+        return "threads"
+
+    @pytest.fixture
+    def celery_worker_parameters(self) -> dict[str, Any]:
+        """Concurrency well above count so QoS prefetch never gates the drain pass.
+
+        See the class docstring: start_worker()'s default concurrency=1 times
+        the default worker_prefetch_multiplier=4 caps initial_prefetch_count
+        at 4, which throttles delivery into small batches paced by the hub's
+        own tick cadence rather than exercising the on_tick drain loop across
+        the whole burst at once.
+        """
+        return {"concurrency": 64}
+
+    def test_worker_drains_batch_far_below_count_times_poll_timeout(
+        self,
+        celery_app: Celery,
+        celery_worker: Any,
+    ) -> None:
+        """Test that publishing >=50 messages to one queue drains far below count x poll_timeout.
+
+        conftest's pytest_configure patches celery_redis_plus.streams.Transport.polling_interval
+        to 1 second for the whole test run, so the pathological
+        one-message-per-poll-cycle fallback would take roughly count seconds
+        (50s for 50 messages here). A healthy hot loop drains the whole
+        batch in a small fraction of a single poll_timeout.
+
+        Completion is observed via a task-side side effect (an in-process list
+        under a lock, since the "threads" pool executes tasks in this same
+        process) rather than AsyncResult.get(). The result backend is a
+        completely separate concern from the streams broker's own consume
+        loop: RedisBackend's ResultConsumer subscribes to one pubsub channel
+        per task_id and AsyncResult.get() polls it with a default 0.5s retry
+        interval, and calling get() on 50 results sequentially, one task_id at
+        a time, would conflate the result backend's own latency with the
+        broker-consume throughput this test exists to check, so ignore_result
+        sidesteps it entirely.
+        """
+        completed: list[int] = []
+        lock = threading.Lock()
+
+        @celery_app.task(ignore_result=True)
+        def record(i: int) -> None:
+            with lock:
+                completed.append(i)
+
+        celery_worker.reload()
+
+        count = 50
+        poll_timeout = Transport.polling_interval  # patched to 1s by conftest
+
+        start = time.monotonic()
+        for i in range(count):
+            record.delay(i)
+
+        # Generous outer deadline so a genuine regression fails loudly with a
+        # clear assertion message instead of hanging; the real bar is the
+        # elapsed assertion below.
+        deadline = start + max(poll_timeout * count, 30)
+        while len(completed) < count and time.monotonic() < deadline:
+            time.sleep(0.005)
+        elapsed = time.monotonic() - start
+
+        assert sorted(completed) == list(range(count)), (
+            f"only {len(completed)}/{count} messages were consumed within the deadline"
+        )
+
+        rate = count / elapsed if elapsed > 0 else float("inf")
+        print(
+            f"\nTestStreamsThroughput: drained {count} messages in {elapsed:.3f}s "
+            f"({rate:.1f} msg/s); count x poll_timeout = {count * poll_timeout}s",
+        )
+
+        # "Far below" per the ruling: comfortably under a single poll_timeout,
+        # nowhere near count x poll_timeout (the one-message-per-cycle
+        # regression this test exists to catch).
+        assert elapsed < poll_timeout, (
+            f"drained {count} messages in {elapsed:.2f}s but expected well under "
+            f"a single poll_timeout ({poll_timeout}s); count x poll_timeout would be "
+            f"{count * poll_timeout}s if the hub fell back to one message per cycle"
+        )
