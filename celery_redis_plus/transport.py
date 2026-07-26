@@ -1735,10 +1735,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             super().close()
         finally:
             if not already_closed:
-                # After super().close() (which calls restore_unacked_once) on
-                # purpose: conn_or_acquire() can lazily rebuild self._pool
-                # during the restore, and that rebuilt pool must be
-                # disconnected too, not just the one that existed before.
+                # After super().close() on purpose: restore_unacked_once can
+                # lazily rebuild self._pool, and the rebuilt one needs closing.
                 self._disconnect_pools()
                 self._close_clients()
 
