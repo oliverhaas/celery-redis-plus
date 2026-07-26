@@ -468,6 +468,18 @@ class MultiChannelPoller:
             except Empty:
                 break
             delivered_any = True
+        else:
+            # Every iteration delivered a message and the cap was still hit:
+            # _consume_read only arms a blocking XREADGROUP when a pass finds
+            # every watched queue empty (the `except Empty` branch above), so
+            # reaching the cap without ever seeing Empty means more messages
+            # may still be waiting past DEFAULT_REQUEUE_BATCH_LIMIT, with
+            # nothing armed to wake the hub for them. Arm one now: XREADGROUP
+            # with BLOCK still returns immediately when data is already
+            # there, so this either delivers right away on the next readable
+            # event or genuinely blocks if the queue just emptied, instead of
+            # leaving the hub to sleep up to poll_timeout with work queued.
+            channel._xreadgroup_start()
         return delivered_any
 
     def _register_XREAD(self, channel: Channel) -> None:
