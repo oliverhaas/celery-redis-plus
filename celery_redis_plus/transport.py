@@ -2030,10 +2030,8 @@ class Transport(virtual.Transport):
         visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         loop.call_repeatedly(visibility_timeout / 3, cycle.maybe_update_messages_index)
 
-        # Store loop for dynamic timer registration (queue TTL refresh), then arm
-        # the timer immediately: a queue with x-expires may already have been
-        # declared (the Tasks bootstep can run before this method does), and
-        # nothing else re-triggers registration for it.
+        # Arm immediately: the Tasks bootstep can declare an x-expires queue
+        # before this runs, and nothing else re-triggers registration for it.
         cycle._loop = loop
         cycle._update_expires_timer()
 
