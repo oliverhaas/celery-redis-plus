@@ -5673,3 +5673,51 @@ class TestStreamsShutdownRestoreIntegration:
         finally:
             producer_conn.close()
             inspector_conn.close()
+
+
+@pytest.mark.unit
+class TestStreamsSize:
+    """Unit tests for Channel._size (XLEN per level stream + ZCARD delayed zset)."""
+
+    def _make_channel(self) -> tuple[Channel, MagicMock, MagicMock]:
+        """Build a bare channel with mocked client, pipeline, and stream keys."""
+        channel = object.__new__(Channel)
+        channel._stream_keys_for_queue = MagicMock(
+            return_value=["stream:myq:9", "stream:myq:6", "stream:myq:3", "stream:myq:0"],
+        )
+
+        mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        return channel, mock_client, mock_pipe
+
+    def test_size_sums_stream_lengths_and_delayed(self) -> None:
+        """_size returns the sum of XLEN per level stream plus ZCARD of the delayed zset."""
+        channel, mock_client, mock_pipe = self._make_channel()
+        mock_pipe.execute.return_value = [2, 0, 1, 4, 5]
+
+        size = channel._size("myq")
+
+        assert size == 12
+        mock_client.pipeline.assert_called_once()
+        assert mock_pipe.xlen.call_count == 4
+        xlen_keys = [call.args[0] for call in mock_pipe.xlen.call_args_list]
+        assert xlen_keys == ["stream:myq:9", "stream:myq:6", "stream:myq:3", "stream:myq:0"]
+        mock_pipe.zcard.assert_called_once_with("delayed:myq")
+        mock_pipe.execute.assert_called_once()
+
+    def test_size_empty_queue_returns_zero(self) -> None:
+        """_size returns 0 when all streams and the delayed zset are empty."""
+        channel, mock_client, mock_pipe = self._make_channel()
+        mock_pipe.execute.return_value = [0, 0, 0, 0, 0]
+
+        assert channel._size("myq") == 0
+        mock_client.pipeline.assert_called_once()
+        mock_pipe.zcard.assert_called_once_with("delayed:myq")

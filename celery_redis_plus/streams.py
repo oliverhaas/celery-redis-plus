@@ -897,6 +897,15 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             cast("QoS", self.qos)._in_flight[delivery_tag] = (hit_key, entry_id)
             return message
 
+    def _size(self, queue: str) -> int:
+        """Return the message count: sum of XLEN over level streams plus ZCARD of the delayed zset."""
+        with self.conn_or_acquire() as client, client.pipeline() as pipe:
+            for stream_key in self._stream_keys_for_queue(queue):
+                pipe.xlen(stream_key)
+            pipe.zcard(self._delayed_key(queue))
+            results = pipe.execute()
+        return sum(int(count) for count in results)
+
     def _move_delayed(self, queue: str, limit: int = DEFAULT_REQUEUE_BATCH_LIMIT) -> int:
         """Move due delayed messages into their priority streams.
 
