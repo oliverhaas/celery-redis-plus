@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import threading
 import time
 from queue import Empty
@@ -9,7 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
-from kombu import Connection
+from kombu import Connection, Consumer, Exchange, Producer, Queue
 from kombu.asynchronous import Hub
 from kombu.utils.encoding import bytes_to_str
 from kombu.utils.json import dumps as json_dumps
@@ -2866,3 +2867,117 @@ class TestStreamsThroughput:
             f"{throughput_bar_seconds:.0f}s; count x poll_timeout would be "
             f"{count * poll_timeout}s if the hub fell back to one message per cycle"
         )
+
+
+@pytest.mark.integration
+class TestStreamsFanoutIntegration:
+    """End-to-end fanout broadcast on the streams transport.
+
+    Fanout is celery's pidbox path (broadcast control commands and their
+    replies) and is the one part of this transport that never involves a
+    consumer group: FanoutStreamsMixin XADDs to a single stream per exchange
+    and every subscriber XREADs that stream independently, at its own offset.
+    Every other class in this file drives the XREADGROUP queue path, so
+    without this one the mixin was only ever exercised against a real server
+    through the sorted-set transport's tests
+    (tests/test_transport.py::TestFanoutMessaging).
+    """
+
+    def test_publish_is_broadcast_to_every_subscribed_connection(
+        self,
+        redis_container: tuple[str, int, str],
+        redis_client: Any,
+        global_keyprefix: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test that one publish reaches two independent subscribers, live at the "$" offset.
+
+        Nothing internal is driven by hand: Consumer.consume() binds the
+        fanout queues and the poller arms the blocking XREADs,
+        Producer.publish() routes through FanoutExchange.deliver into
+        _put_fanout's XADD, and Connection.drain_events() polls the armed
+        reads and dispatches into the consumer callbacks.
+
+        Both reads are armed BEFORE the publish and left at their default "$"
+        offset, so what is covered is what a real subscriber does (receive
+        only what is published while subscribed) rather than replaying stream
+        history from id 0. polling_interval is raised from the 1s that
+        conftest patches in to 5s for the same reason: it is the BLOCK
+        timeout of the armed XREAD, and the publish has to land inside that
+        window for the live path to be the one under test.
+
+        One subscriber runs no_ack, the other acks explicitly, since acking a
+        fanout message is streams-specific: QoS.ack must recognize the tag as
+        a fanout tag and do purely local bookkeeping. Falling through to the
+        stream path instead would log a critical (no in-flight metadata
+        exists for a fanout delivery) and, worse, would mean an ack on one
+        subscriber's connection reaching into a stream that every other
+        subscriber is still reading.
+        """
+        host, port, _image = redis_container
+        app = _make_streams_app(host, port, global_keyprefix)
+        exchange_name = f"streams_fanout_{int(time.time() * 1000)}"
+        exchange = Exchange(exchange_name, type="fanout")
+        received: dict[str, list[Any]] = {"no_ack": [], "acked": []}
+        connections: list[Connection] = []
+
+        try:
+            for label, no_ack in (("no_ack", True), ("acked", False)):
+
+                def callback(body: Any, message: Any, label: str = label, no_ack: bool = no_ack) -> None:
+                    received[label].append(body)
+                    if not no_ack:
+                        message.ack()
+
+                conn = app.connection()
+                connections.append(conn)
+                # BLOCK timeout of the XREAD armed below; see the docstring.
+                conn.transport.polling_interval = 5
+                consumer = Consumer(
+                    conn,
+                    queues=[Queue(f"{exchange_name}.{label}", exchange=exchange, routing_key="#")],
+                    callbacks=[callback],
+                    no_ack=no_ack,
+                    accept=["json"],
+                )
+                consumer.consume()
+
+            subscribers = list(connections)
+            publisher = app.connection()
+            connections.append(publisher)
+            producer = Producer(publisher, exchange=exchange, serializer="json")
+
+            # Arm both blocking XREADs while the stream is still empty: each
+            # drain call registers the fd, sends XREAD ... BLOCK 5000 at "$",
+            # and times out locally with the command still in flight server
+            # side, which is exactly the state a subscribed worker sits in.
+            for conn in subscribers:
+                with pytest.raises(socket.timeout):
+                    conn.drain_events(timeout=0.05)
+
+            producer.publish({"hello": "fanout"}, routing_key="worker.heartbeat", declare=[exchange])
+
+            stream_key = cast("Channel", subscribers[0].default_channel)._fanout_stream_key(exchange_name)
+            prefixed_stream_key = f"{global_keyprefix}{stream_key}"
+            assert redis_client.xlen(prefixed_stream_key) == 1
+
+            for conn in subscribers:
+                conn.drain_events(timeout=5)
+
+            # Broadcast, not a queue: both subscribers get the same body from
+            # the single XADD, neither steals it from the other.
+            assert received["no_ack"] == [{"hello": "fanout"}]
+            assert received["acked"] == [{"hello": "fanout"}]
+
+            ack_errors = [
+                record.getMessage() for record in caplog.records if "Cannot ack message" in record.getMessage()
+            ]
+            assert ack_errors == []
+            # The explicit ack above must not have XACKed or XDELed anything:
+            # no consumer group owns this entry, and it stays in the stream
+            # for any other subscriber until stream_maxlen trims it.
+            assert redis_client.xlen(prefixed_stream_key) == 1
+        finally:
+            for conn in connections:
+                conn.release()
+            app.close()
