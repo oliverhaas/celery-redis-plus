@@ -2197,16 +2197,23 @@ class TestStreamsXReadGroup:
         assert channel._ensured_groups == set()
         assert channel._in_poll is None
 
-    def test_poll_error_xread_uses_subclient(self) -> None:
-        """Test _poll_error routes XREAD errors to the fanout subclient."""
+    def test_poll_error_xread_uses_subclient_and_clears_the_fanout_poll_flag(self) -> None:
+        """Test _poll_error routes XREAD errors to the fanout subclient and unparks the read.
+
+        A flag left set makes _register_XREAD believe a blocking XREAD is
+        still parked on the socket, so it never re-arms one and the fanout
+        queues go silent.
+        """
         channel = object.__new__(Channel)
         channel._in_poll = None
         mock_subclient = MagicMock()
         channel.subclient = mock_subclient
+        channel._in_fanout_poll = mock_subclient.connection
 
         channel._poll_error("XREAD")
 
         mock_subclient.parse_response.assert_called_once_with(mock_subclient.connection, "XREAD")
+        assert channel._in_fanout_poll is None
 
     def test_poll_error_blocking_read_uses_xreadgroup(self) -> None:
         """Test _poll_error parses as XREADGROUP while a blocking read is pending."""
@@ -2218,6 +2225,9 @@ class TestStreamsXReadGroup:
         channel._poll_error("XREADGROUP")
 
         mock_client.parse_response.assert_called_once_with(mock_client.connection, "XREADGROUP")
+        # The armed read is over: leaving the flag set would both stop
+        # _register_XREADGROUP re-arming and misroute the next error reply
+        assert channel._in_poll is None
 
     def test_poll_error_without_blocking_read_uses_evalsha(self) -> None:
         """Test _poll_error parses as EVALSHA when no blocking read is pending (non-blocking pass)."""
@@ -2248,6 +2258,8 @@ class TestStreamsXReadGroup:
         # The next non-blocking pass re-runs _ensure_group per queue,
         # re-creating the groups
         assert channel._ensured_groups == set()
+        # Cleared on the error path too, not only on a clean parse
+        assert channel._in_poll is None
 
 
 @pytest.mark.unit

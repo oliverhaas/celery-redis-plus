@@ -1953,7 +1953,25 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         return delivered
 
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
-        if cmd_type == "XREAD":
+        """Drain the error reply for a polled fd and clear the pending-read flag.
+
+        Clearing the flag matters as much as draining the reply: the armed
+        read is over either way, and a flag left set makes _register_XREAD /
+        _register_XREADGROUP believe a blocking read is still parked on the
+        socket, so neither re-arms one and the channel goes quiet until
+        something else disturbs it. On the XREADGROUP side a stale flag also
+        misroutes the next error reply, since the EVALSHA fallback below keys
+        off exactly that flag.
+
+        Args:
+            cmd_type: The command whose reply is pending on the fd.
+            **options: Passed through to parse_response.
+
+        Returns:
+            The parsed error reply.
+        """
+        is_fanout = cmd_type == "XREAD"
+        if is_fanout:
             client = self.subclient
         else:
             client = self.client
@@ -1970,6 +1988,11 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             # band; clear the cache so the next pass re-ensures the groups
             self._invalidate_group()
             raise Empty from None
+        finally:
+            if is_fanout:
+                self._in_fanout_poll = None
+            else:
+                self._in_poll = None
 
     def close(self) -> None:
         if self._in_poll:
