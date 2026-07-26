@@ -1253,11 +1253,8 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
             )
 
         if moved >= limit:
-            # A queue that stays saturated hits this on every single cycle, so
-            # shout once per queue and mutter afterwards rather than filling
-            # the log with the same line forever. The counter resets as soon
-            # as a pass comes in under the limit, so a fresh backlog is
-            # reported loudly again.
+            # Warn once per queue, then drop to debug: a saturated queue hits
+            # this every cycle. The else branch below re-arms the warning.
             log = logger.debug if queue in self._warned_delayed_limit else logger.warning
             self._warned_delayed_limit.add(queue)
             log(
