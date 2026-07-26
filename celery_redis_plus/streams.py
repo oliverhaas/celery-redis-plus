@@ -133,6 +133,7 @@ _PACKAGE_DIR = Path(__file__).parent
 _STREAMS_CONSUME_LUA = (_PACKAGE_DIR / "streams_consume.lua").read_text()
 _STREAMS_ACK_LUA = (_PACKAGE_DIR / "streams_ack.lua").read_text()
 _STREAMS_MOVE_DELAYED_LUA = (_PACKAGE_DIR / "streams_move_delayed.lua").read_text()
+_STREAMS_CLEANUP_CONSUMERS_LUA = (_PACKAGE_DIR / "streams_cleanup_consumers.lua").read_text()
 
 
 def priority_to_level(priority: int, steps: Sequence[int]) -> int:
@@ -1489,27 +1490,37 @@ class Channel(FanoutStreamsMixin, virtual.Channel):
         consumers idle longer than CONSUMER_IDLE_CLEANUP_FACTOR times the
         visibility timeout. Consumers with pending entries are never deleted
         (reclaim drains them first), and the channel's own consumer is kept.
+
+        The read (XINFO CONSUMERS) and the delete (XGROUP DELCONSUMER) run
+        inside one Lua script per stream (streams_cleanup_consumers.lua), so
+        the pending/idle values a consumer is deleted on are exactly the
+        values at delete time. Doing this as two separate round trips from
+        the client would leave a window where a peer parked in a blocking
+        XREADGROUP with zero pending is handed a fresh entry between the
+        read and the delete; XGROUP DELCONSUMER would then remove that
+        entry from the group PEL along with the consumer, unreachable by
+        XREADGROUP, XPENDING, or XCLAIM, silently degrading at-least-once
+        to at-most-once for that peer.
         """
         if not self._queue_cycle:
             return
-        idle_threshold_ms = CONSUMER_IDLE_CLEANUP_FACTOR * self.visibility_timeout * 1000
         try:
+            idle_threshold_ms = CONSUMER_IDLE_CLEANUP_FACTOR * self.visibility_timeout * 1000
             with self.conn_or_acquire() as client:
+                cleanup_script = client.register_script(_STREAMS_CLEANUP_CONSUMERS_LUA)
                 for queue in self._queue_cycle:
                     for stream_key in self._stream_keys_for_queue(queue):
+                        # Prefix manually since EVALSHA doesn't auto-prefix KEYS
+                        prefixed_stream_key = f"{self.global_keyprefix}{stream_key}"
                         try:
-                            consumers = client.xinfo_consumers(stream_key, self.consumer_group)
+                            cleanup_script(
+                                keys=[prefixed_stream_key],
+                                args=[self.consumer_group, self.consumer_name, idle_threshold_ms],
+                            )
                         except self.ResponseError:
-                            # Stream or group does not exist (yet), nothing to clean
+                            # One stream failing must not abort hygiene for the
+                            # remaining streams and queues this cycle.
                             continue
-                        for consumer in consumers:
-                            name = bytes_to_str(consumer["name"])
-                            if name == self.consumer_name:
-                                continue
-                            if int(consumer["pending"]) > 0:
-                                continue
-                            if int(consumer["idle"]) > idle_threshold_ms:
-                                client.xgroup_delconsumer(stream_key, self.consumer_group, name)
         except Exception:
             logger.warning("Failed to clean up idle consumers, will retry next cycle", exc_info=True)
 
