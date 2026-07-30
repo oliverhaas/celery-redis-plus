@@ -9,10 +9,11 @@ Celery's eta (ISO datetime string in headers) to properties.eta
 from __future__ import annotations
 
 import logging
+import weakref
 from datetime import UTC, datetime
 from typing import Any
 
-from celery.signals import before_task_publish
+from celery.signals import before_task_publish, celeryd_after_setup
 
 logger = logging.getLogger(__name__)
 
@@ -64,3 +65,39 @@ def _convert_eta_to_properties(
     elif isinstance(eta_value, (int, float)):
         # Already a Unix timestamp
         properties["eta"] = float(eta_value)
+
+
+# Per-app worker nodenames for stable stream consumer names; weak so entries
+# clear when the app is collected (mirrors _worker_pools in transport.py).
+_worker_nodenames: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+
+
+@celeryd_after_setup.connect
+def _record_worker_nodename(sender: str, instance: Any, **kwargs: Any) -> None:
+    """Record the worker nodename for consumer-name resolution.
+
+    Args:
+        sender: The worker nodename string (also available as instance.hostname).
+        instance: The Worker instance being set up.
+        **kwargs: Additional signal arguments (conf, options, ...).
+    """
+    _worker_nodenames[instance.app] = str(instance.hostname)
+
+
+def _get_worker_nodename_for_channel(channel: Any) -> str | None:
+    """Look up the worker nodename for the Celery app that owns this channel.
+
+    Mirrors transport._get_worker_pool_for_channel.
+
+    Returns:
+        The recorded nodename, or None when no nodename is known for the app.
+    """
+    try:
+        app = channel.connection.client.app
+        return _worker_nodenames.get(app)
+    except AttributeError:
+        # Fallback for non-Celery usage or when the connection chain is broken.
+        # If there's exactly one nodename registered, use it (single-app case).
+        if len(_worker_nodenames) == 1:
+            return next(iter(_worker_nodenames.values()))
+        return None

@@ -6,7 +6,9 @@ This package provides an enhanced Redis/Valkey transport for Celery with:
 - Full 0-255 priority support (RabbitMQ semantics)
 - Redis Streams for reliable fanout (replaces PUB/SUB)
 
-Requires Redis 7.0+ (or Valkey) for BZMPOP and Python 3.13+.
+Requires Redis 7.0+ for the sorted set transport's BZMPOP and Redis 6.2+ for
+the streams transport's XPENDING ... IDLE filter (or Valkey, any version), and
+Python 3.13+.
 Supports both redis-py and valkey-py client libraries.
 """
 
@@ -21,8 +23,8 @@ __all__ = ["Transport", "__version__"]
 __version__ = version("celery-redis-plus")
 
 
-# Register valkey:// and valkeys:// URL schemes as transport aliases
-# This allows using valkey://host:port/db URLs directly with Celery/Kombu
+# kombu splits bare URL schemes at '+' before alias lookup, so the '+' forms
+# only work at the broker_transport level, never in a bare broker URL.
 def _register_transport_aliases() -> None:
     """Register valkey transport aliases with kombu."""
     try:
@@ -30,6 +32,10 @@ def _register_transport_aliases() -> None:
 
         TRANSPORT_ALIASES.setdefault("valkey", "celery_redis_plus.transport:Transport")
         TRANSPORT_ALIASES.setdefault("valkeys", "celery_redis_plus.transport:Transport")
+        TRANSPORT_ALIASES.setdefault("valkey-streams", "celery_redis_plus.streams:Transport")
+        TRANSPORT_ALIASES.setdefault("valkeys-streams", "celery_redis_plus.streams:Transport")
+        TRANSPORT_ALIASES.setdefault("valkey+streams", "celery_redis_plus.streams:Transport")
+        TRANSPORT_ALIASES.setdefault("valkeys+streams", "celery_redis_plus.streams:Transport")
     except ImportError:
         pass  # kombu not available
 

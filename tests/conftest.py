@@ -12,14 +12,16 @@ def pytest_configure() -> None:
     - polling_interval: 1s (default 10s) for faster worker shutdown
     - DEFAULT_REQUEUE_CHECK_INTERVAL: 2s (default 60s) to test native delayed delivery
     """
+    import celery_redis_plus.streams
     import celery_redis_plus.transport
 
-    # Patch both the constants module and the transport module's local binding
-    # (transport.py uses `from .constants import DEFAULT_REQUEUE_CHECK_INTERVAL`)
+    # Both transport modules import this by value, so each binding needs patching
     celery_redis_plus.constants.DEFAULT_REQUEUE_CHECK_INTERVAL = 2  # type: ignore[misc]
     celery_redis_plus.transport.DEFAULT_REQUEUE_CHECK_INTERVAL = 2  # type: ignore[misc]
+    celery_redis_plus.streams.DEFAULT_REQUEUE_CHECK_INTERVAL = 2  # type: ignore[misc]
 
     celery_redis_plus.transport.Transport.polling_interval = 1
+    celery_redis_plus.streams.Transport.polling_interval = 1
 
 
 # Re-export fixtures from fixtures package

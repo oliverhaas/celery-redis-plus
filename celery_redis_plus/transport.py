@@ -178,13 +178,16 @@ except ImportError:  # pragma: no cover
     pass
 
 
-def _get_worker_pool_for_channel(channel: Channel) -> Any:
+def _get_worker_pool_for_channel(channel: Any) -> Any:
     """Look up the worker pool for the Celery app that owns this channel.
+
+    Accepts any of this package's Channel types (sorted set or streams);
+    only the connection.client.app attribute chain is accessed.
 
     Returns the pool if found, None otherwise.
     """
     try:
-        app = channel.connection.client.app  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
+        app = channel.connection.client.app
         return _worker_pools.get(app)
     except AttributeError:
         # Fallback for non-Celery usage or when the connection chain is broken.
@@ -192,6 +195,91 @@ def _get_worker_pool_for_channel(channel: Channel) -> Any:
         if len(_worker_pools) == 1:
             return next(iter(_worker_pools.values()))
         return None
+
+
+def _drain_hub_callbacks(channel: Any) -> None:
+    """Execute pending hub callbacks to flush deferred acks.
+
+    The hub's _ready set holds callbacks scheduled via call_soon().
+    During graceful shutdown, worker threads may have completed tasks
+    and scheduled ack callbacks that haven't fired yet. Processing
+    them here ensures those delivery tags are marked dirty before
+    the remaining _delivered entries are evaluated.
+
+    Shared by this module's QoS and the streams transport's QoS.
+    """
+    try:
+        hub = channel.connection.cycle._loop
+    except AttributeError:
+        return
+    if hub is None:
+        return
+    ready = hub._pop_ready()
+    for cb in ready:
+        with suppress(Exception):
+            cb()
+
+
+def _release_channel_on_collect(channel: Any) -> None:
+    """Release a channel's broker resources without restoring in-flight messages.
+
+    Used by ``Transport._collect`` (the kombu escape hatch ``Connection.collect()``
+    calls instead of the normal ``close_connection``/``Channel.close`` path used by
+    a real ``Connection.close()``). A collect means the broker connection was lost
+    and celery is about to reconnect; it is not the application asking to shut
+    down. Peers still hold this worker's in-flight messages and will pick them up
+    on their own once the visibility timeout expires (the reclaim pass, for the
+    streams transport), so this must never call QoS.restore_unacked_once(), which
+    would kill the shared thread pool executor and, for the streams transport,
+    release PEL entries out from under still-running local tasks.
+
+    Sets ``channel._collected`` so QoS.ack/reject can key their collected-channel
+    no-op off a flag that ONLY this function ever sets, distinct from kombu's own
+    ``channel.closed`` (which virtual.Channel.close() also sets, for a genuine
+    shutdown, well before restore_unacked_once() runs). Also sets
+    ``channel.closed`` so a later stray ``Channel.close()`` call on this same
+    (about-to-be-discarded) channel object is a no-op, and cancels the QoS's
+    collect-time Finalize so it cannot fire this same restore path again at
+    process exit.
+
+    Shared by this module's Transport and the streams transport's Transport.
+    """
+    if getattr(channel, "_collected", False):
+        return
+    channel._collected = True
+    channel.closed = True
+
+    qos = getattr(channel, "_qos", None)
+    on_collect = getattr(qos, "_on_collect", None)
+    if on_collect is not None:
+        with suppress(Exception):
+            on_collect.cancel()
+
+    with suppress(Exception):
+        channel._disconnect_pools()
+    with suppress(Exception):
+        channel._close_clients()
+
+
+def _collect_transport(transport: Any) -> None:
+    """Release a transport's channels on a lost connection, without restoring.
+
+    Mirrors ``virtual.Transport.close_connection`` (stop the poller, release
+    every channel) but releases each channel via ``_release_channel_on_collect``
+    instead of ``Channel.close``, so no channel runs QoS.restore_unacked_once()
+    for what is a reconnect, not a shutdown.
+
+    Shared by this module's Transport and the streams transport's Transport.
+    """
+    with suppress(Exception):
+        transport.cycle.close()
+    for chan_list in (getattr(transport, "_avail_channels", []), getattr(transport, "channels", [])):
+        while chan_list:
+            try:
+                channel = chan_list.pop()
+            except LookupError:
+                break
+            _release_channel_on_collect(channel)
 
 
 def _queue_score(priority: int, timestamp: float | None = None) -> float:
@@ -242,7 +330,6 @@ class GlobalKeyPrefixMixin:
     global_keyprefix: str = ""
 
     PREFIXED_SIMPLE_COMMANDS: ClassVar[list[str]] = [
-        "EXISTS",
         "EXPIRE",
         "HDEL",
         "HGET",
@@ -262,7 +349,19 @@ class GlobalKeyPrefixMixin:
         "ZREM",
         "ZREVRANGEBYSCORE",
         "ZSCORE",
+        # Only stream commands this codebase issues from Python. Lua-only ones
+        # (XACK, XDEL, XGROUP DELCONSUMER) are absent by design: EVALSHA passes
+        # KEYS through untouched, so a registration here would be dead config.
         "XADD",
+        "XLEN",
+        "XPENDING",
+        "XCLAIM",
+        # XRANGE and XINFO CONSUMERS are issued from Python by tests that
+        # inspect stream state through the channel's own prefixed client
+        "XRANGE",
+        # redis-py sends this as one fused command name, not two tokens
+        "XGROUP CREATE",
+        "XINFO CONSUMERS",
     ]
 
     @staticmethod
@@ -300,9 +399,11 @@ class GlobalKeyPrefixMixin:
 
     PREFIXED_COMPLEX_COMMANDS: ClassVar[dict[str, dict[str, int | None] | Callable[..., list[Any]]]] = {
         "DEL": {"args_start": 0, "args_end": None},
+        "EXISTS": {"args_start": 0, "args_end": None},
         "WATCH": {"args_start": 0, "args_end": None},
         "BZMPOP": _prefix_bzmpop_args,
         "XREAD": _prefix_xread_args,
+        "XREADGROUP": _prefix_xread_args,
     }
 
     def _prefix_args(self, args: list[Any]) -> list[Any]:
@@ -386,15 +487,30 @@ class QoS(virtual.QoS):
         self._fanout_tags: set[str] = set()
 
     def ack(self, delivery_tag: str) -> None:
+        if self.channel._collected:
+            # Connection lost, not a shutdown: the broker still owns this
+            # entry for a peer to reclaim. Not `closed`, which close() sets
+            # before restore_unacked_once() and would drop the restore's acks.
+            logger.debug("Skipping ack for delivery_tag %r: channel was collected", delivery_tag)
+            self._fanout_tags.discard(delivery_tag)
+            super().ack(delivery_tag)
+            return
         # Fanout messages don't need Redis cleanup (no consumer groups)
         if delivery_tag in self._fanout_tags:
             self._fanout_tags.discard(delivery_tag)
         elif self._delivered is not None and delivery_tag in self._delivered:
-            # Regular sorted set message — atomic Lua removes index entry + hash
+            # Regular sorted set message: atomic Lua removes index entry + hash
             self._remove_from_indices(delivery_tag)
         super().ack(delivery_tag)
 
     def reject(self, delivery_tag: str, requeue: bool = False) -> None:
+        if self.channel._collected:
+            # See ack(): no client left to talk to. A peer reclaims the message
+            # after the visibility timeout, requeue or not.
+            logger.debug("Skipping reject for delivery_tag %r: channel was collected", delivery_tag)
+            self._fanout_tags.discard(delivery_tag)
+            super().ack(delivery_tag)
+            return
         # Fanout messages: requeue not supported (fire-and-forget broadcast)
         if delivery_tag in self._fanout_tags:
             self._fanout_tags.discard(delivery_tag)
@@ -452,22 +568,10 @@ class QoS(virtual.QoS):
     def _drain_hub_callbacks(self) -> None:
         """Execute pending hub callbacks to flush deferred acks.
 
-        The hub's _ready set holds callbacks scheduled via call_soon().
-        During graceful shutdown, worker threads may have completed tasks
-        and scheduled ack callbacks that haven't fired yet. Processing
-        them here ensures those delivery tags are marked dirty before
-        the remaining _delivered entries are evaluated.
+        Thin wrapper around the module-level _drain_hub_callbacks so the
+        drain step stays mockable per QoS instance in tests.
         """
-        try:
-            hub = self.channel.connection.cycle._loop
-        except AttributeError:
-            return
-        if hub is None:
-            return
-        ready = hub._pop_ready()
-        for cb in ready:
-            with suppress(Exception):
-                cb()
+        _drain_hub_callbacks(self.channel)
 
     def maybe_update_messages_index(self) -> None:
         """Update scores of delivered messages to now + visibility_timeout.
@@ -653,6 +757,14 @@ class MultiChannelPoller:
 
         Interval = min(all configured x-expires) / 2, so the TTL is refreshed
         ~2 times before it would expire.
+
+        With no TTLs configured, or with the event loop not registered yet,
+        any existing timer is cancelled and both _expires_timer_entry and
+        _expires_timer_interval are reset to None in the same branch. Without
+        that reset, a queue declared before register_with_event_loop runs
+        would leave _expires_timer_interval stale, and the interval-equality
+        check below could then suppress the real registration once the loop
+        does show up.
         """
         min_ttl_ms: int | None = None
         for channel in self._channels:
@@ -660,11 +772,11 @@ class MultiChannelPoller:
                 if min_ttl_ms is None or ttl_ms < min_ttl_ms:
                     min_ttl_ms = ttl_ms
 
-        if min_ttl_ms is None:
+        if min_ttl_ms is None or self._loop is None:
             if self._expires_timer_entry is not None:
                 self._expires_timer_entry.cancel()
-                self._expires_timer_entry = None
-                self._expires_timer_interval = None
+            self._expires_timer_entry = None
+            self._expires_timer_interval = None
             return
 
         interval = min_ttl_ms / 2 / 1000  # ms → seconds, divided by 2
@@ -675,12 +787,11 @@ class MultiChannelPoller:
         if self._expires_timer_entry is not None:
             self._expires_timer_entry.cancel()
 
-        if self._loop is not None:
-            self._expires_timer_entry = self._loop.call_repeatedly(
-                interval,
-                self.maybe_refresh_queue_expires,
-            )
-            self._expires_timer_interval = interval
+        self._expires_timer_entry = self._loop.call_repeatedly(
+            interval,
+            self.maybe_refresh_queue_expires,
+        )
+        self._expires_timer_interval = interval
 
     def on_readable(self, fileno: int) -> bool | None:
         chan, cmd_type = self._fd_to_chan[fileno]
@@ -729,7 +840,184 @@ class MultiChannelPoller:
         return self._fd_to_chan
 
 
-class Channel(virtual.Channel):
+class FanoutStreamsMixin:
+    """Fanout exchange support using Redis Streams (XADD + blocking XREAD), shared by all transports.
+
+    Host classes must be virtual.Channel subclasses providing the collaborators declared below.
+    """
+
+    supports_fanout = True
+    keyprefix_queue = "_kombu.binding.%s"
+    keyprefix_fanout = "/{db}."
+    sep = "\x06\x16"
+    _in_fanout_poll = None
+
+    # Streams configuration
+    stream_maxlen = DEFAULT_STREAM_MAXLEN
+
+    # Fanout settings
+    fanout_prefix: bool | str = True
+    fanout_patterns = True
+
+    # Collaborators provided by the host Channel (declared for type checking)
+    connection: Transport
+    connection_errors: tuple[type[BaseException], ...]
+    global_keyprefix: str
+    active_fanout_queues: set[str]
+    _fanout_queues: dict[str, tuple[str, str]]
+    _stream_offsets: dict[str, str]
+    subclient: Any
+    qos: Any
+    conn_or_acquire: Any
+    typeof: Any
+    _next_delivery_tag: Any
+
+    def _fanout_stream_key(self, exchange: str) -> str:
+        """Get stream key for fanout exchange.
+
+        Fanout exchanges use a single stream per exchange (routing key is ignored).
+        This is correct because fanout semantics deliver every message to every consumer,
+        and XREAD does not support wildcard stream names.
+        """
+        return f"{self.keyprefix_fanout}{exchange}"
+
+    def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
+        """Deliver fanout message using Redis Streams."""
+        stream_key = self._fanout_stream_key(exchange)
+
+        with self.conn_or_acquire() as client:
+            client.xadd(
+                name=stream_key,
+                fields={"payload": dumps(message)},
+                id="*",
+                maxlen=self.stream_maxlen,
+                approximate=True,
+            )
+
+    def _xread_start(self, timeout: float | None = None) -> None:
+        """Start XREAD for fanout streams (true broadcast - every consumer gets every message)."""
+        if timeout is None:
+            timeout = self.connection.polling_interval or 1
+
+        streams: dict[str, str] = {}
+
+        for queue in self.active_fanout_queues:
+            if queue in self._fanout_queues:
+                exchange, _routing_key = self._fanout_queues[queue]
+                stream_key = self._fanout_stream_key(exchange)
+                # Use stored offset or "$" for only new messages
+                offset = self._stream_offsets.get(stream_key, "$")
+                streams[stream_key] = offset
+
+        if not streams:
+            return
+
+        self._in_fanout_poll = self.subclient.connection
+
+        # Build XREAD command
+        stream_keys = list(streams.keys())
+        stream_ids = [streams[k] for k in stream_keys]
+
+        command_args: list[Any] = [
+            "XREAD",
+            "COUNT",
+            "1",
+            "BLOCK",
+            str(int(timeout * 1000)),
+            "STREAMS",
+            *stream_keys,
+            *stream_ids,
+        ]
+
+        if self.global_keyprefix:
+            command_args = self.subclient._prefix_args(command_args)
+
+        self.subclient.connection.send_command(*command_args)
+
+    def _xread_read(self, **options: Any) -> bool:
+        """Read messages from XREAD (fanout broadcast)."""
+        try:
+            try:
+                messages = self.subclient.parse_response(self.subclient.connection, "XREAD", **options)
+            except self.connection_errors:
+                self.subclient.connection.disconnect()
+                raise
+
+            if not messages:
+                raise Empty
+
+            for stream, message_list in messages:
+                stream_str = bytes_to_str(stream) if isinstance(stream, bytes) else stream
+                for message_id, fields in message_list:
+                    message_id_str = bytes_to_str(message_id) if isinstance(message_id, bytes) else message_id
+
+                    # Update offset for this stream
+                    # Strip prefix if present for storing offset
+                    offset_key = stream_str
+                    prefix = self.global_keyprefix
+                    if prefix and stream_str.startswith(prefix):
+                        offset_key = stream_str[len(prefix) :]
+                    self._stream_offsets[offset_key] = message_id_str
+
+                    # Find which queue this stream belongs to
+                    queue_name = None
+                    for queue, (exchange, _routing_key) in self._fanout_queues.items():
+                        if offset_key == self._fanout_stream_key(exchange):
+                            queue_name = queue
+                            break
+
+                    if not queue_name:
+                        continue
+
+                    # Parse payload
+                    payload_field = fields.get(b"payload") or fields.get("payload")
+                    if not payload_field:
+                        continue
+                    payload = loads(bytes_to_str(payload_field))
+
+                    # Set delivery tag
+                    delivery_tag = self._next_delivery_tag()
+                    payload["properties"]["delivery_tag"] = delivery_tag
+
+                    # Mark as fanout message (no ack needed)
+                    if self.qos is not None:
+                        cast("QoS", self.qos)._fanout_tags.add(delivery_tag)
+
+                    # Deliver message
+                    self.connection._deliver(payload, queue_name)
+                    return True
+
+            raise Empty
+        finally:
+            self._in_fanout_poll = None
+
+    def _queue_bind(self, exchange: str, routing_key: str, pattern: str, queue: str) -> None:
+        if self.typeof(exchange).type == "fanout":
+            self._fanout_queues[queue] = (exchange, routing_key.replace("#", "*"))
+        with self.conn_or_acquire() as client:
+            client.sadd(
+                self.keyprefix_queue % (exchange,),
+                self.sep.join([routing_key or "", pattern or "", queue or ""]),
+            )
+
+    def get_table(self, exchange: str) -> list[tuple[str, str, str]]:
+        key = self.keyprefix_queue % exchange
+        with self.conn_or_acquire() as client:
+            values = client.smembers(key)
+            if not values:
+                return []
+            result: list[tuple[str, str, str]] = []
+            binding_parts_count = 3  # routing_key, pattern, queue
+            for val in values:
+                parts = bytes_to_str(val).split(self.sep)
+                # Ensure exactly 3 parts (routing_key, pattern, queue)
+                while len(parts) < binding_parts_count:
+                    parts.append("")
+                result.append((parts[0], parts[1], parts[2]))
+            return result
+
+
+class Channel(FanoutStreamsMixin, virtual.Channel):
     """Redis Channel with BZMPOP priority queues and Streams fanout.
 
     Uses:
@@ -743,12 +1031,7 @@ class Channel(virtual.Channel):
     connection: Transport  # Narrow type from base class for our custom Transport
 
     _client: Any = None
-    supports_fanout = True
-    keyprefix_queue = "_kombu.binding.%s"
-    keyprefix_fanout = "/{db}."
-    sep = "\x06\x16"
     _in_poll = None
-    _in_fanout_poll = None
     _warned_expires_clamp = False
     max_priority = MAX_PRIORITY  # Override kombu's default of 9 to enable full 0-255 range
 
@@ -768,9 +1051,6 @@ class Channel(virtual.Channel):
     health_check_interval = DEFAULT_HEALTH_CHECK_INTERVAL
     client_name: str | None = None
 
-    # Streams configuration
-    stream_maxlen = DEFAULT_STREAM_MAXLEN
-
     # Global key prefix
     global_keyprefix = ""
 
@@ -780,12 +1060,13 @@ class Channel(virtual.Channel):
     # Max restore count (None = no limit)
     max_restore_count: int | None = DEFAULT_MAX_RESTORE_COUNT
 
-    # Fanout settings
-    fanout_prefix: bool | str = True
-    fanout_patterns = True
-
     _async_pool: Any = None
     _pool: Any = None
+
+    # Set only by _release_channel_on_collect(). A class attribute rather than
+    # an __init__ assignment so it defaults to False on test doubles built via
+    # object.__new__.
+    _collected: bool = False
 
     from_transport_options = virtual.Channel.from_transport_options + (
         "sep",
@@ -1129,114 +1410,6 @@ class Channel(virtual.Channel):
         finally:
             self._in_poll = None
 
-    # --- XREAD (Streams) methods for fanout ---
-
-    def _fanout_stream_key(self, exchange: str) -> str:
-        """Get stream key for fanout exchange.
-
-        Fanout exchanges use a single stream per exchange (routing key is ignored).
-        This is correct because fanout semantics deliver every message to every consumer,
-        and XREAD does not support wildcard stream names.
-        """
-        return f"{self.keyprefix_fanout}{exchange}"
-
-    def _xread_start(self, timeout: float | None = None) -> None:
-        """Start XREAD for fanout streams (true broadcast - every consumer gets every message)."""
-        if timeout is None:
-            timeout = self.connection.polling_interval or 1
-
-        streams: dict[str, str] = {}
-
-        for queue in self.active_fanout_queues:
-            if queue in self._fanout_queues:
-                exchange, _routing_key = self._fanout_queues[queue]
-                stream_key = self._fanout_stream_key(exchange)
-                # Use stored offset or "$" for only new messages
-                offset = self._stream_offsets.get(stream_key, "$")
-                streams[stream_key] = offset
-
-        if not streams:
-            return
-
-        self._in_fanout_poll = self.subclient.connection
-
-        # Build XREAD command
-        stream_keys = list(streams.keys())
-        stream_ids = [streams[k] for k in stream_keys]
-
-        command_args: list[Any] = [
-            "XREAD",
-            "COUNT",
-            "1",
-            "BLOCK",
-            str(int(timeout * 1000)),
-            "STREAMS",
-            *stream_keys,
-            *stream_ids,
-        ]
-
-        if self.global_keyprefix:
-            command_args = self.subclient._prefix_args(command_args)
-
-        self.subclient.connection.send_command(*command_args)
-
-    def _xread_read(self, **options: Any) -> bool:
-        """Read messages from XREAD (fanout broadcast)."""
-        try:
-            try:
-                messages = self.subclient.parse_response(self.subclient.connection, "XREAD", **options)
-            except self.connection_errors:
-                self.subclient.connection.disconnect()
-                raise
-
-            if not messages:
-                raise Empty
-
-            for stream, message_list in messages:
-                stream_str = bytes_to_str(stream) if isinstance(stream, bytes) else stream
-                for message_id, fields in message_list:
-                    message_id_str = bytes_to_str(message_id) if isinstance(message_id, bytes) else message_id
-
-                    # Update offset for this stream
-                    # Strip prefix if present for storing offset
-                    offset_key = stream_str
-                    prefix = self.global_keyprefix
-                    if prefix and stream_str.startswith(prefix):
-                        offset_key = stream_str[len(prefix) :]
-                    self._stream_offsets[offset_key] = message_id_str
-
-                    # Find which queue this stream belongs to
-                    queue_name = None
-                    for queue, (exchange, _routing_key) in self._fanout_queues.items():
-                        if offset_key == self._fanout_stream_key(exchange):
-                            queue_name = queue
-                            break
-
-                    if not queue_name:
-                        continue
-
-                    # Parse payload
-                    payload_field = fields.get(b"payload") or fields.get("payload")
-                    if not payload_field:
-                        continue
-                    payload = loads(bytes_to_str(payload_field))
-
-                    # Set delivery tag
-                    delivery_tag = self._next_delivery_tag()
-                    payload["properties"]["delivery_tag"] = delivery_tag
-
-                    # Mark as fanout message (no ack needed)
-                    if self.qos is not None:
-                        cast("QoS", self.qos)._fanout_tags.add(delivery_tag)
-
-                    # Deliver message
-                    self.connection._deliver(payload, queue_name)
-                    return True
-
-            raise Empty
-        finally:
-            self._in_fanout_poll = None
-
     def _poll_error(self, cmd_type: str, **options: Any) -> Any:
         if cmd_type == "XREAD":
             client = self.subclient
@@ -1456,19 +1629,6 @@ class Channel(virtual.Channel):
                 pipe.pexpire(self._messages_index_key(queue), ttl_ms)
             pipe.execute()
 
-    def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
-        """Deliver fanout message using Redis Streams."""
-        stream_key = self._fanout_stream_key(exchange)
-
-        with self.conn_or_acquire() as client:
-            client.xadd(
-                name=stream_key,
-                fields={"payload": dumps(message)},
-                id="*",
-                maxlen=self.stream_maxlen,
-                approximate=True,
-            )
-
     def prepare_queue_arguments(self, arguments: dict[str, Any] | None, **kwargs: Any) -> dict[str, Any] | None:
         return to_rabbitmq_queue_arguments(arguments, **kwargs)
 
@@ -1494,15 +1654,6 @@ class Channel(virtual.Channel):
         x_message_ttl = arguments.get("x-message-ttl")
         if x_message_ttl is not None and queue not in self._message_ttls:
             self._message_ttls[queue] = int(x_message_ttl)
-
-    def _queue_bind(self, exchange: str, routing_key: str, pattern: str, queue: str) -> None:
-        if self.typeof(exchange).type == "fanout":
-            self._fanout_queues[queue] = (exchange, routing_key.replace("#", "*"))
-        with self.conn_or_acquire() as client:
-            client.sadd(
-                self.keyprefix_queue % (exchange,),
-                self.sep.join([routing_key or "", pattern or "", queue or ""]),
-            )
 
     def _delete(self, queue: str, *args: Any, **kwargs: Any) -> None:
         # kombu calls: _delete(queue, exchange, routing_key, pattern)
@@ -1548,22 +1699,6 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             return bool(client.exists(self._queue_key(queue)))
 
-    def get_table(self, exchange: str) -> list[tuple[str, str, str]]:
-        key = self.keyprefix_queue % exchange
-        with self.conn_or_acquire() as client:
-            values = client.smembers(key)
-            if not values:
-                return []
-            result: list[tuple[str, str, str]] = []
-            binding_parts_count = 3  # routing_key, pattern, queue
-            for val in values:
-                parts = bytes_to_str(val).split(self.sep)
-                # Ensure exactly 3 parts (routing_key, pattern, queue)
-                while len(parts) < binding_parts_count:
-                    parts.append("")
-                result.append((parts[0], parts[1], parts[2]))
-            return result
-
     def _purge(self, queue: str) -> int:
         with self.conn_or_acquire() as client:
             queue_key = self._queue_key(queue)
@@ -1587,7 +1722,8 @@ class Channel(virtual.Channel):
         if self._in_fanout_poll:
             with suppress(Empty, *_connection_errors):
                 self._xread_read()
-        if not self.closed:
+        already_closed = self.closed
+        if not already_closed:
             self.connection.cycle.discard(self)
 
             client = self.__dict__.get("client")
@@ -1595,9 +1731,14 @@ class Channel(virtual.Channel):
                 for queue in self._fanout_queues:
                     if queue in self.auto_delete_queues:
                         self.queue_delete(queue, client=client)
-            self._disconnect_pools()
-            self._close_clients()
-        super().close()
+        try:
+            super().close()
+        finally:
+            if not already_closed:
+                # After super().close() on purpose: restore_unacked_once can
+                # lazily rebuild self._pool, and the rebuilt one needs closing.
+                self._disconnect_pools()
+                self._close_clients()
 
     def _close_clients(self) -> None:
         for name in ("client", "subclient"):
@@ -1845,6 +1986,20 @@ class Transport(virtual.Transport):
     def driver_version(self) -> str:
         return client_lib.__version__
 
+    def _collect(self, connection: Connection) -> None:
+        """Release channels for a lost connection, without restoring in-flight messages.
+
+        kombu's ``Connection.collect()`` calls this instead of the normal
+        ``close_connection``/``Channel.close`` path (the one a real
+        ``Connection.close()`` uses) whenever a transport defines it. A collect
+        means the broker connection was lost and celery is about to reconnect,
+        not that the application asked to shut down, so this must never trigger
+        QoS.restore_unacked_once(): a still-unacked message is still owned by
+        this worker and will simply time out and be requeued/redelivered like
+        any other in-flight message if this process never comes back.
+        """
+        _collect_transport(self)
+
     def register_with_event_loop(self, connection: Connection, loop: Any) -> None:
         cycle = self.cycle
         cycle.on_poll_init(loop.poller)
@@ -1875,8 +2030,10 @@ class Transport(virtual.Transport):
         visibility_timeout = connection.client.transport_options.get("visibility_timeout", DEFAULT_VISIBILITY_TIMEOUT)  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
         loop.call_repeatedly(visibility_timeout / 3, cycle.maybe_update_messages_index)
 
-        # Store loop for dynamic timer registration (queue TTL refresh)
+        # Arm immediately: the Tasks bootstep can declare an x-expires queue
+        # before this runs, and nothing else re-triggers registration for it.
         cycle._loop = loop
+        cycle._update_expires_timer()
 
     def on_readable(self, fileno: int) -> Any:  # type: ignore[override]  # ty: ignore[invalid-method-override]
         """Handle AIO event for one of our file descriptors."""

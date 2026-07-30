@@ -40,6 +40,10 @@ Repository = "https://github.com/oliverhaas/celery-redis-plus.git"
 [project.entry-points."kombu.transport"]
 valkey = "celery_redis_plus.transport:Transport"
 valkeys = "celery_redis_plus.transport:Transport"
+valkey-streams = "celery_redis_plus.streams:Transport"
+valkeys-streams = "celery_redis_plus.streams:Transport"
+"valkey+streams" = "celery_redis_plus.streams:Transport"
+"valkeys+streams" = "celery_redis_plus.streams:Transport"
 
 [dependency-groups]
 dev = [

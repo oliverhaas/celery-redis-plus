@@ -51,7 +51,19 @@ def cleanup_async_results() -> Any:
     yield
 
     gc.collect()
-    async_results = [obj for obj in gc.get_objects() if isinstance(obj, AsyncResult)]
+
+    def is_async_result(obj: object) -> bool:
+        # celery Proxy objects resolve their class lazily, so isinstance() can
+        # raise rather than answer: a Proxy left in gc by a test that used a
+        # different app raises NotRegistered when this fixture forces it to
+        # resolve against whichever app is current. Not an AsyncResult either
+        # way, so treat any resolution failure as a no.
+        try:
+            return isinstance(obj, AsyncResult)
+        except Exception:
+            return False
+
+    async_results = [obj for obj in gc.get_objects() if is_async_result(obj)]
 
     for async_result in async_results:
         if async_result.backend is not None:
