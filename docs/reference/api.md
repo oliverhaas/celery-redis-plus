@@ -42,6 +42,17 @@ All options are passed via Celery's `broker_transport_options` configuration.
 | `global_keyprefix` | `str` | `""` | Prefix for all Redis keys |
 | `stream_maxlen` | `int` | `10000` | Max messages per fanout stream (approximate) |
 
+!!! note "Sizing `visibility_timeout`"
+
+    Consuming workers push the deadline forward every `visibility_timeout / 3`
+    seconds, but that refresh is an event-loop timer and the event loop stops
+    ticking while the worker drains and while it reconnects to the broker. A
+    task that is still running across a broker reconnect or a shutdown drain
+    gets no refresh, so `visibility_timeout` has to cover the longest task
+    runtime plus the termination grace period plus however long a reconnect may
+    take. If it does not, another worker picks the message up while the first
+    one is still on it.
+
 #### Message Storage Options
 
 | Option | Type | Default | Description |

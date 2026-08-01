@@ -52,6 +52,10 @@ if TYPE_CHECKING:
 
 import logging
 
+from celery.bootsteps import (
+    CLOSE,  # type: ignore[attr-defined]  # ty: ignore[unresolved-import]
+    TERMINATE,  # type: ignore[attr-defined]  # ty: ignore[unresolved-import]
+)
 from celery.signals import worker_ready, worker_shutdown
 from kombu.exceptions import InconsistencyError, VersionMismatch
 from kombu.transport import virtual
@@ -150,19 +154,21 @@ _ACK_MESSAGE_LUA = (_PACKAGE_DIR / "transport_ack_message.lua").read_text()
 
 _warned_priority_clamp = False
 
-# Per-app worker pool references.  WeakKeyDictionary so entries auto-clean
+# Per-app worker references.  WeakKeyDictionary so entries auto-clean
 # when the Celery app is garbage-collected (no manual cleanup needed on crash).
-_worker_pools: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
+# The value is the WorkController, which carries both the ``pool`` (for the
+# executor wait) and the ``blueprint`` (to tell shutdown from reconnect).
+_worker_owners: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
 
 
 @worker_ready.connect
 def _on_worker_ready(sender: Any, **kwargs: Any) -> None:
-    _worker_pools[sender.app] = sender.pool
+    _worker_owners[sender.app] = sender
 
 
 @worker_shutdown.connect
 def _on_worker_shutdown(sender: Any, **kwargs: Any) -> None:
-    _worker_pools.pop(sender.app, None)
+    _worker_owners.pop(sender.app, None)
 
 
 # Celery's start_worker test helper uses TestWorkController which fires
@@ -173,25 +179,22 @@ try:
 
     @test_worker_started.connect
     def _on_test_worker_started(sender: Any, worker: Any, **kwargs: Any) -> None:
-        _worker_pools[worker.app] = worker.pool
+        _worker_owners[worker.app] = worker
 except ImportError:  # pragma: no cover
     pass
 
 
-def _get_worker_pool_for_channel(channel: Channel) -> Any:
-    """Look up the worker pool for the Celery app that owns this channel.
-
-    Returns the pool if found, None otherwise.
-    """
-    try:
-        app = channel.connection.client.app  # type: ignore[union-attr]  # ty: ignore[unresolved-attribute]
-        return _worker_pools.get(app)
-    except AttributeError:
-        # Fallback for non-Celery usage or when the connection chain is broken.
-        # If there's exactly one pool registered, use it (single-app case).
-        if len(_worker_pools) == 1:
-            return next(iter(_worker_pools.values()))
-        return None
+def _get_worker_owner_for_channel(channel: Channel) -> Any:
+    """Look up the WorkController for the Celery app that owns this channel."""
+    # kombu's Connection holds no back-reference to the Celery app, so the app
+    # lookup is best-effort and the single-registration fallback is what
+    # normally resolves.  Two or more workers leave nothing to disambiguate on.
+    app = getattr(getattr(channel.connection, "client", None), "app", None)
+    if app is not None and (owner := _worker_owners.get(app)) is not None:
+        return owner
+    if len(_worker_owners) == 1:
+        return next(iter(_worker_owners.values()))
+    return None
 
 
 def _queue_score(priority: int, timestamp: float | None = None) -> float:
@@ -427,20 +430,23 @@ class QoS(virtual.QoS):
             ack_script(keys=[index_key, message_key], args=[delivery_tag])
 
     def restore_unacked_once(self, stderr: Any = None) -> None:
-        """Restore unacked messages, waiting for threads and draining acks.
-
-        Celery's shutdown order fires restore_unacked_once (during Consumer
-        close) BEFORE Pool.on_stop() waits for threads.  By calling
-        executor.shutdown(wait=True) here first, all threads complete and
-        their ack callbacks land in hub._ready.  The second drain catches
-        them, so only truly unfinished messages get restored.
-        executor.shutdown() is idempotent — Pool.on_stop()'s later call
-        is a no-op.
-        """
+        """Restore unacked messages, waiting for threads and draining acks."""
         self._drain_hub_callbacks()
 
+        # kombu calls this from Channel.close(), which also runs on broker
+        # reconnects; Blueprint.stop() sets CLOSE before it stops a step, so
+        # only a real shutdown reads CLOSE/TERMINATE here.  Reconnects fall
+        # back to messages_index redelivery on the visibility deadline.
+        owner = _get_worker_owner_for_channel(self.channel)
+        blueprint = getattr(owner, "blueprint", None)
+        if owner is not None and getattr(blueprint, "state", None) not in {CLOSE, TERMINATE}:
+            return
+
+        # Celery fires this BEFORE Pool.on_stop() waits for threads, so wait
+        # here instead: finishing threads land their acks in hub._ready and the
+        # second drain catches them, leaving only unfinished work to restore.
         if (
-            (pool := _get_worker_pool_for_channel(self.channel)) is not None
+            (pool := getattr(owner, "pool", None)) is not None
             and (executor := getattr(pool, "executor", None)) is not None
             and hasattr(executor, "shutdown")
         ):

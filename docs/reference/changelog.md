@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `QoS.restore_unacked_once` no longer shuts the worker thread pool down on broker reconnects. kombu calls it from `Channel.close()`, which also runs when the consumer reconnects, so every broker blip permanently disabled the pool (later `submit()` calls raised `RuntimeError` while the worker kept answering `inspect ping`). It is now gated on the worker blueprint having entered `CLOSE`/`TERMINATE`
+- Reconnects no longer requeue messages whose tasks are still running. Those messages stay in `messages_index` and are redelivered on their visibility deadline instead
+- Worker lookup no longer relies on `channel.connection.client.app`, which never resolves (kombu's `Connection` has no `app` attribute) and made the lookup raise `AttributeError` on every call
+
 ## [0.3.0] - 2026-02-14
 
 ### Added

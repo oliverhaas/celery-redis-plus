@@ -11,11 +11,17 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+from celery.bootsteps import (
+    CLOSE,  # type: ignore[attr-defined]  # ty: ignore[unresolved-import]
+    RUN,  # type: ignore[attr-defined]  # ty: ignore[unresolved-import]
+    TERMINATE,  # type: ignore[attr-defined]  # ty: ignore[unresolved-import]
+)
 from kombu import Exchange, Queue
 from kombu.exceptions import OperationalError
 from kombu.utils.eventio import ERR
 from kombu.utils.json import dumps as json_dumps
 
+import celery_redis_plus.transport as transport_mod
 from celery_redis_plus.constants import (
     DEFAULT_MESSAGE_TTL,
     DEFAULT_VISIBILITY_TIMEOUT,
@@ -1406,6 +1412,34 @@ class TestChannel:
         mock_cycle._update_expires_timer.assert_called_once()
 
 
+def _make_restore_qos(channel: MagicMock, call_order: list[str]) -> QoS:
+    """Build a bare QoS wired up for restore_unacked_once tests."""
+    qos = object.__new__(QoS)
+    qos._fanout_tags = set()
+    qos._dirty = set()
+    qos._delivered = OrderedDict()
+    qos._delivered.restored = False  # type: ignore[attr-defined]
+    qos._delivered["tag1"] = MagicMock()
+    qos.restore_at_shutdown = True
+    qos._on_collect = MagicMock()
+    channel.do_restore = True
+    qos.channel = channel
+    qos._drain_hub_callbacks = MagicMock(side_effect=lambda: call_order.append("drain"))
+    return qos
+
+
+def _make_worker_owner(state: int, call_order: list[str] | None = None) -> MagicMock:
+    """Build a fake WorkController with a pool executor and a blueprint state."""
+    owner = MagicMock(spec=["app", "pool", "blueprint"])
+    owner.pool = MagicMock(spec=["executor"])
+    owner.pool.executor = MagicMock()
+    if call_order is not None:
+        owner.pool.executor.shutdown.side_effect = lambda **_kw: call_order.append("shutdown")
+    owner.blueprint = MagicMock(spec=["state"])
+    owner.blueprint.state = state
+    return owner
+
+
 @pytest.mark.unit
 class TestQoS:
     """Tests for the QoS class."""
@@ -1632,89 +1666,113 @@ class TestQoS:
 
     def test_restore_unacked_once_waits_for_pool(self) -> None:
         """Test that restore drains, waits for executor, drains again, then restores."""
-        import celery_redis_plus.transport as transport_mod
-
-        qos = object.__new__(QoS)
-        qos._fanout_tags = set()
-        qos._dirty = set()
-        qos._delivered = OrderedDict()
-        qos._delivered.restored = False  # type: ignore[attr-defined]
-        qos._delivered["tag1"] = MagicMock()
-        qos.restore_at_shutdown = True
-        qos._on_collect = MagicMock()
+        call_order: list[str] = []
+        owner = _make_worker_owner(CLOSE, call_order)
 
         mock_channel = MagicMock()
-        mock_channel.do_restore = True
-        qos.channel = mock_channel
+        mock_channel.connection.client.app = owner.app
+        qos = _make_restore_qos(mock_channel, call_order)
 
-        qos._drain_hub_callbacks = MagicMock()
-
-        call_order: list[str] = []
-        qos._drain_hub_callbacks.side_effect = lambda: call_order.append("drain")
-
-        mock_executor = MagicMock()
-        mock_executor.shutdown.side_effect = lambda **_kw: call_order.append("shutdown")
-
-        mock_pool = MagicMock(spec=["executor"])
-        mock_pool.executor = mock_executor
-
-        mock_app = MagicMock()
-        mock_channel.connection.client.app = mock_app
-
-        old_pools = transport_mod._worker_pools.copy()
-        transport_mod._worker_pools[mock_app] = mock_pool
-        try:
-            with patch.object(
+        with (
+            patch.dict(transport_mod._worker_owners, {owner.app: owner}, clear=True),
+            patch.object(
                 QoS.__bases__[0],
                 "restore_unacked_once",
                 side_effect=lambda _self, _stderr=None: call_order.append(
                     "super_restore",
                 ),
-            ):
-                qos.restore_unacked_once()
-        finally:
-            transport_mod._worker_pools.clear()
-            transport_mod._worker_pools.update(old_pools)
+            ),
+        ):
+            qos.restore_unacked_once()
 
         assert call_order == ["drain", "shutdown", "drain", "super_restore"]
-        mock_executor.shutdown.assert_called_once_with(wait=True)
+        owner.pool.executor.shutdown.assert_called_once_with(wait=True)
 
-    def test_restore_unacked_once_no_pool_fallback(self) -> None:
-        """Test that without a pool reference, single drain + super is used."""
-        import celery_redis_plus.transport as transport_mod
+    @pytest.mark.parametrize(
+        ("state", "stops_pool"),
+        [(RUN, False), (CLOSE, True), (TERMINATE, True)],
+        ids=["reconnect", "warm_shutdown", "cold_shutdown"],
+    )
+    def test_restore_unacked_once_only_acts_when_the_worker_stops(
+        self,
+        state: int,
+        stops_pool: bool,
+    ) -> None:
+        """Test that a channel closing on a broker reconnect is a no-op.
 
-        qos = object.__new__(QoS)
-        qos._fanout_tags = set()
-        qos._dirty = set()
-        qos._delivered = OrderedDict()
-        qos._delivered.restored = False  # type: ignore[attr-defined]
-        qos._delivered["tag1"] = MagicMock()
-        qos.restore_at_shutdown = True
-        qos._on_collect = MagicMock()
+        kombu calls restore_unacked_once from Channel.close(), which also runs
+        when the consumer reconnects. Shutting the executor down there kills
+        the pool for the rest of the process, and restoring requeues messages
+        whose tasks are still running.
+        """
+        call_order: list[str] = []
+        owner = _make_worker_owner(state, call_order)
 
         mock_channel = MagicMock()
-        mock_channel.do_restore = True
-        qos.channel = mock_channel
+        mock_channel.connection.client.app = owner.app
+        qos = _make_restore_qos(mock_channel, call_order)
 
-        qos._drain_hub_callbacks = MagicMock()
-
-        call_order: list[str] = []
-        qos._drain_hub_callbacks.side_effect = lambda: call_order.append("drain")
-
-        old_pools = transport_mod._worker_pools.copy()
-        transport_mod._worker_pools.clear()
-        try:
-            with patch.object(
+        with (
+            patch.dict(transport_mod._worker_owners, {owner.app: owner}, clear=True),
+            patch.object(
                 QoS.__bases__[0],
                 "restore_unacked_once",
                 side_effect=lambda _self, _stderr=None: call_order.append(
                     "super_restore",
                 ),
-            ):
-                qos.restore_unacked_once()
-        finally:
-            transport_mod._worker_pools.clear()
-            transport_mod._worker_pools.update(old_pools)
+            ),
+        ):
+            qos.restore_unacked_once()
+
+        expected = ["drain", "shutdown", "drain", "super_restore"] if stops_pool else ["drain"]
+        assert call_order == expected
+        assert owner.pool.executor.shutdown.called is stops_pool
+
+    def test_restore_unacked_once_unreadable_blueprint_leaves_pool_alone(self) -> None:
+        """Test that a worker with no readable blueprint state counts as running.
+
+        Skipping the executor wait only delays redelivery to the visibility
+        timeout, while shutting the pool down on a reconnect is unrecoverable.
+        """
+        call_order: list[str] = []
+        owner = MagicMock(spec=["app", "pool"])
+        owner.pool = MagicMock(spec=["executor"])
+
+        mock_channel = MagicMock()
+        mock_channel.connection.client.app = owner.app
+        qos = _make_restore_qos(mock_channel, call_order)
+
+        with (
+            patch.dict(transport_mod._worker_owners, {owner.app: owner}, clear=True),
+            patch.object(
+                QoS.__bases__[0],
+                "restore_unacked_once",
+                side_effect=lambda _self, _stderr=None: call_order.append(
+                    "super_restore",
+                ),
+            ),
+        ):
+            qos.restore_unacked_once()
+
+        assert call_order == ["drain"]
+        owner.pool.executor.shutdown.assert_not_called()
+
+    def test_restore_unacked_once_no_pool_fallback(self) -> None:
+        """Test that without a worker reference, single drain + super is used."""
+        call_order: list[str] = []
+        qos = _make_restore_qos(MagicMock(), call_order)
+
+        with (
+            patch.dict(transport_mod._worker_owners, {}, clear=True),
+            patch.object(
+                QoS.__bases__[0],
+                "restore_unacked_once",
+                side_effect=lambda _self, _stderr=None: call_order.append(
+                    "super_restore",
+                ),
+            ),
+        ):
+            qos.restore_unacked_once()
 
         # Only one drain (no executor wait), then super restore
         assert call_order == ["drain", "super_restore"]
@@ -1726,58 +1784,20 @@ class TestQoS:
         Worker A shuts down → should NOT destroy Worker B's pool reference.
         Worker B's restore should still find its own executor.
         """
-        import celery_redis_plus.transport as transport_mod
-
-        # --- Simulate two workers starting ---
-        mock_app_a = MagicMock()
-        mock_app_b = MagicMock()
-
-        mock_executor_a = MagicMock()
-        mock_pool_a = MagicMock(spec=["executor"])
-        mock_pool_a.executor = mock_executor_a
-
-        mock_executor_b = MagicMock()
-        mock_pool_b = MagicMock(spec=["executor"])
-        mock_pool_b.executor = mock_executor_b
-
-        mock_worker_a = MagicMock()
-        mock_worker_a.app = mock_app_a
-        mock_worker_a.pool = mock_pool_a
-
-        mock_worker_b = MagicMock()
-        mock_worker_b.app = mock_app_b
-        mock_worker_b.pool = mock_pool_b
-
-        # Both workers start
-        transport_mod._on_worker_ready(sender=mock_worker_a)
-        transport_mod._on_worker_ready(sender=mock_worker_b)
-
-        # Worker A shuts down
-        transport_mod._on_worker_shutdown(sender=mock_worker_a)
-
-        # --- Worker B's QoS should still use executor_b ---
-        qos_b = object.__new__(QoS)
-        qos_b._fanout_tags = set()
-        qos_b._dirty = set()
-        qos_b._delivered = OrderedDict()
-        qos_b._delivered.restored = False  # type: ignore[attr-defined]
-        qos_b._delivered["tag1"] = MagicMock()
-        qos_b.restore_at_shutdown = True
-        qos_b._on_collect = MagicMock()
+        call_order: list[str] = []
+        worker_a = _make_worker_owner(CLOSE)
+        worker_b = _make_worker_owner(CLOSE, call_order)
 
         mock_channel_b = MagicMock()
-        mock_channel_b.do_restore = True
         # Wire up so QoS can find its app
-        mock_channel_b.connection.client.app = mock_app_b
-        qos_b.channel = mock_channel_b
+        mock_channel_b.connection.client.app = worker_b.app
+        qos_b = _make_restore_qos(mock_channel_b, call_order)
 
-        qos_b._drain_hub_callbacks = MagicMock()
+        with patch.dict(transport_mod._worker_owners, {}, clear=True):
+            transport_mod._on_worker_ready(sender=worker_a)
+            transport_mod._on_worker_ready(sender=worker_b)
+            transport_mod._on_worker_shutdown(sender=worker_a)
 
-        call_order: list[str] = []
-        qos_b._drain_hub_callbacks.side_effect = lambda: call_order.append("drain")
-        mock_executor_b.shutdown.side_effect = lambda **_kw: call_order.append("shutdown")
-
-        try:
             with patch.object(
                 QoS.__bases__[0],
                 "restore_unacked_once",
@@ -1786,69 +1806,74 @@ class TestQoS:
                 ),
             ):
                 qos_b.restore_unacked_once()
-        finally:
-            # Clean up global state
-            transport_mod._on_worker_shutdown(sender=mock_worker_b)
 
         # Worker B should still have found its executor and waited
         assert call_order == ["drain", "shutdown", "drain", "super_restore"]
-        mock_executor_b.shutdown.assert_called_once_with(wait=True)
+        worker_b.pool.executor.shutdown.assert_called_once_with(wait=True)
         # Worker A's executor should NOT have been called
-        mock_executor_a.shutdown.assert_not_called()
+        worker_a.pool.executor.shutdown.assert_not_called()
 
     def test_restore_unacked_once_single_app_fallback(self) -> None:
-        """Test that pool lookup falls back to the only registered pool.
+        """Test that the lookup falls back to the only registered worker.
 
-        When using kombu directly (without Celery), the connection chain may
-        not have an .app attribute. If exactly one worker pool is registered,
-        use it as a safe fallback.
+        kombu's Connection carries no back-reference to the Celery app, so the
+        app lookup finds nothing on a real connection chain. If exactly one
+        worker is registered, use it.
         """
-        import celery_redis_plus.transport as transport_mod
-
-        qos = object.__new__(QoS)
-        qos._fanout_tags = set()
-        qos._dirty = set()
-        qos._delivered = OrderedDict()
-        qos._delivered.restored = False  # type: ignore[attr-defined]
-        qos._delivered["tag1"] = MagicMock()
-        qos.restore_at_shutdown = True
-        qos._on_collect = MagicMock()
+        call_order: list[str] = []
+        owner = _make_worker_owner(CLOSE, call_order)
 
         mock_channel = MagicMock()
-        mock_channel.do_restore = True
-        # Simulate no .app attribute (pure kombu usage)
         del mock_channel.connection.client.app
-        qos.channel = mock_channel
+        qos = _make_restore_qos(mock_channel, call_order)
 
-        qos._drain_hub_callbacks = MagicMock()
-
-        call_order: list[str] = []
-        qos._drain_hub_callbacks.side_effect = lambda: call_order.append("drain")
-
-        mock_executor = MagicMock()
-        mock_executor.shutdown.side_effect = lambda **_kw: call_order.append("shutdown")
-
-        mock_pool = MagicMock(spec=["executor"])
-        mock_pool.executor = mock_executor
-
-        old_pools = transport_mod._worker_pools.copy()
-        transport_mod._worker_pools.clear()
-        dummy_app = MagicMock()
-        transport_mod._worker_pools[dummy_app] = mock_pool  # Single entry
-        try:
-            with patch.object(
+        with (
+            patch.dict(transport_mod._worker_owners, {MagicMock(): owner}, clear=True),
+            patch.object(
                 QoS.__bases__[0],
                 "restore_unacked_once",
                 side_effect=lambda _self, _stderr=None: call_order.append(
                     "super_restore",
                 ),
-            ):
-                qos.restore_unacked_once()
-        finally:
-            transport_mod._worker_pools.clear()
-            transport_mod._worker_pools.update(old_pools)
+            ),
+        ):
+            qos.restore_unacked_once()
 
         assert call_order == ["drain", "shutdown", "drain", "super_restore"]
+
+    def test_restore_unacked_once_multiple_workers_are_not_guessed(self) -> None:
+        """Test that an unreachable app with two workers registered picks neither.
+
+        There is nothing left to disambiguate on, so fall back to plain kombu
+        behaviour rather than shutting an arbitrary worker's pool down.
+        """
+        call_order: list[str] = []
+        owner_a = _make_worker_owner(CLOSE, call_order)
+        owner_b = _make_worker_owner(CLOSE, call_order)
+
+        mock_channel = MagicMock()
+        del mock_channel.connection.client.app
+        qos = _make_restore_qos(mock_channel, call_order)
+
+        with (
+            patch.dict(
+                transport_mod._worker_owners,
+                {MagicMock(): owner_a, MagicMock(): owner_b},
+                clear=True,
+            ),
+            patch.object(
+                QoS.__bases__[0],
+                "restore_unacked_once",
+                side_effect=lambda _self, _stderr=None: call_order.append(
+                    "super_restore",
+                ),
+            ),
+        ):
+            qos.restore_unacked_once()
+
+        assert call_order == ["drain", "super_restore"]
+        owner_a.pool.executor.shutdown.assert_not_called()
+        owner_b.pool.executor.shutdown.assert_not_called()
 
 
 @pytest.mark.unit
