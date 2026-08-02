@@ -2368,6 +2368,9 @@ class TestFastSlowConsumeMode:
         # Verify pipeline was used (ZADD + HMGET)
         mock_pipe.zadd.assert_called_once()
         mock_pipe.hmget.assert_called_once()
+        # Unconditional ZADD: xx=True would leave a delivery with no visibility
+        # deadline whenever the index entry was missing.
+        assert mock_pipe.zadd.call_args.kwargs.get("xx") is None
 
     def test_slow_consume_read_empty_raises(self, global_keyprefix: str) -> None:
         """Test SLOW mode raises Empty when BZMPOP times out."""
@@ -4555,6 +4558,44 @@ class TestChannelCloseWithFanout:
 @pytest.mark.integration
 class TestSynchronousGet:
     """Tests for synchronous _get method."""
+
+    def test_consuming_recreates_a_missing_index_entry(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that consuming sets a visibility deadline even with no index entry."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "missing-index-entry"
+            queue_key = f"{QUEUE_KEY_PREFIX}celery"
+            index_key = f"{MESSAGES_INDEX_PREFIX}celery"
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            client.delete(queue_key, index_key, message_key)
+
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "restore_count": "0",
+                },
+            )
+            # Queued with no index entry at all
+            client.zadd(queue_key, {delivery_tag: 100.0})
+            assert client.zscore(index_key, delivery_tag) is None
+
+            message = channel._get("celery")
+            assert message["properties"]["delivery_tag"] == delivery_tag
+
+            # Under ZADD XX the entry stayed missing, so the message was out of
+            # the queue and out of the index and a crash would lose it silently.
+            deadline = client.zscore(index_key, delivery_tag)
+            assert deadline is not None
+            assert deadline > time.time()
 
     def test_get_returns_message(
         self,

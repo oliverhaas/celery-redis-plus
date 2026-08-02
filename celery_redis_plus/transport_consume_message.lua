@@ -53,9 +53,13 @@ for _attempt = 1, max_attempts do
     local fields = redis.call('HMGET', message_key, 'payload', 'restore_count')
 
     if fields[1] then
-        -- Valid message: refresh messages_index score for visibility timeout
+        -- Valid message: set the messages_index score for visibility timeout.
+        -- Not 'XX': an entry missing here would leave the message delivered with
+        -- nothing tracking it, so a worker crash would lose it permanently. The
+        -- guard bought nothing anyway, since this runs only after HMGET confirmed
+        -- the hash exists and the whole script is atomic.
         local index_key = global_keyprefix .. messages_index_prefix .. queue_name
-        redis.call('ZADD', index_key, 'XX', new_queue_at, tag)
+        redis.call('ZADD', index_key, new_queue_at, tag)
         return {queue_name, tag, fields[1], fields[2] or '0'}
     else
         -- Message hash expired (x-message-ttl): clean up index and try next

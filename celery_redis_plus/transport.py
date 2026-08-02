@@ -1118,12 +1118,19 @@ class Channel(virtual.Channel):
                 delivery_tag, _score = members[0]
                 delivery_tag = bytes_to_str(delivery_tag)
 
-                # Pipeline ZADD (refresh index) + HMGET (fetch message)
+                # Pipeline ZADD (set index deadline) + HMGET (fetch message).
+                # Not xx=True: a missing entry would leave the message delivered
+                # with nothing tracking it, out of the queue and out of the index,
+                # so a worker crash would lose it permanently and silently.
+                # The pipeline is not transactional, so this can write an entry
+                # for a message acked a moment earlier. That corrects itself: the
+                # HMGET then returns no payload and _cleanup_expired_message ZREMs
+                # the entry again.
                 index_key = self._messages_index_key(dest)
                 message_key = self._message_key(delivery_tag)
                 new_queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
                 with self.client.pipeline(transaction=False) as pipe:
-                    pipe.zadd(index_key, {delivery_tag: new_queue_at}, xx=True)
+                    pipe.zadd(index_key, {delivery_tag: new_queue_at})
                     pipe.hmget(message_key, "payload", "restore_count")
                     results = pipe.execute()
 
