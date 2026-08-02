@@ -984,6 +984,25 @@
 </tr>
 </tbody>
 </table>
+<div class="admonition note">
+<p class="admonition-title">Sizing <code>visibility_timeout</code></p>
+<p>Consuming workers push the deadline forward every <code>visibility_timeout / 3</code>
+seconds, but that refresh is an event-loop timer and the event loop stops
+ticking while the worker drains and while it reconnects to the broker. A
+task that is still running across a broker reconnect or a shutdown drain
+gets no refresh, so <code>visibility_timeout</code> has to cover the longest task
+runtime plus the termination grace period plus however long a reconnect may
+take. If it does not, another worker picks the message up while the first
+one is still on it.</p>
+<p>Under <code>--pool=solo</code> there is no refresh at all. The solo pool runs each task
+inline on the main thread, so the event loop is frozen for the whole task
+and the timer never fires. Size <code>visibility_timeout</code> above your longest
+single task, the same way you would with no refresh mechanism. A lone solo
+worker gets away with it because its own requeue scan is frozen too, but a
+second worker of any pool type will reclaim the message and run it again.
+<code>prefork</code> and <code>threads</code> are unaffected: they execute tasks off the main
+thread, so the event loop keeps ticking and the refresh works.</p>
+</div>
 <h4 id="message-storage-options">Message Storage Options<a class="headerlink" href="#message-storage-options" title="Permanent link">&para;</a></h4>
 <table>
 <thead>

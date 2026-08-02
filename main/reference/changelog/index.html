@@ -572,6 +572,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="[Unreleased]">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fixed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixed
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -609,7 +626,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixed" class="md-nav__link">
+  <a href="#fixed_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -637,7 +654,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixed_1" class="md-nav__link">
+  <a href="#fixed_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -687,7 +704,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixed_2" class="md-nav__link">
+  <a href="#fixed_3" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -726,7 +743,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixed_3" class="md-nav__link">
+  <a href="#fixed_4" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -915,6 +932,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="[Unreleased]">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fixed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Fixed
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -952,7 +986,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixed" class="md-nav__link">
+  <a href="#fixed_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -980,7 +1014,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#fixed_1" class="md-nav__link">
+  <a href="#fixed_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -1030,7 +1064,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixed_2" class="md-nav__link">
+  <a href="#fixed_3" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -1069,7 +1103,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#fixed_3" class="md-nav__link">
+  <a href="#fixed_4" class="md-nav__link">
     <span class="md-ellipsis">
       
         Fixed
@@ -1232,6 +1266,12 @@
 <p>The format is based on <a href="https://keepachangelog.com/en/1.0.0/">Keep a Changelog</a>,
 and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning</a>.</p>
 <h2 id="unreleased">[Unreleased]<a class="headerlink" href="#unreleased" title="Permanent link">&para;</a></h2>
+<h3 id="fixed">Fixed<a class="headerlink" href="#fixed" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>QoS.restore_unacked_once</code> no longer shuts the worker thread pool down on broker reconnects. kombu calls it from <code>Channel.close()</code>, which also runs when the consumer reconnects, so every broker blip permanently disabled the pool (later <code>submit()</code> calls raised <code>RuntimeError</code> while the worker kept answering <code>inspect ping</code>). It is now gated on the worker blueprint having entered <code>CLOSE</code>/<code>TERMINATE</code></li>
+<li>Reconnects no longer requeue messages whose tasks are still running. Those messages stay in <code>messages_index</code> and are redelivered on their visibility deadline instead</li>
+<li>Worker lookup no longer relies on <code>channel.connection.client.app</code>, which never resolves (kombu's <code>Connection</code> has no <code>app</code> attribute) and made the lookup raise <code>AttributeError</code> on every call</li>
+</ul>
 <h2 id="030-2026-02-14">[0.3.0] - 2026-02-14<a class="headerlink" href="#030-2026-02-14" title="Permanent link">&para;</a></h2>
 <h3 id="added">Added<a class="headerlink" href="#added" title="Permanent link">&para;</a></h3>
 <ul>
@@ -1246,7 +1286,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>Default message TTL changed from 3 days to <code>-1</code> (no TTL); configurable via <code>message_ttl</code> channel attribute</li>
 <li>CI/CD: tag workflow now gates on CI success instead of running on every push</li>
 </ul>
-<h3 id="fixed">Fixed<a class="headerlink" href="#fixed" title="Permanent link">&para;</a></h3>
+<h3 id="fixed_1">Fixed<a class="headerlink" href="#fixed_1" title="Permanent link">&para;</a></h3>
 <ul>
 <li><code>EXPIRE</code> and <code>PEXPIRE</code> commands now correctly prefixed when <code>global_keyprefix</code> is set</li>
 <li><code>_bzmpop_read</code> and <code>_get</code> now skip expired message hashes and try the next message instead of raising <code>Empty</code></li>
@@ -1254,7 +1294,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>Removed redundant redis-specific getter functions (<code>get_redis_error_classes</code>, <code>get_redis_ConnectionError</code>, <code>_get_response_error</code>)</li>
 </ul>
 <h2 id="025-2026-02-14">[0.2.5] - 2026-02-14<a class="headerlink" href="#025-2026-02-14" title="Permanent link">&para;</a></h2>
-<h3 id="fixed_1">Fixed<a class="headerlink" href="#fixed_1" title="Permanent link">&para;</a></h3>
+<h3 id="fixed_2">Fixed<a class="headerlink" href="#fixed_2" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Fanout/broadcast (events, Flower) now works: added dedicated subclient for XREAD and fixed per-routing-key stream splitting</li>
 </ul>
@@ -1267,7 +1307,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <ul>
 <li>Migration support from standard Redis transport</li>
 </ul>
-<h3 id="fixed_2">Fixed<a class="headerlink" href="#fixed_2" title="Permanent link">&para;</a></h3>
+<h3 id="fixed_3">Fixed<a class="headerlink" href="#fixed_3" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Simplified transport configuration in docs</li>
 </ul>
@@ -1279,7 +1319,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>SSL/TLS detection from <code>valkeys://</code> URL scheme</li>
 <li>Priority clamping for out-of-range values (clamps to 0-255 range with warning)</li>
 </ul>
-<h3 id="fixed_3">Fixed<a class="headerlink" href="#fixed_3" title="Permanent link">&para;</a></h3>
+<h3 id="fixed_4">Fixed<a class="headerlink" href="#fixed_4" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Documentation site 404 by setting dev as default version</li>
 </ul>
