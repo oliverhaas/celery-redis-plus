@@ -1945,6 +1945,32 @@ class TestTransport:
         assert hasattr(Transport, "connection_errors")
         assert hasattr(Transport, "channel_errors")
 
+    def test_expires_timer_starts_for_queues_declared_before_the_loop(self) -> None:
+        """Test that register_with_event_loop starts the expires timer for existing queues."""
+        channel = MagicMock()
+        channel._expires = {"celery": 60_000}
+        poller = MultiChannelPoller()
+        poller.add(channel)
+
+        # _update_expires_timer no-ops without a loop, which is the state celery
+        # leaves things in: queues are declared in the Tasks bootstep, long
+        # before asynloop calls register_with_event_loop.
+        poller._update_expires_timer()
+        assert poller._expires_timer_entry is None
+
+        transport = MagicMock()
+        transport.cycle = poller
+        connection = MagicMock()
+        connection.client.transport_options = {}
+        loop = MagicMock()
+
+        Transport.register_with_event_loop(transport, connection, loop)
+
+        assert poller._loop is loop
+        assert poller._expires_timer_entry is not None
+        # 60_000 ms / 2 / 1000 = refresh twice per TTL
+        loop.call_repeatedly.assert_any_call(30.0, poller.maybe_refresh_queue_expires)
+
 
 @pytest.mark.unit
 class TestMultiChannelPoller:

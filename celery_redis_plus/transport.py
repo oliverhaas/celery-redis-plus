@@ -1922,6 +1922,12 @@ class Transport(virtual.Transport):
         # Store loop for dynamic timer registration (queue TTL refresh)
         cycle._loop = loop
 
+        # _update_expires_timer no-ops while cycle._loop is None, and celery
+        # declares every queue in the Tasks bootstep, which runs before asynloop
+        # gets here. Without this call the timer only ever started by accident,
+        # when a queue happened to be declared later at runtime.
+        cycle._update_expires_timer()
+
     def on_readable(self, fileno: int) -> Any:  # type: ignore[override]  # ty: ignore[invalid-method-override]
         """Handle AIO event for one of our file descriptors."""
         return self.cycle.on_readable(fileno)
