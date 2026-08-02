@@ -1004,6 +1004,21 @@ class Channel(virtual.Channel):
             self._consume_script_sha = self.client.script_load(_CONSUME_MESSAGE_LUA)
         return self._consume_script_sha
 
+    @staticmethod
+    def _mark_redelivered(message: dict[str, Any], restore_count: int) -> None:
+        """Set the AMQP redelivery flags on a consumed message.
+
+        Both are derived from the stored counter rather than a separate field.
+        delivery_info['redelivered'] is where kombu's own Redis transport puts
+        it, and the only place celery looks, in Request and trace, for
+        worker_deduplicate_successful_tasks.
+        """
+        if restore_count <= 0:
+            return
+        properties = message.setdefault("properties", {})
+        properties.setdefault("headers", {})["x-restore-count"] = restore_count
+        properties.setdefault("delivery_info", {})["redelivered"] = True
+
     def _parse_consume_result(self, result: list[Any]) -> tuple[str, dict[str, Any]]:
         """Parse the result from consume_message Lua script.
 
@@ -1012,11 +1027,8 @@ class Channel(virtual.Channel):
         """
         queue_name = bytes_to_str(result[0])
         payload_json = result[2]
-        restore_count = int(result[3] or 0)
         message: dict[str, Any] = loads(bytes_to_str(payload_json))
-        if restore_count > 0:
-            headers = message.setdefault("properties", {}).setdefault("headers", {})
-            headers["x-restore-count"] = restore_count
+        self._mark_redelivered(message, int(result[3] or 0))
         return queue_name, message
 
     def _bzmpop_start(self, timeout: float | None = None) -> None:
@@ -1137,10 +1149,7 @@ class Channel(virtual.Channel):
                 payload_json = results[1][0]
                 if payload_json:
                     message: dict[str, Any] = loads(bytes_to_str(payload_json))
-                    restore_count = int(results[1][1] or 0)
-                    if restore_count > 0:
-                        headers = message.setdefault("properties", {}).setdefault("headers", {})
-                        headers["x-restore-count"] = restore_count
+                    self._mark_redelivered(message, int(results[1][1] or 0))
                     self._consume_fast_mode = True  # Switch back to FAST
                     self.connection._deliver(message, dest)
                     return True
@@ -1372,7 +1381,9 @@ class Channel(virtual.Channel):
         """Requeue a rejected message to its queue using Lua script.
 
         The Lua script atomically reads the routing_key (queue) from the message
-        hash and adds the message back to that queue. Sets the redelivered flag.
+        hash and adds the message back to that queue, incrementing restore_count.
+        It does not enforce max_restore_count: the message keeps its index entry,
+        so enqueue_due_messages drops it at the next deadline if it is over.
 
         Args:
             delivery_tag: The message's delivery tag.
@@ -1457,7 +1468,6 @@ class Channel(virtual.Channel):
                     "payload": dumps(message),
                     "routing_key": queue,
                     "priority": priority,
-                    "redelivered": 0,
                     "native_delayed": 1 if is_native_delayed else 0,
                     "eta": eta_timestamp or 0,
                     "restore_count": 0,

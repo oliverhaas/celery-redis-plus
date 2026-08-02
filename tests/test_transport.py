@@ -3971,11 +3971,11 @@ class TestMessageRequeue:
             # Message should now be in the queue
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None
 
-    def test_requeue_by_tag_sets_redelivered_flag(
+    def test_requeue_by_tag_counts_the_redelivery(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that _requeue_by_tag sets the redelivered flag in hash."""
+        """Test that _requeue_by_tag increments restore_count in the hash."""
 
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
@@ -4002,7 +4002,6 @@ class TestMessageRequeue:
                     "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
-                    "redelivered": "0",
                     "native_delayed": "0",
                     "restore_count": "0",
                     "eta": "0",
@@ -4013,9 +4012,9 @@ class TestMessageRequeue:
             result = channel._requeue_by_tag(delivery_tag, leftmost=False)
             assert result is True
 
-            # Check the redelivered flag was set in the hash
-            redelivered = client.hget(message_key, "redelivered")
-            assert redelivered == b"1"
+            # The redelivery is counted, and no separate redelivered field is written
+            assert client.hget(message_key, "restore_count") == b"1"
+            assert client.hget(message_key, "redelivered") is None
 
             # Message should be in queue
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None
@@ -5146,6 +5145,9 @@ class TestRestoreCount:
             message = channel._get("celery")
             assert message is not None
             assert message["properties"]["headers"]["x-restore-count"] == 3
+            # celery reads delivery_info['redelivered'] in Request and trace, and
+            # it gates worker_deduplicate_successful_tasks
+            assert message["properties"]["delivery_info"]["redelivered"] is True
 
     def test_restore_count_header_absent_when_zero(
         self,
@@ -5324,15 +5326,16 @@ class TestRestoreCount:
             assert client.exists(message_key)
             assert client.hget(message_key, "restore_count") == b"1000"
 
-    def test_requeue_by_tag_does_not_increment_restore_count(
+    def test_requeue_by_tag_increments_but_does_not_enforce_the_limit(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that _requeue_by_tag does NOT increment restore_count.
+        """Test that _requeue_by_tag counts the redelivery without dropping the message.
 
-        Only visibility timeout restores (enqueue_due_messages) should increment
-        restore_count. Explicit requeues (reject with requeue=True, worker shutdown
-        restore) are voluntary and should not count toward the limit.
+        Reject-with-requeue is a redelivery, as it is in RabbitMQ, so it counts.
+        The limit is not enforced here: the message keeps its index entry, so
+        enqueue_due_messages sees the raised count at its next deadline and drops
+        it. One place decides, one place deletes.
         """
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
@@ -5360,7 +5363,8 @@ class TestRestoreCount:
             result = channel._requeue_by_tag(delivery_tag, queue="celery")
             assert result is True
 
-            # restore_count should be unchanged
-            assert client.hget(message_key, "restore_count") == b"5"
+            # The redelivery is counted, so the next enqueue_due_messages cycle
+            # sees the raised count and drops the message
+            assert client.hget(message_key, "restore_count") == b"6"
             # Message should be in queue
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None

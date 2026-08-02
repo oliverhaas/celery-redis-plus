@@ -2,7 +2,7 @@
 -- This handles both delayed messages (first delivery) and timed-out messages (redelivery).
 -- Uses per-message hashes: message:{tag} with fields: payload, routing_key, priority, native_delayed, eta, restore_count
 -- For native_delayed messages: set native_delayed=0 (first delivery, not a redelivery)
--- For timed-out messages: set redelivered=1, increment restore_count (message was consumed but not acked).
+-- For timed-out messages: increment restore_count (message was consumed but not acked).
 -- A tag that is still in the queue was never delivered, only backlogged, so it is
 -- re-dated in the index but neither counted nor dropped.
 -- If max_restore_count is set and exceeded, the message is dropped (removed from index, hash deleted).
@@ -83,8 +83,9 @@ for _, tag in ipairs(ready) do
                 -- Skip to next message (do not use goto, use flag approach below)
                 routing_key = nil
             else
-                -- Mark as redelivered and update restore_count
-                redis.call('HSET', message_key, 'redelivered', '1', 'restore_count', tostring(restore_count))
+                -- Update restore_count. The AMQP redelivered flag is derived
+                -- from this counter at consume time, not stored separately.
+                redis.call('HSET', message_key, 'restore_count', tostring(restore_count))
             end
         end
 

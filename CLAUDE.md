@@ -79,10 +79,11 @@ broker_transport = "celery_redis_plus.transport:Transport"
 
 ### Restore Count
 
-Messages track how many times they've been involuntarily restored (visibility timeout expiry). The `restore_count` field in the message hash is incremented by the `enqueue_due_messages` Lua script on each timeout restore. It is NOT incremented for voluntary requeues (reject+requeue, worker shutdown).
+Messages track how many times they've been redelivered. The `restore_count` field in the message hash is incremented by `enqueue_due_messages` on a visibility timeout restore and by `requeue_message` on reject-with-requeue or a worker shutdown restore. These are the same two paths RabbitMQ counts for `x-delivery-count`. A message that is merely backlogged in the queue past its deadline was never delivered, so it is not counted.
 
-- `max_restore_count` transport option: when set, messages exceeding this count are dropped
+- `max_restore_count` transport option: when set, messages exceeding this count are dropped. Only `enqueue_due_messages` enforces it, so a requeued message is dropped at its next deadline rather than immediately
 - `x-restore-count` header: injected into consumed messages when `restore_count > 0`
+- `delivery_info["redelivered"]`: set to `True` on the same condition. This is where kombu's Redis transport puts it and the only place celery looks, in `Request` and `trace`, for `worker_deduplicate_successful_tasks`. There is no `redelivered` hash field; both flags are derived from the counter at consume time
 - `/{db}.{exchange}`: Redis Stream for fanout messages
 - `_kombu.binding.{exchange}`: Set storing queue-exchange bindings
 

@@ -1,5 +1,5 @@
 -- Lua script for requeuing a single rejected message to its queue.
--- Sets redelivered=1 and adds to queue with appropriate score.
+-- Increments restore_count and adds to queue with appropriate score.
 -- Uses routing_key from the hash as the queue name.
 -- KEYS: [1] = message_key
 -- ARGV: [1] = leftmost (1 or 0), [2] = priority_multiplier, [3] = message_ttl,
@@ -25,8 +25,14 @@ if not priority or not routing_key then
     return 0
 end
 
--- Mark as redelivered
-redis.call('HSET', message_key, 'redelivered', '1')
+-- Count the redelivery. Reject-with-requeue is a redelivery just like a
+-- visibility timeout restore, and this is the counter the AMQP redelivered flag
+-- is derived from at consume time.
+--
+-- The limit is deliberately not enforced here: a requeued message keeps its
+-- index entry, so enqueue_due_messages sees the raised count at its next
+-- deadline and drops it. One place decides, one place deletes.
+redis.call('HINCRBY', message_key, 'restore_count', 1)
 if message_ttl >= 0 then
     redis.call('EXPIRE', message_key, message_ttl)
 end
