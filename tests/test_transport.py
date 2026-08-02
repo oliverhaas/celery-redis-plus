@@ -2374,12 +2374,12 @@ class TestFastSlowConsumeMode:
         mock_client = MagicMock()
         mock_conn = MagicMock()
         mock_client.connection = mock_conn
-        mock_client.connection.polling_interval = 1
+        mock_client.connection.blocking_timeout = 1
         # _prefix_args must return a real list for send_command(*args)
         mock_client._prefix_args.side_effect = lambda args: args
         channel.client = mock_client
         channel.connection = MagicMock()
-        channel.connection.polling_interval = 1
+        channel.connection.blocking_timeout = 1
 
         # EVALSHA returns nil (queue empty)
         mock_client.parse_response.return_value = None
@@ -2521,7 +2521,7 @@ class TestFastSlowConsumeMode:
         mock_client.script_load.return_value = "test_sha_123"
         channel.client = mock_client
         channel.connection = MagicMock()
-        channel.connection.polling_interval = 1
+        channel.connection.blocking_timeout = 1
 
         channel._bzmpop_start(timeout=1)
 
@@ -2545,7 +2545,7 @@ class TestFastSlowConsumeMode:
         mock_client._prefix_args.side_effect = lambda args: args
         channel.client = mock_client
         channel.connection = MagicMock()
-        channel.connection.polling_interval = 1
+        channel.connection.blocking_timeout = 1
 
         channel._bzmpop_start(timeout=1)
 
@@ -5021,16 +5021,91 @@ class TestBzmpopEdgeCases:
 
 
 @pytest.mark.unit
-class TestPollingInterval:
-    """Tests for polling_interval setting."""
+class TestBlockingTimeout:
+    """Tests for the blocking read timeout, and for keeping it off polling_interval."""
 
-    def test_transport_polling_interval_patched_for_tests(self) -> None:
-        """Test Transport polling_interval is patched to 1 for faster tests.
+    def test_transport_blocking_timeout_patched_for_tests(self) -> None:
+        """Test Transport blocking_timeout is patched to 1 for faster tests.
 
         Note: The default is 10s, but pytest_configure patches it to 1s
         for faster worker shutdown during tests.
         """
-        assert Transport.polling_interval == 1
+        assert Transport.blocking_timeout == 1
+
+    def test_the_synchronous_drain_does_not_sleep(self) -> None:
+        """Test that an empty poll is retried immediately.
+
+        kombu's drain_events sleeps polling_interval between unsuccessful
+        polls, and sharing that attribute with the block timeout made it 10s.
+        """
+        client = MagicMock()
+        client.transport_options = {}
+        transport = Transport(client)
+        transport.cycle.get = MagicMock(side_effect=Empty)
+
+        with (
+            patch("kombu.transport.virtual.base.sleep") as mock_sleep,
+            pytest.raises(TimeoutError),  # socket.timeout, once the drain timeout is up
+        ):
+            transport.drain_events(client, timeout=0.01)
+
+        mock_sleep.assert_not_called()
+        assert transport.polling_interval is None
+
+    def test_blocking_timeout_from_transport_options(self) -> None:
+        """Test that blocking_timeout is configurable and leaves the sleep off."""
+        client = MagicMock()
+        client.transport_options = {"blocking_timeout": 30}
+
+        transport = Transport(client)
+
+        assert transport.blocking_timeout == 30
+        assert transport.polling_interval is None
+
+    def test_polling_interval_is_still_read_as_the_block_timeout(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test that the old name keeps working without switching on the sleep."""
+        transport_mod._warned_polling_interval = False
+        client = MagicMock()
+        client.transport_options = {"polling_interval": 30}
+
+        with caplog.at_level(logging.WARNING, logger="celery_redis_plus.transport"):
+            transport = Transport(client)
+
+        assert transport.blocking_timeout == 30
+        assert transport.polling_interval is None
+        assert "deprecated" in caplog.text
+
+    def test_the_block_timeout_is_what_bzmpop_and_xread_wait_on(self) -> None:
+        """Test that both blocking reads take their timeout from blocking_timeout."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = ""
+        channel._consume_fast_mode = False
+        channel._queue_cycle = ["celery"]
+        channel.queue_key_prefix = QUEUE_KEY_PREFIX
+        channel.keyprefix_fanout = "/0."
+        channel.active_fanout_queues = {"fanout_queue"}
+        channel._fanout_queues = {"fanout_queue": ("test_exchange", "")}
+        channel._stream_offsets = {}
+
+        mock_client = MagicMock()
+        mock_client._prefix_args.side_effect = lambda args: args
+        channel.client = mock_client
+        channel.subclient = mock_client
+        channel.connection = MagicMock()
+        channel.connection.blocking_timeout = 7
+
+        channel._bzmpop_start()
+        bzmpop_args = mock_client.connection.send_command.call_args[0]
+        assert bzmpop_args[0] == "BZMPOP"
+        assert bzmpop_args[1] == 7
+
+        channel._xread_start()
+        xread_args = mock_client.connection.send_command.call_args[0]
+        assert xread_args[0] == "XREAD"
+        assert xread_args[xread_args.index("BLOCK") + 1] == "7000"
 
 
 @pytest.mark.unit

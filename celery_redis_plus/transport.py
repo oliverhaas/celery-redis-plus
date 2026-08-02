@@ -22,6 +22,11 @@ For Redis, set ``broker_transport`` with a standard ``redis://`` URL::
 Transport Options
 =================
 * ``visibility_timeout``: Time in seconds before unacked messages are restored (default: 300)
+* ``blocking_timeout``: Time in seconds BZMPOP and XREAD block on the server while a poll
+  is outstanding (default: 10). Has to stay below ``socket_timeout``, if one is set, or
+  every poll that finds nothing ends as a read timeout. This is kombu's ``brpop_timeout``
+  under a name that also covers XREAD, and it is not kombu's ``polling_interval``, which is
+  the sleep between unsuccessful polls and stays disabled here.
 * ``stream_maxlen``: Maximum stream length for fanout streams (default: 10000)
 * ``global_keyprefix``: Global prefix for all Redis keys
 * ``socket_timeout``: Socket timeout in seconds
@@ -84,6 +89,7 @@ from kombu.utils.url import _parse_url
 from vine import promise
 
 from .constants import (
+    DEFAULT_BLOCKING_TIMEOUT,
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_DELIVERY_LIMIT,
     DEFAULT_MESSAGE_TTL,
@@ -164,6 +170,7 @@ _ACK_MESSAGE_LUA = (_PACKAGE_DIR / "transport_ack_message.lua").read_text()
 
 
 _warned_priority_clamp = False
+_warned_polling_interval = False
 
 # Per-app worker references.  WeakKeyDictionary so entries auto-clean
 # when the Celery app is garbage-collected (no manual cleanup needed on crash).
@@ -1049,7 +1056,7 @@ class Channel(virtual.Channel):
 
     def _bzmpop_start(self, timeout: float | None = None) -> None:
         if timeout is None:
-            timeout = self.connection.polling_interval or 1
+            timeout = self.connection.blocking_timeout or 1
         if not self._queue_cycle:
             return
 
@@ -1193,7 +1200,7 @@ class Channel(virtual.Channel):
     def _xread_start(self, timeout: float | None = None) -> None:
         """Start XREAD for fanout streams (true broadcast - every consumer gets every message)."""
         if timeout is None:
-            timeout = self.connection.polling_interval or 1
+            timeout = self.connection.blocking_timeout or 1
 
         streams: dict[str, str] = {}
 
@@ -1929,7 +1936,12 @@ class Transport(virtual.Transport):
 
     Channel = Channel
 
-    polling_interval = 10  # Timeout for blocking BZMPOP/XREAD calls in seconds
+    #: Seconds BZMPOP and XREAD block on the server while a poll is outstanding.
+    blocking_timeout = DEFAULT_BLOCKING_TIMEOUT
+
+    #: kombu's sleep between unsuccessful polls, disabled as in kombu's own Redis
+    #: transport: a sleep on top of a blocking read delays a reply already on its way.
+    polling_interval = None
     default_port = DEFAULT_PORT
     driver_type = _client_lib_name or "redis"
     driver_name = _client_lib_name or "redis"
@@ -1951,6 +1963,28 @@ class Transport(virtual.Transport):
 
         # Import signals module to register signal handlers when transport is used
         from . import signals as _signals  # noqa: F401
+
+        transport_options = self.client.transport_options if self.client else None
+        blocking_timeout = (transport_options or {}).get("blocking_timeout")
+        if blocking_timeout is None and self.polling_interval is not None:
+            # polling_interval was this transport's block timeout before
+            # blocking_timeout existed. kombu reads it in virtual.Transport
+            # and also sleeps that long between unsuccessful polls, so keep
+            # honouring the value but put the sleep back to off.
+            global _warned_polling_interval  # noqa: PLW0603
+            if not _warned_polling_interval:
+                logger.warning(
+                    "The polling_interval transport option is deprecated, use blocking_timeout."
+                    " In kombu it is the sleep between unsuccessful polls, here it used to be"
+                    " how long BZMPOP and XREAD block. Reading it as blocking_timeout=%s and"
+                    " leaving the sleep disabled.",
+                    self.polling_interval,
+                )
+                _warned_polling_interval = True
+            blocking_timeout = self.polling_interval
+        self.polling_interval = None
+        if blocking_timeout is not None:
+            self.blocking_timeout = blocking_timeout
 
         self.cycle = MultiChannelPoller()
         # Shared by every channel of this connection, see Channel.__init__

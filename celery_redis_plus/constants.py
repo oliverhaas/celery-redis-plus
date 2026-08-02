@@ -19,6 +19,11 @@ DEFAULT_VISIBILITY_TIMEOUT = 300  # 5 minutes
 # Default health check interval in seconds
 DEFAULT_HEALTH_CHECK_INTERVAL = 25
 
+# Seconds BZMPOP and XREAD block on the server while a poll is outstanding.
+# Has to stay below socket_timeout, if one is configured, or every poll that
+# finds nothing ends as a read timeout instead.
+DEFAULT_BLOCKING_TIMEOUT = 10
+
 # Default stream maximum length for fanout streams
 DEFAULT_STREAM_MAXLEN = 10000
 

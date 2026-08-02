@@ -9,7 +9,7 @@ def pytest_configure() -> None:
     This runs before any test modules are imported, ensuring patches
     are in place when the transport module loads.
 
-    - polling_interval: 1s (default 10s) for faster worker shutdown
+    - blocking_timeout: 1s (default 10s) for faster worker shutdown
     - DEFAULT_REQUEUE_CHECK_INTERVAL: 2s (default 60s) to test native delayed delivery
     """
     import celery_redis_plus.transport
@@ -19,7 +19,7 @@ def pytest_configure() -> None:
     celery_redis_plus.constants.DEFAULT_REQUEUE_CHECK_INTERVAL = 2  # type: ignore[misc]
     celery_redis_plus.transport.DEFAULT_REQUEUE_CHECK_INTERVAL = 2  # type: ignore[misc]
 
-    celery_redis_plus.transport.Transport.polling_interval = 1
+    celery_redis_plus.transport.Transport.blocking_timeout = 1
 
 
 # Re-export fixtures from fixtures package

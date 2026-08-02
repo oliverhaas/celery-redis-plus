@@ -40,8 +40,26 @@ All options are passed via Celery's `broker_transport_options` configuration.
 |--------|------|---------|-------------|
 | `visibility_timeout` | `int` | `300` | Seconds before unacked messages are reclaimed |
 | `delivery_limit` | `int` or `None` | `20` | Delivery attempts before a message is dropped (`None` = no limit) |
+| `blocking_timeout` | `int` | `10` | Seconds BZMPOP and XREAD block on the server per poll |
 | `global_keyprefix` | `str` | `""` | Prefix for all Redis keys |
 | `stream_maxlen` | `int` | `10000` | Max messages per fanout stream (approximate) |
+
+!!! warning "`blocking_timeout` is not kombu's `polling_interval`"
+
+    Both answer "how long to wait", but they are opposite mechanisms.
+    `blocking_timeout` is how long the server holds the BZMPOP or XREAD open,
+    during which a message is delivered the instant it arrives.
+    `polling_interval` is kombu's sleep *between* unsuccessful polls, and this
+    transport disables it, exactly as kombu's own Redis transport does. A sleep
+    on top of a blocking read only delays a reply that is already on its way.
+
+    Setting `polling_interval` in `broker_transport_options` still works: it is
+    read as `blocking_timeout` and logs a deprecation warning, and the sleep
+    stays off.
+
+    Keep `blocking_timeout` below `socket_timeout` if you set one. The poll is
+    an ordinary read on the connection, so a socket timeout shorter than the
+    block turns every empty poll into a read timeout and a reconnect.
 
 !!! note "How `delivery_limit` counts"
 
