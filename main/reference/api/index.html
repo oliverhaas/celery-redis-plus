@@ -1241,8 +1241,8 @@ thread, so the event loop keeps ticking and the refresh works.</p>
 </tr>
 <tr>
 <td><code>_kombu.binding.{exchange}</code></td>
-<td>Set</td>
-<td>Queue-exchange bindings</td>
+<td>Sorted Set</td>
+<td>Queue-exchange bindings, scored with the unix time each binding goes stale (<code>+inf</code> for a queue without <code>x-expires</code>)</td>
 </tr>
 </tbody>
 </table>
@@ -1301,6 +1301,16 @@ thread, so the event loop keeps ticking and the refresh works.</p>
 <td><code>MESSAGES_INDEX_PREFIX</code></td>
 <td><code>"messages_index:"</code></td>
 <td>Prefix for per-queue message index sorted sets</td>
+</tr>
+<tr>
+<td><code>MIN_QUEUE_EXPIRES</code></td>
+<td><code>10000</code></td>
+<td>Floor under <code>x-expires</code>, in milliseconds</td>
+</tr>
+<tr>
+<td><code>MIN_BINDING_LIFETIME</code></td>
+<td><code>300</code></td>
+<td>Floor under how long a binding survives without a refresh, in seconds</td>
 </tr>
 </tbody>
 </table>
