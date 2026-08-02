@@ -29,6 +29,7 @@ from celery_redis_plus.constants import (
     DEFAULT_VISIBILITY_TIMEOUT,
     MESSAGE_KEY_PREFIX,
     MESSAGES_INDEX_PREFIX,
+    MIN_BINDING_LIFETIME,
     MIN_QUEUE_EXPIRES,
     PRIORITY_SCORE_MULTIPLIER,
     QUEUE_KEY_PREFIX,
@@ -427,6 +428,20 @@ class TestGlobalKeyPrefixMixin:
         assert pipeline.global_keyprefix == "myprefix:"
 
 
+def _stub_binding_table(mock_client: MagicMock, members: list[bytes]) -> MagicMock:
+    """Point a mocked client at a binding table holding `members`.
+
+    get_table reads the table by pruning and ranging in one pipeline, so the
+    members live on the pipeline's result, not on a plain command.
+    """
+    mock_pipe = MagicMock()
+    mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+    mock_pipe.__exit__ = MagicMock(return_value=False)
+    mock_pipe.execute.return_value = [0, members]
+    mock_client.pipeline.return_value = mock_pipe
+    return mock_pipe
+
+
 @pytest.mark.unit
 class TestChannel:
     """Tests for the custom Channel class."""
@@ -750,7 +765,7 @@ class TestChannel:
         channel.deadletter_queue = None
 
         mock_client = MagicMock()
-        mock_client.smembers.return_value = set()
+        _stub_binding_table(mock_client, [])
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
         mock_context.__exit__ = MagicMock(return_value=False)
@@ -772,7 +787,7 @@ class TestChannel:
         channel.deadletter_queue = None
 
         mock_client = MagicMock()
-        mock_client.smembers.return_value = set()
+        _stub_binding_table(mock_client, [])
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
         mock_context.__exit__ = MagicMock(return_value=False)
@@ -786,9 +801,10 @@ class TestChannel:
         """Test get_table returns empty list for exchange with no bindings."""
         channel = object.__new__(Channel)
         channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
 
         mock_client = MagicMock()
-        mock_client.smembers.return_value = set()
+        _stub_binding_table(mock_client, [])
 
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
@@ -810,7 +826,7 @@ class TestChannel:
 
         mock_client = MagicMock()
         # Written by a deployment configured with sep=":"
-        mock_client.smembers.return_value = {b"test_key:test_pattern:test_queue"}
+        _stub_binding_table(mock_client, [b"test_key:test_pattern:test_queue"])
 
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
@@ -1317,6 +1333,7 @@ class TestChannel:
         channel = object.__new__(Channel)
         channel.global_keyprefix = global_keyprefix
         channel._expires = {"celery": 60000, "priority": 120000}
+        channel._bindings = {}
 
         mock_client = MagicMock()
         mock_pipe = MagicMock()
@@ -1340,6 +1357,47 @@ class TestChannel:
         assert (f"{QUEUE_KEY_PREFIX}priority", 120000) in call_args_set
         assert (f"{MESSAGES_INDEX_PREFIX}priority", 120000) in call_args_set
         mock_pipe.execute.assert_called_once()
+
+    def test_refresh_queue_expires_rescores_the_bindings(self, global_keyprefix: str) -> None:
+        """Test that the refresh pushes the staleness deadline of declared bindings out."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel._expires = {"celery": 60000}
+        channel._bindings = {"celery": {("celery_exchange", "celery\x06\x16\x06\x16celery")}}
+
+        mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        before = time.time()
+        channel._refresh_queue_expires()
+        after = time.time()
+
+        mock_pipe.zadd.assert_called_once()
+        key, mapping = mock_pipe.zadd.call_args[0]
+        assert key == "_kombu.binding.celery_exchange"
+        stale_at = mapping["celery\x06\x16\x06\x16celery"]
+        # x-expires is 60s but the floor under a binding's life is longer
+        assert before + MIN_BINDING_LIFETIME <= stale_at <= after + MIN_BINDING_LIFETIME
+
+    def test_binding_stale_at(self) -> None:
+        """Test the staleness deadline a binding is scored with."""
+        channel = object.__new__(Channel)
+        channel._expires = {"short": 60_000, "long": 3_600_000}
+
+        # A queue that never expires keeps its route until an explicit unbind
+        assert channel._binding_stale_at("no_expires") == float("inf")
+        # Below the floor the floor wins, above it x-expires does
+        assert channel._binding_stale_at("short", now=1000) == 1000 + MIN_BINDING_LIFETIME
+        assert channel._binding_stale_at("long", now=1000) == 1000 + 3600
 
     def test_refresh_queue_expires_empty(self) -> None:
         """Test that _refresh_queue_expires is a no-op when _expires is empty."""
@@ -1464,11 +1522,13 @@ class TestChannel:
         )
 
     def test_delete_cleans_up_ttl_state(self, global_keyprefix: str) -> None:
-        """Test that _delete removes queue from _expires and _message_ttls."""
+        """Test that _delete removes queue from _expires, _message_ttls and _bindings."""
         channel = object.__new__(Channel)
         channel.auto_delete_queues = {"my_queue"}
         channel._expires = {"my_queue": 60000}
         channel._message_ttls = {"my_queue": 30000}
+        member = "my_key\x06\x16\x06\x16my_queue"
+        channel._bindings = {"my_queue": {("my_exchange", member)}}
         channel.global_keyprefix = global_keyprefix
         channel.keyprefix_queue = "_kombu.binding.%s"
         channel.sep = "\x06\x16"
@@ -1483,12 +1543,118 @@ class TestChannel:
         channel.connection = MagicMock()
         channel.connection.cycle = mock_cycle
 
-        channel._delete("my_queue")
+        channel._delete("my_queue", "my_exchange", "my_key", "")
 
         assert "my_queue" not in channel._expires
         assert "my_queue" not in channel._message_ttls
         assert "my_queue" not in channel.auto_delete_queues
+        assert "my_queue" not in channel._bindings
+        mock_client.zrem.assert_called_once_with("_kombu.binding.my_exchange", member)
         mock_cycle._update_expires_timer.assert_called_once()
+
+    def test_delete_falls_back_to_srem_on_a_legacy_binding_set(self, global_keyprefix: str) -> None:
+        """Test that unbinding removes the member in place without converting the table."""
+        channel = object.__new__(Channel)
+        channel.auto_delete_queues = set()
+        channel._expires = {}
+        channel._message_ttls = {}
+        channel._bindings = {}
+        channel.global_keyprefix = global_keyprefix
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+        channel._convert_binding_set = MagicMock()  # type: ignore[method-assign]
+
+        mock_client = MagicMock()
+        mock_client.zrem.side_effect = _client_exceptions.ResponseError(
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        )
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        channel.connection = MagicMock()
+
+        channel._delete("my_queue", "my_exchange", "my_key", "")
+
+        member = "my_key\x06\x16\x06\x16my_queue"
+        mock_client.srem.assert_called_once_with("_kombu.binding.my_exchange", member)
+        channel._convert_binding_set.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_delete_reraises_a_non_wrongtype_error(self, global_keyprefix: str) -> None:
+        """Test that _delete only swallows the wrong-type error it knows how to handle."""
+        channel = object.__new__(Channel)
+        channel.auto_delete_queues = set()
+        channel._expires = {}
+        channel._message_ttls = {}
+        channel._bindings = {}
+        channel.global_keyprefix = global_keyprefix
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+
+        mock_client = MagicMock()
+        mock_client.zrem.side_effect = _client_exceptions.ResponseError("READONLY")
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+        channel.connection = MagicMock()
+
+        with pytest.raises(_client_exceptions.ResponseError):
+            channel._delete("my_queue", "my_exchange", "my_key", "")
+
+    def test_queue_bind_converts_a_legacy_binding_set(self, global_keyprefix: str) -> None:
+        """Test that a binding table still stored as a set is converted, then written."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+        channel._expires = {}
+        channel._bindings = {}
+        channel._fanout_queues = {}
+        channel.typeof = MagicMock(return_value=MagicMock(type="direct"))
+        channel._convert_binding_set = MagicMock()  # type: ignore[method-assign]
+
+        mock_client = MagicMock()
+        mock_client.zadd.side_effect = [
+            _client_exceptions.ResponseError("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            1,
+        ]
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        channel._queue_bind("my_exchange", "my_key", "", "my_queue")
+
+        channel._convert_binding_set.assert_called_once_with(mock_client, "my_exchange")  # type: ignore[attr-defined]
+        member = "my_key\x06\x16\x06\x16my_queue"
+        # The queue has no x-expires, so its route never goes stale
+        assert mock_client.zadd.call_args_list[1][0] == (
+            "_kombu.binding.my_exchange",
+            {member: float("inf")},
+        )
+        assert channel._bindings == {"my_queue": {("my_exchange", member)}}
+
+    def test_get_table_reads_a_legacy_binding_set(self, global_keyprefix: str) -> None:
+        """Test that a binding table still stored as a set stays readable."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+
+        mock_client = MagicMock()
+        mock_pipe = _stub_binding_table(mock_client, [])
+        mock_pipe.execute.side_effect = _client_exceptions.ResponseError(
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        )
+        mock_client.smembers.return_value = {b"my_key\x06\x16\x06\x16my_queue"}
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        assert channel.get_table("my_exchange") == [("my_key", "", "my_queue")]
+        mock_client.smembers.assert_called_once_with("_kombu.binding.my_exchange")
 
 
 def _make_restore_qos(channel: MagicMock, call_order: list[str]) -> QoS:
@@ -2298,6 +2464,52 @@ class TestMultiChannelPoller:
 
         channel._poll_error.assert_called_once_with("BZMPOP")
         assert result is None
+
+    def test_drain_refreshes_expires_without_a_loop(self) -> None:
+        """A connection with no hub refreshes off the drain path instead."""
+        poller = MultiChannelPoller()
+        poller.maybe_refresh_queue_expires = MagicMock()  # type: ignore[method-assign]
+        channel = MagicMock()
+        channel._expires = {"celery": 60_000}
+        poller._channels = {channel}  # type: ignore[assignment]
+
+        poller.maybe_refresh_queue_expires_without_loop()
+        # 10s in, well short of the 60s / 2 interval
+        poller._last_expires_refresh = time.time() - 10
+        poller.maybe_refresh_queue_expires_without_loop()
+
+        poller.maybe_refresh_queue_expires.assert_called_once()  # type: ignore[attr-defined]
+
+        # Past the interval it runs again
+        poller._last_expires_refresh = time.time() - 31
+        poller.maybe_refresh_queue_expires_without_loop()
+
+        assert poller.maybe_refresh_queue_expires.call_count == 2  # type: ignore[attr-defined]
+
+    def test_drain_does_not_refresh_expires_when_a_loop_owns_it(self) -> None:
+        """With a hub the timer refreshes, so the drain path stays out of it."""
+        poller = MultiChannelPoller()
+        poller.maybe_refresh_queue_expires = MagicMock()  # type: ignore[method-assign]
+        poller._loop = MagicMock()
+        channel = MagicMock()
+        channel._expires = {"celery": 60_000}
+        poller._channels = {channel}  # type: ignore[assignment]
+
+        poller.maybe_refresh_queue_expires_without_loop()
+
+        poller.maybe_refresh_queue_expires.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_drain_does_not_refresh_expires_without_ttls(self) -> None:
+        """Nothing to refresh when no queue has an x-expires."""
+        poller = MultiChannelPoller()
+        poller.maybe_refresh_queue_expires = MagicMock()  # type: ignore[method-assign]
+        channel = MagicMock()
+        channel._expires = {}
+        poller._channels = {channel}  # type: ignore[assignment]
+
+        poller.maybe_refresh_queue_expires_without_loop()
+
+        poller.maybe_refresh_queue_expires.assert_not_called()  # type: ignore[attr-defined]
 
 
 @pytest.mark.unit
@@ -3338,6 +3550,77 @@ class TestQueueOperations:
         # Cleanup
         redis_client.delete(f"{global_keyprefix}_kombu.binding.test_exchange")
 
+    def test_lookup_drops_an_abandoned_binding(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """A binding nobody refreshes anymore is pruned by the next lookup."""
+        bindings_key = f"{global_keyprefix}_kombu.binding.test_abandoned"
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.exchange_declare(exchange="test_abandoned", type="direct")
+            channel._queue_bind(
+                exchange="test_abandoned",
+                routing_key="live_key",
+                pattern="",
+                queue="live_queue",
+            )
+            # Left behind by a process that is gone: nothing rescores it, so its
+            # deadline has aged past now
+            abandoned = channel.sep.join(["gone_key", "", "gone_queue"])
+            redis_client.zadd(bindings_key, {abandoned: time.time() - 1})
+            assert redis_client.zcard(bindings_key) == 2
+
+            assert set(channel._lookup("test_abandoned", "live_key")) == {"live_queue"}
+
+            # Dropped from Redis, not just filtered out of the read
+            live = channel.sep.join(["live_key", "", "live_queue"])
+            assert redis_client.zrange(bindings_key, 0, -1) == [live.encode()]
+
+            # With only the abandoned binding left the table reads empty, and a
+            # direct publish raises instead of silently going nowhere
+            channel._delete("live_queue", "test_abandoned", "live_key", "")
+            redis_client.zadd(bindings_key, {abandoned: time.time() - 1})
+            with pytest.raises(InconsistencyError):
+                channel._lookup("test_abandoned", "gone_key")
+
+        redis_client.delete(bindings_key)
+
+    def test_queue_bind_converts_a_legacy_binding_set(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """A binding table left behind as a plain set is converted in place."""
+        bindings_key = f"{global_keyprefix}_kombu.binding.test_legacy"
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            inherited = channel.sep.join(["old_key", "", "old_queue"])
+            redis_client.sadd(bindings_key, inherited)
+
+            channel._queue_bind(
+                exchange="test_legacy",
+                routing_key="new_key",
+                pattern="",
+                queue="new_queue",
+            )
+
+            # zcard would raise WRONGTYPE if the key were still a set
+            assert redis_client.zcard(bindings_key) == 2
+            scores = dict(redis_client.zrange(bindings_key, 0, -1, withscores=True))
+            # This transport did not write the inherited member, so nothing knows
+            # when it goes stale and it is kept until an explicit unbind
+            assert scores[inherited.encode()] == float("inf")
+            assert sorted(channel.get_table("test_legacy")) == [
+                ("new_key", "", "new_queue"),
+                ("old_key", "", "old_queue"),
+            ]
+
+        redis_client.delete(bindings_key)
+
 
 @pytest.mark.integration
 class TestChannelConnection:
@@ -3428,10 +3711,12 @@ class TestFanoutMessaging:
             # Bind and declare
             fanout_queue.bind(channel).declare()  # type: ignore[attr-defined]
 
-            # The binding should be stored
+            # The binding should be stored, scored +inf because the queue has no
+            # x-expires and so its route never goes stale
             bindings_key = f"{global_keyprefix}_kombu.binding.test_fanout_decl"
-            bindings = redis_client.smembers(bindings_key)
+            bindings = redis_client.zrange(bindings_key, 0, -1, withscores=True)
             assert len(bindings) >= 1
+            assert all(score == float("inf") for _, score in bindings)
 
             # Cleanup
             redis_client.delete(bindings_key)

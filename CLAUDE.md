@@ -70,6 +70,8 @@ broker_transport = "celery_redis_plus.transport:Transport"
 - `DEFAULT_REQUEUE_CHECK_INTERVAL`: `60` - interval for checking messages to requeue
 - `DEFAULT_REQUEUE_BATCH_LIMIT`: `1000` - max messages processed per requeue cycle
 - `DEFAULT_DELIVERY_LIMIT`: `20` - max times a message may be delivered before being dropped (None = no limit)
+- `MIN_QUEUE_EXPIRES`: `10_000` - floor under `x-expires`, in milliseconds
+- `MIN_BINDING_LIFETIME`: `300` - floor under how long a binding survives without a refresh, in seconds
 
 ### Redis Keys
 
@@ -85,7 +87,13 @@ Messages track how many times they've been redelivered. The `delivery_count` fie
 - `x-delivery-count` header: injected into consumed messages when `delivery_count > 0`
 - `delivery_info["redelivered"]`: set to `True` on the same condition. This is where kombu's Redis transport puts it and the only place celery looks, in `Request` and `trace`, for `worker_deduplicate_successful_tasks`. There is no `redelivered` hash field; both flags are derived from the counter at consume time
 - `/{db}.{exchange}`: Redis Stream for fanout messages
-- `_kombu.binding.{exchange}`: Set storing queue-exchange bindings
+- `_kombu.binding.{exchange}`: Sorted set storing queue-exchange bindings, scored with the unix time each binding goes stale
+
+### Binding Lifetime
+
+A binding is scored `x-expires` (in seconds, floored at `MIN_BINDING_LIFETIME`) past its last refresh, or `+inf` when its queue has no `x-expires`. `_queue_bind`, `_refresh_queue_expires` and `_put` all rescore; `get_table` runs `ZREMRANGEBYSCORE ... -inf now` ahead of its read, so cleanup rides the read path. `Channel._bindings` maps each queue to its `(exchange, member)` pairs so the refresh knows what to rescore, and is shared across a connection's channels like `_expires` is.
+
+kombu's own Redis transport writes this key as a plain set. `_queue_bind` converts one in place via `transport_convert_bindings.lua` (inherited members get `+inf`) and retries; `_delete` and `get_table` fall back to `SREM`/`SMEMBERS` on `WRONGTYPE` rather than converting.
 
 ## Testing
 

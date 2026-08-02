@@ -44,11 +44,20 @@ Transport Options
   first delivery plus two redeliveries. A redelivery is a visibility timeout restore or a
   reject-with-requeue, the same two paths RabbitMQ counts. Consumed messages carry the
   count in the ``x-delivery-count`` header once it is above zero.
-* ``sep``: Separator used inside ``_kombu.binding.{exchange}`` set members
-  (default: ``"\\x06\\x16"``, same as kombu's Redis transport). The binding sets are the one
-  piece of broker state this transport shares byte-for-byte with kombu's Redis transport, so
-  a deployment migrating from it must carry over whatever ``sep`` it configured there.
-  A mismatch breaks routing in both directions -- see the migration guide.
+* ``sep``: Separator used inside ``_kombu.binding.{exchange}`` members
+  (default: ``"\\x06\\x16"``, same as kombu's Redis transport). Members are packed exactly
+  as kombu's Redis transport packs them, so a deployment migrating from it must carry over
+  whatever ``sep`` it configured there or the members it left behind match no routing key
+  -- see the migration guide. The key itself is a sorted set here rather than a set, so the
+  two transports can no longer share it; the first bind converts an inherited set in place.
+
+Binding lifetime
+================
+``_kombu.binding.{exchange}`` is a sorted set scored with the unix time each binding goes
+stale, which is ``x-expires`` after its last refresh (at least ``MIN_BINDING_LIFETIME``).
+A queue without ``x-expires`` is scored ``+inf`` and its binding only ever goes away on an
+explicit unbind. Declaring, refreshing and publishing all rescore; ``get_table`` drops
+whatever has aged out, so cleanup rides the read path and nothing has to sweep.
 """
 
 from __future__ import annotations
@@ -100,6 +109,7 @@ from .constants import (
     MAX_PRIORITY,
     MESSAGE_KEY_PREFIX,
     MESSAGES_INDEX_PREFIX,
+    MIN_BINDING_LIFETIME,
     MIN_PRIORITY,
     MIN_QUEUE_EXPIRES,
     PRIORITY_SCORE_MULTIPLIER,
@@ -167,10 +177,17 @@ _ENQUEUE_DUE_MESSAGES_LUA = (_PACKAGE_DIR / "transport_enqueue_due_messages.lua"
 _REQUEUE_MESSAGE_LUA = (_PACKAGE_DIR / "transport_requeue_message.lua").read_text()
 _CONSUME_MESSAGE_LUA = (_PACKAGE_DIR / "transport_consume_message.lua").read_text()
 _ACK_MESSAGE_LUA = (_PACKAGE_DIR / "transport_ack_message.lua").read_text()
+_CONVERT_BINDINGS_LUA = (_PACKAGE_DIR / "transport_convert_bindings.lua").read_text()
 
 
 _warned_priority_clamp = False
 _warned_polling_interval = False
+
+
+def _is_wrongtype(exc: Exception) -> bool:
+    """Whether the server rejected a command because the key holds another type."""
+    return str(exc).startswith("WRONGTYPE")
+
 
 # Per-app worker references.  WeakKeyDictionary so entries auto-clean
 # when the Celery app is garbage-collected (no manual cleanup needed on crash).
@@ -281,6 +298,7 @@ class GlobalKeyPrefixMixin:
         "ZRANGE",
         "ZRANGEBYSCORE",
         "ZREM",
+        "ZREMRANGEBYSCORE",
         "ZREVRANGEBYSCORE",
         "ZSCORE",
         "XADD",
@@ -581,6 +599,7 @@ class MultiChannelPoller:
         self._loop: Any = None
         self._expires_timer_entry: Any = None
         self._expires_timer_interval: float | None = None
+        self._last_expires_refresh: float = 0.0
 
     def close(self) -> None:
         for fd in self._chan_to_sock.values():
@@ -684,26 +703,51 @@ class MultiChannelPoller:
             if channel._refresh_queue_expires():
                 return
 
-    def _update_expires_timer(self) -> None:
-        """Register or update the periodic PEXPIRE timer based on configured TTLs.
+    def _expires_refresh_interval(self) -> float | None:
+        """Seconds between refreshes, or None when no queue has an x-expires.
 
-        Interval = min(all configured x-expires) / 2, so the TTL is refreshed
-        ~2 times before it would expire.
+        Half the shortest configured TTL, so it is refreshed ~2 times before it
+        would expire.
         """
         min_ttl_ms: int | None = None
         for channel in self._channels:
             for ttl_ms in channel._expires.values():
                 if min_ttl_ms is None or ttl_ms < min_ttl_ms:
                     min_ttl_ms = ttl_ms
-
         if min_ttl_ms is None:
+            return None
+        return min_ttl_ms / 2 / 1000  # ms → seconds, divided by 2
+
+    def maybe_refresh_queue_expires_without_loop(self) -> None:
+        """Refresh from the drain path on a connection that has no event loop.
+
+        The timer below only exists inside a worker's hub. A celery control
+        client waiting for replies, a Flower event receiver and a gevent
+        worker's synloop all drain events instead, and without this their
+        queues and bindings age out from under them while they are still
+        being used.
+        """
+        if self._loop is not None:
+            return
+        interval = self._expires_refresh_interval()
+        if interval is None:
+            return
+        now = time()
+        if now - self._last_expires_refresh < interval:
+            return
+        self._last_expires_refresh = now
+        self.maybe_refresh_queue_expires()
+
+    def _update_expires_timer(self) -> None:
+        """Register or update the periodic PEXPIRE timer based on configured TTLs."""
+        interval = self._expires_refresh_interval()
+
+        if interval is None:
             if self._expires_timer_entry is not None:
                 self._expires_timer_entry.cancel()
                 self._expires_timer_entry = None
                 self._expires_timer_interval = None
             return
-
-        interval = min_ttl_ms / 2 / 1000  # ms → seconds, divided by 2
 
         if self._expires_timer_interval == interval:
             return
@@ -734,6 +778,7 @@ class MultiChannelPoller:
         return None
 
     def get(self, callback: Any, timeout: float | None = None) -> None:
+        self.maybe_refresh_queue_expires_without_loop()
         self._in_protected_read = True
         try:
             for channel in self._channels:
@@ -868,6 +913,10 @@ class Channel(virtual.Channel):
         # channel of that connection may be the one publishing to it.
         self._expires: dict[str, int] = self.connection._expires  # queue_name → TTL in ms
         self._message_ttls: dict[str, int] = self.connection._message_ttls  # queue_name → message TTL in ms
+        # queue_name → {(exchange, member)} for every binding declared on this
+        # connection, so the refresh knows which members are still ours to keep
+        # alive.  Shared for the same reason as the two registries above.
+        self._bindings: dict[str, set[tuple[str, str]]] = self.connection._bindings
         # FAST/SLOW consume mode: FAST uses atomic Lua ZPOPMIN, SLOW uses blocking BZMPOP
         self._consume_fast_mode: bool = True
         self._consume_script_sha: str | None = None
@@ -1512,6 +1561,12 @@ class Channel(virtual.Channel):
                 ttl_ms = self._expires[queue]
                 pipe.pexpire(self._queue_key(queue), ttl_ms)
                 pipe.pexpire(self._messages_index_key(queue), ttl_ms)
+                # A producer has no event loop and so never runs the periodic
+                # refresh. Publishing already keeps the queue alive; the route
+                # to it has to stay alive with it.
+                stale_at = self._binding_stale_at(queue, now=now)
+                for exchange, member in self._bindings.get(queue, ()):
+                    pipe.zadd(self._binding_key(exchange), {member: stale_at})
             pipe.execute()
 
     def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
@@ -1553,14 +1608,54 @@ class Channel(virtual.Channel):
         if x_message_ttl is not None and queue not in self._message_ttls:
             self._message_ttls[queue] = int(x_message_ttl)
 
+    def _binding_key(self, exchange: str) -> str:
+        return self.keyprefix_queue % (exchange,)
+
+    def _binding_member(self, routing_key: str, pattern: str, queue: str) -> str:
+        return self.sep.join([routing_key or "", pattern or "", queue or ""])
+
+    def _binding_stale_at(self, queue: str, now: float | None = None) -> float:
+        """Unix time the bindings of this queue go stale.
+
+        Only a queue that expires can leave a binding behind that nobody wants:
+        one that stays around has to keep its route, so it is scored +inf and
+        goes away on an explicit unbind or not at all.
+
+        The window never drops below MIN_BINDING_LIFETIME, because the processes
+        that abandon bindings are the ones that cannot refresh them. A celery
+        control client has no event loop, and the 10s x-expires on its reply
+        queue is shorter than the control call the binding has to outlive.
+        """
+        expires_ms = self._expires.get(queue)
+        if expires_ms is None:
+            return float("inf")
+        return (time() if now is None else now) + max(expires_ms / 1000, MIN_BINDING_LIFETIME)
+
+    def _convert_binding_set(self, client: Any, exchange: str) -> None:
+        """Turn a binding table left behind as a plain set into a sorted set."""
+        script = client.register_script(_CONVERT_BINDINGS_LUA)
+        # EVALSHA doesn't auto-prefix, so the key goes in already prefixed
+        converted = script(keys=[f"{self.global_keyprefix}{self._binding_key(exchange)}"])
+        logger.info(
+            "Converted the binding table of exchange %r from a set to a sorted set, "
+            "carrying over %s member(s) with no staleness deadline",
+            exchange,
+            converted,
+        )
+
     def _queue_bind(self, exchange: str, routing_key: str, pattern: str, queue: str) -> None:
         if self.typeof(exchange).type == "fanout":
             self._fanout_queues[queue] = (exchange, routing_key.replace("#", "*"))
+        member = self._binding_member(routing_key, pattern, queue)
+        self._bindings.setdefault(queue, set()).add((exchange, member))
         with self.conn_or_acquire() as client:
-            client.sadd(
-                self.keyprefix_queue % (exchange,),
-                self.sep.join([routing_key or "", pattern or "", queue or ""]),
-            )
+            try:
+                client.zadd(self._binding_key(exchange), {member: self._binding_stale_at(queue)})
+            except _client_exceptions.ResponseError as exc:
+                if not _is_wrongtype(exc):
+                    raise
+                self._convert_binding_set(client, exchange)
+                client.zadd(self._binding_key(exchange), {member: self._binding_stale_at(queue)})
 
     def _delete(self, queue: str, *args: Any, **kwargs: Any) -> None:
         # kombu calls: _delete(queue, exchange, routing_key, pattern)
@@ -1571,11 +1666,21 @@ class Channel(virtual.Channel):
         had_expires = queue in self._expires
         self._expires.pop(queue, None)
         self._message_ttls.pop(queue, None)
+        member = self._binding_member(routing_key, pattern, queue)
+        declared = self._bindings.get(queue)
+        if declared is not None:
+            declared.discard((exchange, member))
+            if not declared:
+                del self._bindings[queue]
         with self.conn_or_acquire(client=kwargs.get("client")) as client:
-            client.srem(
-                self.keyprefix_queue % (exchange,),
-                self.sep.join([routing_key or "", pattern or "", queue or ""]),
-            )
+            try:
+                client.zrem(self._binding_key(exchange), member)
+            except _client_exceptions.ResponseError as exc:
+                if not _is_wrongtype(exc):
+                    raise
+                # Table still a plain set from an older deployment. Unbinding is
+                # no reason to convert it, so just remove the member in place.
+                client.srem(self._binding_key(exchange), member)
             # Collect delivery tags from queue and index to clean up message hashes
             queue_key = self._queue_key(queue)
             index_key = self._messages_index_key(queue)
@@ -1590,7 +1695,11 @@ class Channel(virtual.Channel):
             self.connection.cycle._update_expires_timer()
 
     def _refresh_queue_expires(self) -> bool:
-        """Refresh PEXPIRE on queue and index keys for queues with x-expires.
+        """Refresh queue and index keys, and the bindings, for queues with x-expires.
+
+        A binding lives exactly as long as some channel keeps rescoring it. The
+        rescore also re-adds a member another process pruned while this one was
+        stalled, so a queue that is still declared here keeps its route.
 
         Returns whether the refresh is done, so the caller can fall back to
         another channel when this one's connection is broken.
@@ -1599,9 +1708,13 @@ class Channel(virtual.Channel):
             return True
         try:
             with self.conn_or_acquire() as client, client.pipeline() as pipe:
+                now = time()
                 for queue, ttl_ms in self._expires.items():
                     pipe.pexpire(self._queue_key(queue), ttl_ms)
                     pipe.pexpire(self._messages_index_key(queue), ttl_ms)
+                    stale_at = self._binding_stale_at(queue, now=now)
+                    for exchange, member in self._bindings.get(queue, ()):
+                        pipe.zadd(self._binding_key(exchange), {member: stale_at})
                 pipe.execute()
         except Exception:
             logger.warning("Failed to refresh queue expires, will retry next cycle", exc_info=True)
@@ -1623,14 +1736,20 @@ class Channel(virtual.Channel):
 
         The reasoning holds for topic and fanout. It does not hold for direct,
         where the binding is known to exist, and it especially does not hold once
-        binding keys carry a TTL, which this transport does via x-expires, because
-        then an empty table also means the binding aged out.
+        bindings carry a staleness deadline, which they do here, because then an
+        empty table also means the binding aged out.
 
         InconsistencyError is in this transport's connection_errors, so kombu's
         Connection.ensure reconnects, clears declared_entities, redeclares (which
-        recreates the binding via SADD) and retries. If it fails again the caller
-        gets an OperationalError. Mailbox._publish_reply already catches
-        InconsistencyError, so pidbox is exempt for free.
+        recreates the binding via ZADD) and retries. If it fails again the caller
+        gets an OperationalError. That is also what a worker replying to a client
+        that is already gone gets: Mailbox._publish_reply does catch
+        InconsistencyError, but it publishes with retry=True, so Connection.ensure
+        converts the second raise into an OperationalError that the catch misses,
+        and the worker logs it and resets its pidbox channel. That predates the
+        staleness deadline -- a client that cleans up after itself empties the
+        reply table on its way out -- but the deadline makes it reachable for a
+        client that did not.
 
         Raised here rather than in get_table like pre-5.2 kombu did, because
         exchange_delete, queue_unbind and list_bindings also call get_table and
@@ -1640,18 +1759,43 @@ class Channel(virtual.Channel):
         # get_table runs a second time only on the miss path, to tell "no bindings
         # at all" apart from "bindings exist but none match this routing key".
         if not queues and self.typeof(exchange).type == "direct" and not self.get_table(exchange):
-            key = self.keyprefix_queue % (exchange,)
+            key = self._binding_key(exchange)
             msg = (
                 f"Cannot route message for direct exchange {exchange!r}: binding table is empty. "
-                f"Probably the key {key!r} has been removed from the Redis database."
+                f"Probably the key {key!r} has been removed from the Redis database, "
+                f"or every binding in it went stale."
             )
             raise InconsistencyError(msg)
         return queues
 
+    def _read_bindings(self, client: Any, exchange: str) -> Any:
+        """Read the live bindings of an exchange, dropping the ones that aged out.
+
+        Pruning rides the read path because nothing else can reach these members:
+        a binding is only ever unbound by the process that declared it, and the
+        ones that pile up are precisely the ones whose process is gone. The
+        removal costs no extra round trip, and in steady state it removes
+        nothing, so Redis has nothing to propagate.
+        """
+        key = self._binding_key(exchange)
+        try:
+            # Not a transaction: this runs on the publish path, and a bind landing
+            # between the two commands is indistinguishable from one landing just
+            # after the read.
+            with client.pipeline(transaction=False) as pipe:
+                pipe.zremrangebyscore(key, "-inf", time())
+                pipe.zrange(key, 0, -1)
+                return pipe.execute()[1]
+        except _client_exceptions.ResponseError as exc:
+            if not _is_wrongtype(exc):
+                raise
+            # Table still a plain set from an older deployment or from kombu's
+            # own Redis transport. Readable as it is; the next bind converts it.
+            return client.smembers(key)
+
     def get_table(self, exchange: str) -> list[tuple[str, str, str]]:
-        key = self.keyprefix_queue % exchange
         with self.conn_or_acquire() as client:
-            values = client.smembers(key)
+            values = self._read_bindings(client, exchange)
             if not values:
                 return []
             result: list[tuple[str, str, str]] = []
@@ -1988,6 +2132,7 @@ class Transport(virtual.Transport):
 
         self.cycle = MultiChannelPoller()
         # Shared by every channel of this connection, see Channel.__init__
+        self._bindings: dict[str, set[tuple[str, str]]] = {}
         self._expires: dict[str, int] = {}
         self._message_ttls: dict[str, int] = {}
 

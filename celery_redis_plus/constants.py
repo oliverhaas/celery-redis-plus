@@ -53,3 +53,10 @@ DEFAULT_DELIVERY_LIMIT: int | None = 20
 # Minimum allowed x-expires value in milliseconds (10 seconds)
 # Celery's control/reply queues use 10s by default
 MIN_QUEUE_EXPIRES = 10_000
+
+# Floor under how long a binding survives without a refresh, in seconds.
+# A binding is scored with its queue's x-expires window, but the processes that
+# leave bindings behind are the ones that cannot refresh them: a celery control
+# client has no event loop, and x-expires on its reply queue is 10s, which is
+# shorter than the control call the binding has to outlive.
+MIN_BINDING_LIFETIME = 300

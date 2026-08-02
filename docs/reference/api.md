@@ -168,7 +168,7 @@ The transport uses the following Redis key patterns:
 | `message:{delivery_tag}` | Hash | Message payload, routing key, priority, and flags |
 | `messages_index:{name}` | Sorted Set | Per-queue index tracking `{delivery_tag: queue_at}` for visibility timeout and delayed delivery |
 | `/{db}.{exchange}` | Stream | Fanout messages |
-| `_kombu.binding.{exchange}` | Set | Queue-exchange bindings |
+| `_kombu.binding.{exchange}` | Sorted Set | Queue-exchange bindings, scored with the unix time each binding goes stale (`+inf` for a queue without `x-expires`) |
 
 ## Constants
 
@@ -185,3 +185,5 @@ The following constants are used internally and define default behavior:
 | `QUEUE_KEY_PREFIX` | `"queue:"` | Prefix for queue sorted sets |
 | `MESSAGE_KEY_PREFIX` | `"message:"` | Prefix for message hashes |
 | `MESSAGES_INDEX_PREFIX` | `"messages_index:"` | Prefix for per-queue message index sorted sets |
+| `MIN_QUEUE_EXPIRES` | `10000` | Floor under `x-expires`, in milliseconds |
+| `MIN_BINDING_LIFETIME` | `300` | Floor under how long a binding survives without a refresh, in seconds |
