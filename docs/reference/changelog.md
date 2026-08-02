@@ -7,12 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING**: the involuntary-redelivery cap now follows RabbitMQ quorum queues. The `max_restore_count` transport option is now `delivery_limit`, the `restore_count` message hash field is now `delivery_count`, and the `x-restore-count` header is now `x-delivery-count`. The default changed from no limit to `20`, which is what RabbitMQ quorum queues have applied since 4.0, and the counter now counts delivery attempts rather than redeliveries, so a message is dropped on its 20th delivery. Set `delivery_limit: None` in `broker_transport_options` to keep the old unlimited behaviour. A message published by an older version has no `delivery_count` field, which reads as `0`, so it simply starts over
+
 ### Documentation & Diagnostics
 - Documented the `sep` transport option, which was accepted but never listed. A deployment migrating from the standard Redis transport has to carry over whatever `sep` it configured there, because `_kombu.binding.{exchange}` is the one piece of broker state shared byte-for-byte between the two transports
 - Added a "Carry over a custom `sep`" section to the migration guide covering both failure modes of a mismatch: kombu raising `ValueError: not enough values to unpack (expected 3, got 1)` on every publish, and this transport padding the member to `(member, "", "")` so routing silently matches nothing
 - `get_table` now logs a warning (once per process) naming the exchange and the offending member when a binding does not split into three parts. Padding behaviour is unchanged, so nothing starts raising
 
 ### Fixed
+- Publishing to a direct exchange whose binding table is empty now raises `InconsistencyError` instead of discarding the message. kombu made the empty table a silent no-op in 5.2 (PR #1404), which is right for topic and fanout but not for direct, where the binding is known to exist and, with `x-expires`, may simply have aged out. `InconsistencyError` is in `connection_errors`, so kombu redeclares the binding and retries. The visible symptom was pidbox replies vanishing after a control queue expired
+- Acking a message now removes it from `queue:{name}` as well as from `messages_index:{name}`. A message whose visibility timeout had already restored it left the restored copy behind, so it was delivered again after being acked
+- A consumed message always gets a visibility deadline. Both consume paths refreshed the index entry with `ZADD ... XX`, which is a no-op when the entry is gone, so such a message was never recovered if its worker died
+- A queue backlog is no longer counted as a redelivery. `enqueue_due_messages` gates the counter on the `ZADD NX` result, so a message still sitting in its queue past its deadline is re-dated but neither counted nor dropped. Without this, a queue slower than `visibility_timeout` would have eaten its own backlog once `delivery_limit` gained a default
+- `delivery_info["redelivered"]` and the `x-delivery-count` header are now derived from the delivery counter at consume time. `redelivered` used to be a hash field that was written but never read, so Celery's `worker_deduplicate_successful_tasks` never saw a redelivery
+- The queue expires refresh timer now starts for queues declared before the event loop existed. `register_with_event_loop` never called `_update_expires_timer` after attaching the loop, so a worker that declared all its queues at startup refreshed none of their TTLs and its queues expired underneath it
 - `QoS.restore_unacked_once` no longer shuts the worker thread pool down on broker reconnects. kombu calls it from `Channel.close()`, which also runs when the consumer reconnects, so every broker blip permanently disabled the pool (later `submit()` calls raised `RuntimeError` while the worker kept answering `inspect ping`). It is now gated on the worker blueprint having entered `CLOSE`/`TERMINATE`
 - Reconnects no longer requeue messages whose tasks are still running. Those messages stay in `messages_index` and are redelivered on their visibility deadline instead
 - Worker lookup no longer relies on `channel.connection.client.app`, which never resolves (kombu's `Connection` has no `app` attribute) and made the lookup raise `AttributeError` on every call

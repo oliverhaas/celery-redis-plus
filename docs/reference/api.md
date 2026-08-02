@@ -39,8 +39,27 @@ All options are passed via Celery's `broker_transport_options` configuration.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `visibility_timeout` | `int` | `300` | Seconds before unacked messages are reclaimed |
+| `delivery_limit` | `int` or `None` | `20` | Delivery attempts before a message is dropped (`None` = no limit) |
 | `global_keyprefix` | `str` | `""` | Prefix for all Redis keys |
 | `stream_maxlen` | `int` | `10000` | Max messages per fanout stream (approximate) |
+
+!!! note "How `delivery_limit` counts"
+
+    The counter follows RabbitMQ quorum queues: it counts delivery attempts,
+    not redeliveries, so a message is dropped on its 20th delivery rather than
+    after 20 redeliveries. Both involuntary redeliveries (the visibility
+    timeout expiring) and voluntary ones (`reject(requeue=True)`, a worker
+    handing messages back on shutdown) increment it. A message that is still
+    sitting in its queue because no worker has got to it yet is a backlog, not
+    a redelivery, and does not count.
+
+    Consumed messages carry the current count in the `x-delivery-count` header
+    and have `delivery_info["redelivered"]` set once it is above zero, which is
+    what Celery's `worker_deduplicate_successful_tasks` reads.
+
+    Dropped messages are deleted outright. There is no dead-letter queue yet,
+    so set `delivery_limit: None` if you would rather have a poison message
+    redeliver forever than disappear.
 
 !!! note "Sizing `visibility_timeout`"
 
