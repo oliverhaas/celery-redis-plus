@@ -1589,6 +1589,42 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             return bool(client.exists(self._queue_key(queue)))
 
+    def _lookup(self, exchange: str, routing_key: str, default: str | None = None) -> list[str] | set[str]:
+        """Find queues bound to an exchange, raising rather than dropping for direct.
+
+        kombu returns an empty list when an exchange's binding table is empty and
+        the publish is silently discarded. That was a deliberate change in kombu
+        5.2 (PR #1404, closing #1063), replacing an InconsistencyError, because an
+        empty table is the normal AMQP state for an exchange whose queues were all
+        unbound.
+
+        The reasoning holds for topic and fanout. It does not hold for direct,
+        where the binding is known to exist, and it especially does not hold once
+        binding keys carry a TTL, which this transport does via x-expires, because
+        then an empty table also means the binding aged out.
+
+        InconsistencyError is in this transport's connection_errors, so kombu's
+        Connection.ensure reconnects, clears declared_entities, redeclares (which
+        recreates the binding via SADD) and retries. If it fails again the caller
+        gets an OperationalError. Mailbox._publish_reply already catches
+        InconsistencyError, so pidbox is exempt for free.
+
+        Raised here rather than in get_table like pre-5.2 kombu did, because
+        exchange_delete, queue_unbind and list_bindings also call get_table and
+        would then throw during teardown.
+        """
+        queues = super()._lookup(exchange, routing_key, default)
+        # get_table runs a second time only on the miss path, to tell "no bindings
+        # at all" apart from "bindings exist but none match this routing key".
+        if not queues and self.typeof(exchange).type == "direct" and not self.get_table(exchange):
+            key = self.keyprefix_queue % (exchange,)
+            msg = (
+                f"Cannot route message for direct exchange {exchange!r}: binding table is empty. "
+                f"Probably the key {key!r} has been removed from the Redis database."
+            )
+            raise InconsistencyError(msg)
+        return queues
+
     def get_table(self, exchange: str) -> list[tuple[str, str, str]]:
         key = self.keyprefix_queue % exchange
         with self.conn_or_acquire() as client:

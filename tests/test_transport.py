@@ -18,7 +18,8 @@ from celery.bootsteps import (
     TERMINATE,  # type: ignore[attr-defined]  # ty: ignore[unresolved-import]
 )
 from kombu import Exchange, Queue
-from kombu.exceptions import OperationalError
+from kombu.exceptions import InconsistencyError, OperationalError
+from kombu.transport import virtual
 from kombu.utils.eventio import ERR
 from kombu.utils.json import dumps as json_dumps
 
@@ -739,6 +740,47 @@ class TestChannel:
         channel = object.__new__(Channel)
         with pytest.raises(ValueError, match="Database is int"):
             channel._prepare_virtual_host("invalid")
+
+    def test_publish_to_an_exchange_without_bindings_raises(self) -> None:
+        """Test that a direct exchange with an empty binding table raises, not drops."""
+        channel = object.__new__(Channel)
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+        channel.typeof = MagicMock(return_value=virtual.exchange.DirectExchange(channel))
+        channel.deadletter_queue = None
+
+        mock_client = MagicMock()
+        mock_client.smembers.return_value = set()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with pytest.raises(InconsistencyError, match="binding table is empty"):
+            channel._lookup("reply.celery.pidbox", "some-ticket-uuid")
+
+        # InconsistencyError is in connection_errors, so kombu's ensure reconnects,
+        # redeclares the binding and retries instead of surfacing it directly.
+        assert InconsistencyError in Transport.connection_errors
+
+    def test_lookup_topic_exchange_without_bindings_still_discards(self) -> None:
+        """Test that only direct exchanges raise: celeryev must not block publishers."""
+        channel = object.__new__(Channel)
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+        channel.typeof = MagicMock(return_value=virtual.exchange.TopicExchange(channel))
+        channel.deadletter_queue = None
+
+        mock_client = MagicMock()
+        mock_client.smembers.return_value = set()
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        # Raising on celeryev would make every worker buffer every task event
+        # for as long as Flower is down.
+        assert not channel._lookup("celeryev", "task.succeeded")
 
     def test_get_table_empty_exchange(self) -> None:
         """Test get_table returns empty list for exchange with no bindings."""
