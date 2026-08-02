@@ -667,9 +667,15 @@ class MultiChannelPoller:
                 cast("QoS", qos).maybe_update_messages_index()
 
     def maybe_refresh_queue_expires(self) -> None:
-        """Refresh PEXPIRE on queue keys with x-expires TTL."""
+        """Refresh PEXPIRE on queue keys with x-expires TTL.
+
+        Every channel here belongs to one connection, so they share one expires
+        registry and one server. The first channel that gets the refresh
+        through does it for all of them; the rest are only tried if it fails.
+        """
         for channel in self._channels:
-            channel._refresh_queue_expires()
+            if channel._refresh_queue_expires():
+                return
 
     def _update_expires_timer(self) -> None:
         """Register or update the periodic PEXPIRE timer based on configured TTLs.
@@ -848,9 +854,13 @@ class Channel(virtual.Channel):
         self.handlers = {"BZMPOP": self._bzmpop_read, "XREAD": self._xread_read}
         # Track last-read stream ID per stream for fanout (start with $ = only new messages)
         self._stream_offsets: dict[str, str] = {}
-        # Per-queue TTL state from x-expires and x-message-ttl queue arguments
-        self._expires: dict[str, int] = {}  # queue_name → TTL in ms
-        self._message_ttls: dict[str, int] = {}  # queue_name → message TTL in ms
+        # Per-queue TTL state from x-expires and x-message-ttl queue arguments.
+        # Aliases of the transport-wide registries, not copies: kombu caches
+        # declarations per connection (Connection.declared_entities), so only
+        # the first channel to declare a queue sees its arguments, while any
+        # channel of that connection may be the one publishing to it.
+        self._expires: dict[str, int] = self.connection._expires  # queue_name → TTL in ms
+        self._message_ttls: dict[str, int] = self.connection._message_ttls  # queue_name → message TTL in ms
         # FAST/SLOW consume mode: FAST uses atomic Lua ZPOPMIN, SLOW uses blocking BZMPOP
         self._consume_fast_mode: bool = True
         self._consume_script_sha: str | None = None
@@ -1572,10 +1582,14 @@ class Channel(virtual.Channel):
         if had_expires:
             self.connection.cycle._update_expires_timer()
 
-    def _refresh_queue_expires(self) -> None:
-        """Refresh PEXPIRE on queue and index keys for queues with x-expires."""
+    def _refresh_queue_expires(self) -> bool:
+        """Refresh PEXPIRE on queue and index keys for queues with x-expires.
+
+        Returns whether the refresh is done, so the caller can fall back to
+        another channel when this one's connection is broken.
+        """
         if not self._expires:
-            return
+            return True
         try:
             with self.conn_or_acquire() as client, client.pipeline() as pipe:
                 for queue, ttl_ms in self._expires.items():
@@ -1584,6 +1598,8 @@ class Channel(virtual.Channel):
                 pipe.execute()
         except Exception:
             logger.warning("Failed to refresh queue expires, will retry next cycle", exc_info=True)
+            return False
+        return True
 
     def _has_queue(self, queue: str, **kwargs: Any) -> bool:
         with self.conn_or_acquire() as client:
@@ -1937,6 +1953,9 @@ class Transport(virtual.Transport):
         from . import signals as _signals  # noqa: F401
 
         self.cycle = MultiChannelPoller()
+        # Shared by every channel of this connection, see Channel.__init__
+        self._expires: dict[str, int] = {}
+        self._message_ttls: dict[str, int] = {}
 
     def driver_version(self) -> str:
         return client_lib.__version__

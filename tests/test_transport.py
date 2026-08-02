@@ -4421,6 +4421,42 @@ class TestQueueTTL:
             raw_client.close()
             app.close()
 
+    def test_a_second_channel_applies_a_ttl_it_never_declared(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """A queue keeps its TTL when another channel of the connection publishes to it.
+
+        kombu caches declarations on the connection, not the channel, so only
+        the first channel to declare a queue ever sees its x-expires. Any other
+        channel of that connection can still be the one that publishes.
+        """
+        with celery_app.connection() as conn:
+            declaring = cast("Channel", conn.default_channel)
+            declaring._new_queue("celery", arguments={"x-expires": 60000, "x-message-ttl": 30000})
+
+            publishing = cast("Channel", conn.channel())
+            assert publishing is not declaring
+            publishing._put(
+                "celery",
+                {
+                    "body": "test",
+                    "properties": {
+                        "delivery_tag": "shared-ttl-test",
+                        "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    },
+                },
+            )
+
+            queue_ttl = int(redis_client.pttl(f"{global_keyprefix}{QUEUE_KEY_PREFIX}celery"))
+            assert 0 < queue_ttl <= 60000
+            index_ttl = int(redis_client.pttl(f"{global_keyprefix}{MESSAGES_INDEX_PREFIX}celery"))
+            assert 0 < index_ttl <= 60000
+            message_ttl = int(redis_client.ttl(f"{global_keyprefix}{MESSAGE_KEY_PREFIX}shared-ttl-test"))
+            assert 0 < message_ttl <= 30
+
     def test_delete_removes_ttl_state(
         self,
         celery_app: Celery,
