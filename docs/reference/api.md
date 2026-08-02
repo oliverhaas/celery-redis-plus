@@ -53,6 +53,15 @@ All options are passed via Celery's `broker_transport_options` configuration.
     take. If it does not, another worker picks the message up while the first
     one is still on it.
 
+    Under `--pool=solo` there is no refresh at all. The solo pool runs each task
+    inline on the main thread, so the event loop is frozen for the whole task
+    and the timer never fires. Size `visibility_timeout` above your longest
+    single task, the same way you would with no refresh mechanism. A lone solo
+    worker gets away with it because its own requeue scan is frozen too, but a
+    second worker of any pool type will reclaim the message and run it again.
+    `prefork` and `threads` are unaffected: they execute tasks off the main
+    thread, so the event loop keeps ticking and the refresh works.
+
 #### Message Storage Options
 
 | Option | Type | Default | Description |
