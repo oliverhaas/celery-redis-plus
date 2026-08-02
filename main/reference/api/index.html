@@ -1008,6 +1008,13 @@ redeliver forever than disappear.</p>
 </div>
 <div class="admonition note">
 <p class="admonition-title">Sizing <code>visibility_timeout</code></p>
+<p>Only unacknowledged messages have a deadline, so with Celery's default
+<code>task_acks_late = False</code> a running task is not covered at all: the message
+is acked the moment the pool accepts the task, before the task body starts,
+and nothing can redeliver it afterwards. That also means a task lost to a
+worker crash is not retried. The rest of this note applies to
+<code>task_acks_late = True</code>, where the message stays unacknowledged for the
+whole run, and to messages sitting in a worker's prefetch buffer.</p>
 <p>Consuming workers push the deadline forward every <code>visibility_timeout / 3</code>
 seconds, but that refresh is an event-loop timer and the event loop stops
 ticking while the worker drains and while it reconnects to the broker. A
