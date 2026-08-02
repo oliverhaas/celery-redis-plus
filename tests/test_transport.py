@@ -4944,6 +4944,53 @@ class TestRestoreCount:
             restore_count = client.hget(message_key, "restore_count")
             assert restore_count == b"0"
 
+    def test_a_backlogged_message_is_not_counted_as_redelivered(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that a message still waiting in the queue is not counted as redelivered."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "backlogged-not-redelivered"
+            queue_key = f"{QUEUE_KEY_PREFIX}celery"
+            index_key = f"{MESSAGES_INDEX_PREFIX}celery"
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            client.delete(queue_key, index_key, message_key)
+
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                },
+            )
+
+            # Published but never consumed: still in the queue, and its index
+            # deadline has passed because the backlog is longer than the
+            # visibility timeout.
+            client.zadd(queue_key, {delivery_tag: 100.0})
+            client.zadd(index_key, {delivery_tag: time.time() - 100})
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            for _ in range(3):
+                channel.enqueue_due_messages()
+                # Re-date the deadline into the past so the next cycle looks again
+                client.zadd(index_key, {delivery_tag: time.time() - 100})
+
+            # Delivered exactly zero times, so the counter must still be zero
+            assert client.hget(message_key, "restore_count") == b"0"
+            # And the queue entry is untouched, not re-scored
+            assert client.zscore(queue_key, delivery_tag) == 100.0
+
     def test_restore_count_incremented_on_redelivery(
         self,
         celery_app: Celery,
@@ -5162,11 +5209,12 @@ class TestRestoreCount:
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that dropping a message also removes it from the queue sorted set.
+        """Test that dropping a message leaves nothing behind in the queue sorted set.
 
-        A message might be in the queue (e.g., added by a previous enqueue cycle
-        but not yet consumed). When dropped, it should be removed from the queue
-        sorted set as well, not just the index and hash.
+        The drop happens on the restore attempt, which re-adds the tag to the
+        queue before the limit is checked, so the drop has to take it back out
+        again. A tag that was already in the queue is a backlog rather than a
+        redelivery and is never dropped at all.
         """
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
@@ -5191,9 +5239,9 @@ class TestRestoreCount:
                 },
             )
 
-            # Message is in BOTH the index and the queue sorted set
+            # Consumed but not acked: in the index with a past deadline, out of
+            # the queue, so this cycle is a genuine redelivery attempt.
             client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() - 100})
-            client.zadd(f"{QUEUE_KEY_PREFIX}celery", {delivery_tag: 100.0})
 
             if "celery" not in channel._active_queues:
                 channel._active_queues.append("celery")

@@ -2,7 +2,9 @@
 -- This handles both delayed messages (first delivery) and timed-out messages (redelivery).
 -- Uses per-message hashes: message:{tag} with fields: payload, routing_key, priority, native_delayed, eta, restore_count
 -- For native_delayed messages: set native_delayed=0 (first delivery, not a redelivery)
--- For timed-out messages: set redelivered=1, increment restore_count (message was consumed but not acked)
+-- For timed-out messages: set redelivered=1, increment restore_count (message was consumed but not acked).
+-- A tag that is still in the queue was never delivered, only backlogged, so it is
+-- re-dated in the index but neither counted nor dropped.
 -- If max_restore_count is set and exceeded, the message is dropped (removed from index, hash deleted).
 -- Reads routing_key from hash to add message to the correct queue.
 -- KEYS: [1] = messages_index:{queue} (per-queue index, passed with global_keyprefix applied)
@@ -56,18 +58,24 @@ for _, tag in ipairs(ready) do
         end
         local queue_score = (255 - priority) * priority_multiplier + score_time_ms
 
+        -- Add to the message's queue (with global prefix and queue: prefix).
+        -- NX reports whether the tag was actually absent: it returns 1 only on a
+        -- real (re)enqueue. A tag still sitting in a backlog past its deadline was
+        -- never delivered, so it must not be counted as a redelivery.
+        local queue_key = global_keyprefix .. queue_key_prefix .. routing_key
+        local restored = redis.call('ZADD', queue_key, 'NX', queue_score, tag) == 1
+
         -- Check if this is a native delayed message (first delivery) or a timed-out message (redelivery)
         if native_delayed and tonumber(native_delayed) == 1 then
             -- Native delayed message: clear the flag (this is the first delivery)
             redis.call('HSET', message_key, 'native_delayed', '0')
-        else
+        elseif restored then
             -- Timed-out message: increment restore_count
             restore_count = restore_count + 1
 
             -- Check if max restore count exceeded
             if max_restore_count >= 0 and restore_count > max_restore_count then
                 -- Drop the message: remove from index, queue, and delete hash
-                local queue_key = global_keyprefix .. queue_key_prefix .. routing_key
                 redis.call('ZREM', messages_index, tag)
                 redis.call('ZREM', queue_key, tag)
                 redis.call('DEL', message_key)
@@ -81,14 +89,14 @@ for _, tag in ipairs(ready) do
         end
 
         if routing_key then
-            -- Add to the message's queue (with global prefix and queue: prefix)
-            local queue_key = global_keyprefix .. queue_key_prefix .. routing_key
-            redis.call('ZADD', queue_key, 'NX', queue_score, tag)
-
-            -- Update queue_at for next cycle (now + visibility_timeout)
+            -- Update queue_at for next cycle (now + visibility_timeout).
+            -- Done for backlogged tags too, otherwise their deadline stays in the
+            -- past and every cycle re-checks them.
             local new_queue_at = now_sec + visibility_timeout
             redis.call('ZADD', messages_index, new_queue_at, tag)
-            total_enqueued = total_enqueued + 1
+            if restored then
+                total_enqueued = total_enqueued + 1
+            end
         end
     else
         -- No message hash = message was already acked/deleted, clean up index
