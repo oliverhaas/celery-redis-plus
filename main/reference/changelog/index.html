@@ -576,6 +576,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#documentation-diagnostics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Documentation &amp; Diagnostics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#fixed" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -936,6 +947,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#documentation-diagnostics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Documentation &amp; Diagnostics
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#fixed" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1266,6 +1288,12 @@
 <p>The format is based on <a href="https://keepachangelog.com/en/1.0.0/">Keep a Changelog</a>,
 and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning</a>.</p>
 <h2 id="unreleased">[Unreleased]<a class="headerlink" href="#unreleased" title="Permanent link">&para;</a></h2>
+<h3 id="documentation-diagnostics">Documentation &amp; Diagnostics<a class="headerlink" href="#documentation-diagnostics" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Documented the <code>sep</code> transport option, which was accepted but never listed. A deployment migrating from the standard Redis transport has to carry over whatever <code>sep</code> it configured there, because <code>_kombu.binding.{exchange}</code> is the one piece of broker state shared byte-for-byte between the two transports</li>
+<li>Added a "Carry over a custom <code>sep</code>" section to the migration guide covering both failure modes of a mismatch: kombu raising <code>ValueError: not enough values to unpack (expected 3, got 1)</code> on every publish, and this transport padding the member to <code>(member, "", "")</code> so routing silently matches nothing</li>
+<li><code>get_table</code> now logs a warning (once per process) naming the exchange and the offending member when a binding does not split into three parts. Padding behaviour is unchanged, so nothing starts raising</li>
+</ul>
 <h3 id="fixed">Fixed<a class="headerlink" href="#fixed" title="Permanent link">&para;</a></h3>
 <ul>
 <li><code>QoS.restore_unacked_once</code> no longer shuts the worker thread pool down on broker reconnects. kombu calls it from <code>Channel.close()</code>, which also runs when the consumer reconnects, so every broker blip permanently disabled the pool (later <code>submit()</code> calls raised <code>RuntimeError</code> while the worker kept answering <code>inspect ping</code>). It is now gated on the worker blueprint having entered <code>CLOSE</code>/<code>TERMINATE</code></li>

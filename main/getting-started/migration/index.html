@@ -405,6 +405,24 @@
         
       
       
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migration
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
       <a href="./" class="md-nav__link md-nav__link--active">
         
   
@@ -421,6 +439,36 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#carry-over-a-custom-sep" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Carry over a custom sep
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
       
     </li>
   
@@ -564,6 +612,25 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#carry-over-a-custom-sep" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Carry over a custom sep
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -605,6 +672,18 @@
 </span></code></pre></div>
 <p>The <code>dest_app</code> is probably just the app of your new deployment and does not need to be explicitely defined, while <code>source_app</code> is a temporary dummy app for the old transports.</p>
 <p>For most cases where a few minutes of task delays do not matter, the migration is fairly straight forward. Deploy new code with the backwards-compatible <code>source_app</code>, run the migration script, migration itself is already done, then remove the <code>source_app</code> or any other leftovers in the next deployment.</p>
+<h2 id="carry-over-a-custom-sep">Carry over a custom <code>sep</code><a class="headerlink" href="#carry-over-a-custom-sep" title="Permanent link">&para;</a></h2>
+<p>Queues, message hashes and indices all use key prefixes that differ from the standard Redis transport, so the two transports cannot read each other's messages. That is what the migration above is for. Exchange bindings are the exception. Both transports store them in <code>_kombu.binding.{exchange}</code>, under the same key name, with members packed as <code>routing_key + sep + pattern + sep + queue</code>. It is the one piece of broker state that is shared rather than versioned by key name.</p>
+<p><code>sep</code> defaults to <code>"\x06\x16"</code> in both transports. If your deployment overrode it in <code>broker_transport_options</code>, the override <strong>must</strong> come along:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">broker_transport_options</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;sep&quot;</span><span class="p">:</span> <span class="s2">&quot;:&quot;</span><span class="p">}</span>
+</span></code></pre></div>
+<p>Miss it and the two sides write bindings in two different formats into the same set, and each misreads the other's:</p>
+<ul>
+<li>The standard Redis transport splits without padding and unpacks 3-tuples, so it raises <code>ValueError: not enough values to unpack (expected 3, got 1)</code> on every <code>_lookup</code>, meaning on every publish, for as long as both versions run side by side.</li>
+<li>celery-redis-plus pads a short split to <code>(member, "", "")</code>, which matches no routing key. <code>_lookup</code> returns an empty set and kombu's <code>DirectExchange.deliver</code> drops the message with no exception, no warning and no deadletter.</li>
+</ul>
+<p>The second case produces no error at all, so <code>get_table</code> logs a warning (once per process) naming the exchange and the offending member whenever a binding does not split into three parts.</p>
+<p>The bindings are rewritten by <code>_queue_bind</code> on worker/producer startup, so fixing <code>sep</code> and restarting is normally enough. Stale members in the old format linger until the exchange is redeclared; <code>SREM</code> them from <code>_kombu.binding.{exchange}</code> if the warning persists.</p>
 
 
 
