@@ -977,6 +977,12 @@
 <td>Delivery attempts before a message is dropped (<code>None</code> = no limit)</td>
 </tr>
 <tr>
+<td><code>blocking_timeout</code></td>
+<td><code>int</code></td>
+<td><code>10</code></td>
+<td>Seconds BZMPOP and XREAD block on the server per poll</td>
+</tr>
+<tr>
 <td><code>global_keyprefix</code></td>
 <td><code>str</code></td>
 <td><code>""</code></td>
@@ -990,6 +996,21 @@
 </tr>
 </tbody>
 </table>
+<div class="admonition warning">
+<p class="admonition-title"><code>blocking_timeout</code> is not kombu's <code>polling_interval</code></p>
+<p>Both answer "how long to wait", but they are opposite mechanisms.
+<code>blocking_timeout</code> is how long the server holds the BZMPOP or XREAD open,
+during which a message is delivered the instant it arrives.
+<code>polling_interval</code> is kombu's sleep <em>between</em> unsuccessful polls, and this
+transport disables it, exactly as kombu's own Redis transport does. A sleep
+on top of a blocking read only delays a reply that is already on its way.</p>
+<p>Setting <code>polling_interval</code> in <code>broker_transport_options</code> still works: it is
+read as <code>blocking_timeout</code> and logs a deprecation warning, and the sleep
+stays off.</p>
+<p>Keep <code>blocking_timeout</code> below <code>socket_timeout</code> if you set one. The poll is
+an ordinary read on the connection, so a socket timeout shorter than the
+block turns every empty poll into a read timeout and a reconnect.</p>
+</div>
 <div class="admonition note">
 <p class="admonition-title">How <code>delivery_limit</code> counts</p>
 <p>The counter follows RabbitMQ quorum queues: it counts delivery attempts,

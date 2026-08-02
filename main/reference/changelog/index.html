@@ -587,6 +587,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#added" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Added
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#documentation-diagnostics" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -626,7 +637,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#added" class="md-nav__link">
+  <a href="#added_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -687,7 +698,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#added_1" class="md-nav__link">
+  <a href="#added_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -715,7 +726,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#added_2" class="md-nav__link">
+  <a href="#added_3" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -754,7 +765,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#added_3" class="md-nav__link">
+  <a href="#added_4" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -849,7 +860,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#added_4" class="md-nav__link">
+  <a href="#added_5" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -888,7 +899,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#added_5" class="md-nav__link">
+  <a href="#added_6" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -969,6 +980,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#added" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Added
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#documentation-diagnostics" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1008,7 +1030,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#added" class="md-nav__link">
+  <a href="#added_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -1069,7 +1091,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#added_1" class="md-nav__link">
+  <a href="#added_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -1097,7 +1119,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#added_2" class="md-nav__link">
+  <a href="#added_3" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -1136,7 +1158,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#added_3" class="md-nav__link">
+  <a href="#added_4" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -1231,7 +1253,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#added_4" class="md-nav__link">
+  <a href="#added_5" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -1270,7 +1292,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#added_5" class="md-nav__link">
+  <a href="#added_6" class="md-nav__link">
     <span class="md-ellipsis">
       
         Added
@@ -1314,6 +1336,10 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <ul>
 <li><strong>BREAKING</strong>: the involuntary-redelivery cap now follows RabbitMQ quorum queues. The <code>max_restore_count</code> transport option is now <code>delivery_limit</code>, the <code>restore_count</code> message hash field is now <code>delivery_count</code>, and the <code>x-restore-count</code> header is now <code>x-delivery-count</code>. The default changed from no limit to <code>20</code>, which is what RabbitMQ quorum queues have applied since 4.0, and the counter now counts delivery attempts rather than redeliveries, so a message is dropped on its 20th delivery. Set <code>delivery_limit: None</code> in <code>broker_transport_options</code> to keep the old unlimited behaviour. A message published by an older version has no <code>delivery_count</code> field, which reads as <code>0</code>, so it simply starts over</li>
 </ul>
+<h3 id="added">Added<a class="headerlink" href="#added" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>blocking_timeout</code> transport option (default <code>10</code>), the seconds BZMPOP and XREAD block on the server per poll. This was <code>polling_interval</code>, which in kombu means the sleep <em>between</em> unsuccessful polls, so one attribute drove two opposite mechanisms: <code>kombu.transport.virtual.Transport.drain_events</code> slept 10 seconds after any poll that came up empty, and the sleep was clamped to the caller's drain timeout rather than skipped. kombu's own Redis transport sets <code>polling_interval = None</code> and keeps <code>brpop_timeout</code> separate for exactly this reason, and this transport now does the same. Setting <code>polling_interval</code> still works, read as <code>blocking_timeout</code> with a deprecation warning and with the sleep left disabled. Keep it below <code>socket_timeout</code> if you set one</li>
+</ul>
 <h3 id="documentation-diagnostics">Documentation &amp; Diagnostics<a class="headerlink" href="#documentation-diagnostics" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Documented the <code>sep</code> transport option, which was accepted but never listed. A deployment migrating from the standard Redis transport has to carry over whatever <code>sep</code> it configured there, because <code>_kombu.binding.{exchange}</code> is the one piece of broker state shared byte-for-byte between the two transports</li>
@@ -1334,7 +1360,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>Worker lookup no longer relies on <code>channel.connection.client.app</code>, which never resolves (kombu's <code>Connection</code> has no <code>app</code> attribute) and made the lookup raise <code>AttributeError</code> on every call</li>
 </ul>
 <h2 id="030-2026-02-14">[0.3.0] - 2026-02-14<a class="headerlink" href="#030-2026-02-14" title="Permanent link">&para;</a></h2>
-<h3 id="added">Added<a class="headerlink" href="#added" title="Permanent link">&para;</a></h3>
+<h3 id="added_1">Added<a class="headerlink" href="#added_1" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Queue TTL (<code>x-expires</code>): queues auto-expire when no worker refreshes them, via periodic PEXPIRE with dynamic interval (TTL/2)</li>
 <li>Message TTL (<code>x-message-ttl</code>): per-queue message expiry via shorter EXPIRE on message hashes</li>
@@ -1359,12 +1385,12 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <ul>
 <li>Fanout/broadcast (events, Flower) now works: added dedicated subclient for XREAD and fixed per-routing-key stream splitting</li>
 </ul>
-<h3 id="added_1">Added<a class="headerlink" href="#added_1" title="Permanent link">&para;</a></h3>
+<h3 id="added_2">Added<a class="headerlink" href="#added_2" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Example project in <code>examples/simple/</code> demonstrating tasks, delayed delivery, priority, retries, and Flower</li>
 </ul>
 <h2 id="024-2026-01-31">[0.2.4] - 2026-01-31<a class="headerlink" href="#024-2026-01-31" title="Permanent link">&para;</a></h2>
-<h3 id="added_2">Added<a class="headerlink" href="#added_2" title="Permanent link">&para;</a></h3>
+<h3 id="added_3">Added<a class="headerlink" href="#added_3" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Migration support from standard Redis transport</li>
 </ul>
@@ -1373,7 +1399,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>Simplified transport configuration in docs</li>
 </ul>
 <h2 id="023-2026-01-29">[0.2.3] - 2026-01-29<a class="headerlink" href="#023-2026-01-29" title="Permanent link">&para;</a></h2>
-<h3 id="added_3">Added<a class="headerlink" href="#added_3" title="Permanent link">&para;</a></h3>
+<h3 id="added_4">Added<a class="headerlink" href="#added_4" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Support for both redis-py and valkey-py client libraries (optional dependencies)</li>
 <li><code>valkey://</code> and <code>valkeys://</code> URL scheme support for easier configuration</li>
@@ -1395,7 +1421,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>Added <code>queue:</code> prefix to avoid collision with list-based queues</li>
 </ul>
 <h2 id="020-2025-01-20">[0.2.0] - 2025-01-20<a class="headerlink" href="#020-2025-01-20" title="Permanent link">&para;</a></h2>
-<h3 id="added_4">Added<a class="headerlink" href="#added_4" title="Permanent link">&para;</a></h3>
+<h3 id="added_5">Added<a class="headerlink" href="#added_5" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Native delayed delivery support</li>
 <li>Full priority support (0-255)</li>
@@ -1408,7 +1434,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>Improved message reliability with per-message hashes</li>
 </ul>
 <h2 id="010-2025-01-15">[0.1.0] - 2025-01-15<a class="headerlink" href="#010-2025-01-15" title="Permanent link">&para;</a></h2>
-<h3 id="added_5">Added<a class="headerlink" href="#added_5" title="Permanent link">&para;</a></h3>
+<h3 id="added_6">Added<a class="headerlink" href="#added_6" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Initial release</li>
 <li>Custom Kombu transport for Redis/Valkey</li>
