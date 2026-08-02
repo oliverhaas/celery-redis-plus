@@ -3712,6 +3712,56 @@ class TestDelayedMessageStorage:
 class TestMessageRequeue:
     """Tests for message requeue functionality (unified delayed + restore)."""
 
+    def test_acking_after_a_restore_cancels_the_restored_copy(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that acking removes the queue entry a visibility timeout restore put back."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "ack-cancels-restore"
+            queue_key = f"{QUEUE_KEY_PREFIX}celery"
+            index_key = f"{MESSAGES_INDEX_PREFIX}celery"
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            client.delete(queue_key, index_key, message_key)
+
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "native_delayed": "0",
+                    "restore_count": "0",
+                    "eta": "0",
+                },
+            )
+
+            # Consumed but not yet acked: out of the queue, deadline already past
+            client.zadd(index_key, {delivery_tag: time.time() - 100})
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            # Visibility timeout fires and puts the tag back while the original
+            # consumer is still working on it
+            channel.enqueue_due_messages()
+            assert client.zscore(queue_key, delivery_tag) is not None
+
+            # The original consumer acks. Without the queue ZREM the restored
+            # copy stays poppable and a second worker runs the task.
+            message = MagicMock()
+            message.delivery_info = {"routing_key": "celery"}
+            channel.qos._delivered[delivery_tag] = message
+            channel.qos._remove_from_indices(delivery_tag)
+
+            assert client.zscore(queue_key, delivery_tag) is None
+            assert client.zscore(index_key, delivery_tag) is None
+            assert not client.exists(message_key)
+
     def test_requeue_restores_unacked_message(
         self,
         celery_app: Celery,

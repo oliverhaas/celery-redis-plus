@@ -420,19 +420,25 @@ class QoS(virtual.QoS):
             super().ack(delivery_tag)
 
     def _remove_from_indices(self, delivery_tag: str) -> None:
-        """Atomically remove message from index and delete its hash.
+        """Atomically remove message from queue and index and delete its hash.
 
         Uses a Lua script so that a connection drop cannot leave an orphaned
         message hash (ZREM succeeds but DEL doesn't) or an orphaned index
         entry (DEL succeeds but ZREM doesn't).
+
+        The queue entry is removed too: if enqueue_due_messages restored this
+        message while its consumer was still working on it, the tag is back in
+        the queue, and only this ZREM can cancel that restored copy before
+        another worker pops it.
         """
         queue = cast("dict", self._delivered)[delivery_tag].delivery_info["routing_key"]
         # Prefix keys since EVALSHA doesn't auto-prefix
         index_key = f"{self.channel.global_keyprefix}{self.channel._messages_index_key(queue)}"
         message_key = f"{self.channel.global_keyprefix}{self.channel._message_key(delivery_tag)}"
+        queue_key = f"{self.channel.global_keyprefix}{self.channel._queue_key(queue)}"
         with self.channel.conn_or_acquire() as client:
             ack_script = client.register_script(_ACK_MESSAGE_LUA)
-            ack_script(keys=[index_key, message_key], args=[delivery_tag])
+            ack_script(keys=[index_key, message_key, queue_key], args=[delivery_tag])
 
     def restore_unacked_once(self, stderr: Any = None) -> None:
         """Restore unacked messages, waiting for threads and draining acks."""
