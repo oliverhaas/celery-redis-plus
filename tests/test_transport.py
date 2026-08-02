@@ -1656,14 +1656,27 @@ class TestQoS:
         mock_channel = MagicMock()
         mock_channel.conn_or_acquire.return_value = mock_client
         mock_channel._messages_index_key.side_effect = lambda q: f"{MESSAGES_INDEX_PREFIX}{q}"
+        mock_channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
         qos.channel = mock_channel
 
+        before = time.time()
         qos.maybe_update_messages_index()
+        after = time.time()
 
         # Should update scores for tag1 and tag2, but NOT fanout_tag
         assert mock_pipe.zadd.call_count == 2
         zadd_calls = [call[0][0] for call in mock_pipe.zadd.call_args_list]
         assert f"{MESSAGES_INDEX_PREFIX}celery" in zadd_calls
+
+        for zadd_call in mock_pipe.zadd.call_args_list:
+            # XX only, or the heartbeat resurrects a message that was acked
+            # between reading _delivered and running the pipeline
+            assert zadd_call.kwargs["xx"] is True
+            # The deadline has to match what _put and the consume paths write,
+            # otherwise the heartbeat moves it backwards
+            (queue_at,) = zadd_call.args[1].values()
+            expected = DEFAULT_VISIBILITY_TIMEOUT + transport_mod.DEFAULT_REQUEUE_CHECK_INTERVAL
+            assert before + expected <= queue_at <= after + expected
 
     def test_drain_hub_callbacks_fires_callbacks(self) -> None:
         """Test that _drain_hub_callbacks executes hub callbacks."""
@@ -2012,6 +2025,38 @@ class TestTransport:
         assert poller._expires_timer_entry is not None
         # 60_000 ms / 2 / 1000 = refresh twice per TTL
         loop.call_repeatedly.assert_any_call(30.0, poller.maybe_refresh_queue_expires)
+
+    @pytest.mark.parametrize(
+        ("transport_options", "expected_interval"),
+        [
+            ({}, DEFAULT_VISIBILITY_TIMEOUT / 3),
+            ({"visibility_timeout": 30}, 10.0),
+        ],
+        ids=["default", "configured"],
+    )
+    def test_visibility_heartbeat_is_registered_with_the_event_loop(
+        self,
+        transport_options: dict[str, Any],
+        expected_interval: float,
+    ) -> None:
+        """The heartbeat that keeps in-flight messages alive has to be on the loop.
+
+        Nothing else in the suite notices if this registration goes missing:
+        the heartbeat only matters for a task that outlives its visibility
+        timeout, and a message whose deadline passes is simply redelivered.
+        """
+        poller = MultiChannelPoller()
+        transport = MagicMock()
+        transport.cycle = poller
+        connection = MagicMock()
+        connection.client.transport_options = transport_options
+        loop = MagicMock()
+
+        Transport.register_with_event_loop(transport, connection, loop)
+
+        # Three beats per visibility timeout, so two can be missed before a
+        # message is handed to another worker.
+        loop.call_repeatedly.assert_any_call(expected_interval, poller.maybe_update_messages_index)
 
 
 @pytest.mark.unit
@@ -3833,6 +3878,93 @@ class TestMessageRequeue:
             assert client.zscore(index_key, delivery_tag) is None
             assert not client.exists(message_key)
 
+    def test_the_heartbeat_holds_a_message_past_its_visibility_timeout(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that a heartbeated message is not restored once its deadline passes.
+
+        Drives the beats by hand. The registration that puts them on the event
+        loop is covered by
+        TestTransport.test_visibility_heartbeat_is_registered_with_the_event_loop.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.visibility_timeout = 2
+            client = channel.client
+
+            delivery_tag = "heartbeat-holds"
+            queue_key = f"{QUEUE_KEY_PREFIX}celery"
+            index_key = f"{MESSAGES_INDEX_PREFIX}celery"
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            client.delete(queue_key, index_key, message_key)
+
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "native_delayed": "0",
+                    "delivery_count": "0",
+                    "eta": "0",
+                },
+            )
+            # Consumed but not acked, with the deadline a consume path would set
+            client.zadd(index_key, {delivery_tag: time.time() + channel.visibility_timeout})
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            message = MagicMock()
+            message.delivery_info = {"routing_key": "celery"}
+            channel.qos._delivered[delivery_tag] = message
+
+            # Task still running well past the visibility timeout, beating at
+            # the interval register_with_event_loop uses
+            deadline = time.time() + 2 * channel.visibility_timeout
+            while time.time() < deadline:
+                channel.qos.maybe_update_messages_index()
+                channel.enqueue_due_messages()
+                time.sleep(channel.visibility_timeout / 3)
+
+            assert client.zscore(queue_key, delivery_tag) is None, "message was restored while still in flight"
+
+            # Stop beating, as a crashed worker would, and it comes back
+            time.sleep(channel.visibility_timeout + 0.5)
+            channel.enqueue_due_messages()
+            assert client.zscore(queue_key, delivery_tag) is not None
+
+    def test_the_heartbeat_does_not_resurrect_an_acked_message(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that a tag acked mid-heartbeat is not put back into the index.
+
+        _delivered is read outside the pipeline, so an ack can land between the
+        read and the ZADD. The XX flag is what keeps that from re-creating the
+        index entry and redelivering an acked message.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "heartbeat-after-ack"
+            index_key = f"{MESSAGES_INDEX_PREFIX}celery"
+            client.delete(index_key)
+
+            message = MagicMock()
+            message.delivery_info = {"routing_key": "celery"}
+            channel.qos._delivered[delivery_tag] = message
+
+            # The ack already removed the index entry; _delivered has not caught up
+            assert client.zscore(index_key, delivery_tag) is None
+
+            channel.qos.maybe_update_messages_index()
+
+            assert client.zscore(index_key, delivery_tag) is None
+
     def test_requeue_restores_unacked_message(
         self,
         celery_app: Celery,
@@ -5503,3 +5635,86 @@ class TestDeliveryCount:
             assert client.hget(message_key, "delivery_count") == b"6"
             # Message should be in queue
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None
+
+
+@pytest.mark.integration
+class TestVisibilityHeartbeatEndToEnd:
+    """The visibility heartbeat under a real worker running a real long task."""
+
+    def test_a_task_outliving_its_visibility_timeout_runs_once(
+        self,
+        redis_container: tuple[str, int, str],
+    ) -> None:
+        """Test that a task running past the visibility timeout is not redelivered.
+
+        This is the whole point of the heartbeat, and the only test that
+        exercises it through the worker's event loop rather than by calling
+        maybe_update_messages_index directly. The task sleeps for several
+        visibility timeouts, so without the heartbeat the message goes back
+        into the queue while it is still running and a second execution starts.
+
+        Uses the threads pool: tasks run off the main thread, so the hub keeps
+        ticking and the timer fires. Under --pool=solo it would not, which is
+        the caveat documented for visibility_timeout.
+
+        acks_late, because with the default early ack celery acknowledges the
+        message the moment the pool accepts the task. The message is gone from
+        Redis before the task body starts, so nothing can redeliver it and the
+        heartbeat has nothing left to hold.
+        """
+        from celery import Celery as CeleryApp
+        from celery.contrib.testing import worker as testing_worker
+
+        host, port, _image = redis_container
+        # A beat every second, so the message survives two missed beats. Tighter
+        # than this and a stalled hub on a loaded CI box looks like a bug.
+        visibility_timeout = 3
+        task_runtime = 8
+
+        app = CeleryApp("test_visibility_heartbeat")
+        app.conf.update(
+            broker_url=f"redis://{host}:{port}/0",
+            broker_transport="celery_redis_plus.transport:Transport",
+            broker_transport_options={"visibility_timeout": visibility_timeout},
+            result_backend=f"redis://{host}:{port}/1",
+            task_always_eager=False,
+            task_acks_late=True,
+            worker_prefetch_multiplier=1,
+        )
+
+        counter_key = "heartbeat-executions"
+        raw_client = client_lib.Redis(host=host, port=port, db=2)
+
+        @app.task(name="tests.sleep_past_visibility_timeout")
+        def sleep_past_visibility_timeout() -> int:
+            client = client_lib.Redis(host=host, port=port, db=2)
+            try:
+                client.incr(counter_key)
+            finally:
+                client.close()
+            time.sleep(task_runtime)
+            return 1
+
+        try:
+            with testing_worker.start_worker(
+                app,
+                pool="threads",
+                concurrency=2,
+                perform_ping_check=False,
+                shutdown_timeout=30.0,
+            ):
+                result = sleep_past_visibility_timeout.delay()
+                assert result.get(timeout=task_runtime + 30) == 1
+
+                # A redelivery starts while the first run is still sleeping, but
+                # the worker may only get to it once that run frees a slot, so
+                # give it a full requeue cycle to show up
+                settle = time.time() + visibility_timeout + transport_mod.DEFAULT_REQUEUE_CHECK_INTERVAL
+                while time.time() < settle:
+                    assert int(raw_client.get(counter_key) or 0) == 1, "task was redelivered while it was running"
+                    time.sleep(0.2)
+        finally:
+            raw_client.delete(counter_key)
+            raw_client.flushdb()
+            raw_client.close()
+            app.close()

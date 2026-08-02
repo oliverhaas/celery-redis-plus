@@ -63,6 +63,14 @@ All options are passed via Celery's `broker_transport_options` configuration.
 
 !!! note "Sizing `visibility_timeout`"
 
+    Only unacknowledged messages have a deadline, so with Celery's default
+    `task_acks_late = False` a running task is not covered at all: the message
+    is acked the moment the pool accepts the task, before the task body starts,
+    and nothing can redeliver it afterwards. That also means a task lost to a
+    worker crash is not retried. The rest of this note applies to
+    `task_acks_late = True`, where the message stays unacknowledged for the
+    whole run, and to messages sitting in a worker's prefetch buffer.
+
     Consuming workers push the deadline forward every `visibility_timeout / 3`
     seconds, but that refresh is an event-loop timer and the event loop stops
     ticking while the worker drains and while it reconnects to the broker. A
