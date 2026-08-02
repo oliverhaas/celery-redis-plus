@@ -576,6 +576,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#changed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Changed
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#documentation-diagnostics" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -626,7 +637,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#changed" class="md-nav__link">
+  <a href="#changed_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Changed
@@ -782,7 +793,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#changed_1" class="md-nav__link">
+  <a href="#changed_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Changed
@@ -810,7 +821,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#changed_2" class="md-nav__link">
+  <a href="#changed_3" class="md-nav__link">
     <span class="md-ellipsis">
       
         Changed
@@ -849,7 +860,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#changed_3" class="md-nav__link">
+  <a href="#changed_4" class="md-nav__link">
     <span class="md-ellipsis">
       
         Changed
@@ -947,6 +958,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#changed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Changed
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#documentation-diagnostics" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -997,7 +1019,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#changed" class="md-nav__link">
+  <a href="#changed_1" class="md-nav__link">
     <span class="md-ellipsis">
       
         Changed
@@ -1153,7 +1175,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#changed_1" class="md-nav__link">
+  <a href="#changed_2" class="md-nav__link">
     <span class="md-ellipsis">
       
         Changed
@@ -1181,7 +1203,7 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#changed_2" class="md-nav__link">
+  <a href="#changed_3" class="md-nav__link">
     <span class="md-ellipsis">
       
         Changed
@@ -1220,7 +1242,7 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#changed_3" class="md-nav__link">
+  <a href="#changed_4" class="md-nav__link">
     <span class="md-ellipsis">
       
         Changed
@@ -1288,6 +1310,10 @@
 <p>The format is based on <a href="https://keepachangelog.com/en/1.0.0/">Keep a Changelog</a>,
 and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semantic Versioning</a>.</p>
 <h2 id="unreleased">[Unreleased]<a class="headerlink" href="#unreleased" title="Permanent link">&para;</a></h2>
+<h3 id="changed">Changed<a class="headerlink" href="#changed" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>BREAKING</strong>: the involuntary-redelivery cap now follows RabbitMQ quorum queues. The <code>max_restore_count</code> transport option is now <code>delivery_limit</code>, the <code>restore_count</code> message hash field is now <code>delivery_count</code>, and the <code>x-restore-count</code> header is now <code>x-delivery-count</code>. The default changed from no limit to <code>20</code>, which is what RabbitMQ quorum queues have applied since 4.0, and the counter now counts delivery attempts rather than redeliveries, so a message is dropped on its 20th delivery. Set <code>delivery_limit: None</code> in <code>broker_transport_options</code> to keep the old unlimited behaviour. A message published by an older version has no <code>delivery_count</code> field, which reads as <code>0</code>, so it simply starts over</li>
+</ul>
 <h3 id="documentation-diagnostics">Documentation &amp; Diagnostics<a class="headerlink" href="#documentation-diagnostics" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Documented the <code>sep</code> transport option, which was accepted but never listed. A deployment migrating from the standard Redis transport has to carry over whatever <code>sep</code> it configured there, because <code>_kombu.binding.{exchange}</code> is the one piece of broker state shared byte-for-byte between the two transports</li>
@@ -1296,6 +1322,12 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 </ul>
 <h3 id="fixed">Fixed<a class="headerlink" href="#fixed" title="Permanent link">&para;</a></h3>
 <ul>
+<li>Publishing to a direct exchange whose binding table is empty now raises <code>InconsistencyError</code> instead of discarding the message. kombu made the empty table a silent no-op in 5.2 (PR #1404), which is right for topic and fanout but not for direct, where the binding is known to exist and, with <code>x-expires</code>, may simply have aged out. <code>InconsistencyError</code> is in <code>connection_errors</code>, so kombu redeclares the binding and retries. The visible symptom was pidbox replies vanishing after a control queue expired</li>
+<li>Acking a message now removes it from <code>queue:{name}</code> as well as from <code>messages_index:{name}</code>. A message whose visibility timeout had already restored it left the restored copy behind, so it was delivered again after being acked</li>
+<li>A consumed message always gets a visibility deadline. Both consume paths refreshed the index entry with <code>ZADD ... XX</code>, which is a no-op when the entry is gone, so such a message was never recovered if its worker died</li>
+<li>A queue backlog is no longer counted as a redelivery. <code>enqueue_due_messages</code> gates the counter on the <code>ZADD NX</code> result, so a message still sitting in its queue past its deadline is re-dated but neither counted nor dropped. Without this, a queue slower than <code>visibility_timeout</code> would have eaten its own backlog once <code>delivery_limit</code> gained a default</li>
+<li><code>delivery_info["redelivered"]</code> and the <code>x-delivery-count</code> header are now derived from the delivery counter at consume time. <code>redelivered</code> used to be a hash field that was written but never read, so Celery's <code>worker_deduplicate_successful_tasks</code> never saw a redelivery</li>
+<li>The queue expires refresh timer now starts for queues declared before the event loop existed. <code>register_with_event_loop</code> never called <code>_update_expires_timer</code> after attaching the loop, so a worker that declared all its queues at startup refreshed none of their TTLs and its queues expired underneath it</li>
 <li><code>QoS.restore_unacked_once</code> no longer shuts the worker thread pool down on broker reconnects. kombu calls it from <code>Channel.close()</code>, which also runs when the consumer reconnects, so every broker blip permanently disabled the pool (later <code>submit()</code> calls raised <code>RuntimeError</code> while the worker kept answering <code>inspect ping</code>). It is now gated on the worker blueprint having entered <code>CLOSE</code>/<code>TERMINATE</code></li>
 <li>Reconnects no longer requeue messages whose tasks are still running. Those messages stay in <code>messages_index</code> and are redelivered on their visibility deadline instead</li>
 <li>Worker lookup no longer relies on <code>channel.connection.client.app</code>, which never resolves (kombu's <code>Connection</code> has no <code>app</code> attribute) and made the lookup raise <code>AttributeError</code> on every call</li>
@@ -1307,7 +1339,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>Message TTL (<code>x-message-ttl</code>): per-queue message expiry via shorter EXPIRE on message hashes</li>
 <li><code>prepare_queue_arguments</code> override using kombu's <code>to_rabbitmq_queue_arguments</code> for RabbitMQ-compatible queue argument handling</li>
 </ul>
-<h3 id="changed">Changed<a class="headerlink" href="#changed" title="Permanent link">&para;</a></h3>
+<h3 id="changed_1">Changed<a class="headerlink" href="#changed_1" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Split global <code>messages_index</code> sorted set into per-queue <code>messages_index:{queue}</code> keys for scoped recovery, clean queue lifecycle, and correct <code>global_keyprefix</code> behavior with Lua scripts</li>
 <li>Renamed internal redis-specific naming to client-library-agnostic (<code>client_lib</code>, <code>_client_exceptions</code>) for better redis-py/valkey-py compatibility</li>
@@ -1352,12 +1384,12 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>Documentation site 404 by setting dev as default version</li>
 </ul>
 <h2 id="022-2025-01-22">[0.2.2] - 2025-01-22<a class="headerlink" href="#022-2025-01-22" title="Permanent link">&para;</a></h2>
-<h3 id="changed_1">Changed<a class="headerlink" href="#changed_1" title="Permanent link">&para;</a></h3>
+<h3 id="changed_2">Changed<a class="headerlink" href="#changed_2" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Updated celery-types-ng to 0.25.4 and fixed typing errors</li>
 </ul>
 <h2 id="021-2025-01-21">[0.2.1] - 2025-01-21<a class="headerlink" href="#021-2025-01-21" title="Permanent link">&para;</a></h2>
-<h3 id="changed_2">Changed<a class="headerlink" href="#changed_2" title="Permanent link">&para;</a></h3>
+<h3 id="changed_3">Changed<a class="headerlink" href="#changed_3" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Added <code>queue:</code> prefix to avoid collision with list-based queues</li>
 </ul>
@@ -1369,7 +1401,7 @@ and this project adheres to <a href="https://semver.org/spec/v2.0.0.html">Semant
 <li>Reliable fanout via Redis Streams</li>
 <li>Visibility timeout tracking</li>
 </ul>
-<h3 id="changed_3">Changed<a class="headerlink" href="#changed_3" title="Permanent link">&para;</a></h3>
+<h3 id="changed_4">Changed<a class="headerlink" href="#changed_4" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Switched from Redis lists to sorted sets for queues</li>
 <li>Improved message reliability with per-message hashes</li>

@@ -971,6 +971,12 @@
 <td>Seconds before unacked messages are reclaimed</td>
 </tr>
 <tr>
+<td><code>delivery_limit</code></td>
+<td><code>int</code> or <code>None</code></td>
+<td><code>20</code></td>
+<td>Delivery attempts before a message is dropped (<code>None</code> = no limit)</td>
+</tr>
+<tr>
 <td><code>global_keyprefix</code></td>
 <td><code>str</code></td>
 <td><code>""</code></td>
@@ -984,6 +990,22 @@
 </tr>
 </tbody>
 </table>
+<div class="admonition note">
+<p class="admonition-title">How <code>delivery_limit</code> counts</p>
+<p>The counter follows RabbitMQ quorum queues: it counts delivery attempts,
+not redeliveries, so a message is dropped on its 20th delivery rather than
+after 20 redeliveries. Both involuntary redeliveries (the visibility
+timeout expiring) and voluntary ones (<code>reject(requeue=True)</code>, a worker
+handing messages back on shutdown) increment it. A message that is still
+sitting in its queue because no worker has got to it yet is a backlog, not
+a redelivery, and does not count.</p>
+<p>Consumed messages carry the current count in the <code>x-delivery-count</code> header
+and have <code>delivery_info["redelivered"]</code> set once it is above zero, which is
+what Celery's <code>worker_deduplicate_successful_tasks</code> reads.</p>
+<p>Dropped messages are deleted outright. There is no dead-letter queue yet,
+so set <code>delivery_limit: None</code> if you would rather have a poison message
+redeliver forever than disappear.</p>
+</div>
 <div class="admonition note">
 <p class="admonition-title">Sizing <code>visibility_timeout</code></p>
 <p>Consuming workers push the deadline forward every <code>visibility_timeout / 3</code>
