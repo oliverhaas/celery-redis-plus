@@ -6045,7 +6045,11 @@ class TestVisibilityHeartbeatEndToEnd:
         counter_key = "heartbeat-executions"
         raw_client = client_lib.Redis(host=host, port=port, db=2)
 
-        @app.task(name="tests.sleep_past_visibility_timeout")
+        # shared=False, or celery replays this registration onto every app built
+        # after it. The other parametrization of this test registers the same
+        # name against its own container, and whichever finalizer runs last wins,
+        # so the worker ends up talking to a container that is already stopped.
+        @app.task(name="tests.sleep_past_visibility_timeout", shared=False)
         def sleep_past_visibility_timeout() -> int:
             client = client_lib.Redis(host=host, port=port, db=2)
             try:
