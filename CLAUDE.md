@@ -69,20 +69,20 @@ broker_transport = "celery_redis_plus.transport:Transport"
 - `DEFAULT_VISIBILITY_TIMEOUT`: `300` - seconds before unacked messages are requeued
 - `DEFAULT_REQUEUE_CHECK_INTERVAL`: `60` - interval for checking messages to requeue
 - `DEFAULT_REQUEUE_BATCH_LIMIT`: `1000` - max messages processed per requeue cycle
-- `DEFAULT_MAX_RESTORE_COUNT`: `None` - max times a message can be restored via visibility timeout before being dropped (None = no limit)
+- `DEFAULT_DELIVERY_LIMIT`: `20` - max times a message may be delivered before being dropped (None = no limit)
 
 ### Redis Keys
 
 - `queue:{name}`: Sorted set storing delivery_tags with priority+timestamp scores (uses `queue:` prefix to avoid collision with list-based queues)
-- `message:{delivery_tag}`: Hash storing message payload, routing_key, priority, flags, and `restore_count`
+- `message:{delivery_tag}`: Hash storing message payload, routing_key, priority, flags, and `delivery_count`
 - `messages_index:{name}`: Per-queue sorted set storing `{delivery_tag: queue_at}` for visibility timeout and delayed delivery
 
-### Restore Count
+### Delivery Count
 
-Messages track how many times they've been redelivered. The `restore_count` field in the message hash is incremented by `enqueue_due_messages` on a visibility timeout restore and by `requeue_message` on reject-with-requeue or a worker shutdown restore. These are the same two paths RabbitMQ counts for `x-delivery-count`. A message that is merely backlogged in the queue past its deadline was never delivered, so it is not counted.
+Messages track how many times they've been redelivered. The `delivery_count` field in the message hash is incremented by `enqueue_due_messages` on a visibility timeout restore and by `requeue_message` on reject-with-requeue or a worker shutdown restore. These are the same two paths RabbitMQ counts for `x-delivery-count`. A message that is merely backlogged in the queue past its deadline was never delivered, so it is not counted.
 
-- `max_restore_count` transport option: when set, messages exceeding this count are dropped. Only `enqueue_due_messages` enforces it, so a requeued message is dropped at its next deadline rather than immediately
-- `x-restore-count` header: injected into consumed messages when `restore_count > 0`
+- `delivery_limit` transport option (default `20`, `None` disables): counts attempts, as RabbitMQ's quorum queue `delivery-limit` does. `delivery_count` is 0 on a first delivery, so the check is `delivery_count >= delivery_limit` and a limit of 3 allows a first delivery plus two redeliveries. Only `enqueue_due_messages` enforces it, so a requeued message is dropped at its next deadline rather than immediately
+- `x-delivery-count` header: injected into consumed messages when `delivery_count > 0`
 - `delivery_info["redelivered"]`: set to `True` on the same condition. This is where kombu's Redis transport puts it and the only place celery looks, in `Request` and `trace`, for `worker_deduplicate_successful_tasks`. There is no `redelivered` hash field; both flags are derived from the counter at consume time
 - `/{db}.{exchange}`: Redis Stream for fanout messages
 - `_kombu.binding.{exchange}`: Set storing queue-exchange bindings

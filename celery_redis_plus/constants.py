@@ -39,9 +39,11 @@ MESSAGE_KEY_PREFIX = "message:"
 # Prefix for queue sorted set keys (avoids collision with list-based queues)
 QUEUE_KEY_PREFIX = "queue:"
 
-# Default max restore count (None = no limit, backwards compatible)
-# When set to an integer, messages restored more than this many times are dropped
-DEFAULT_MAX_RESTORE_COUNT: int | None = None
+# Default delivery limit (None = no limit)
+# Counts attempts, as RabbitMQ's quorum queue delivery-limit does: a message is
+# dropped on its Nth delivery, not after N redeliveries. 20 is what RabbitMQ
+# quorum queues have applied since 4.0.
+DEFAULT_DELIVERY_LIMIT: int | None = 20
 
 # Minimum allowed x-expires value in milliseconds (10 seconds)
 # Celery's control/reply queues use 10s by default

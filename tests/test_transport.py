@@ -824,7 +824,7 @@ class TestChannel:
 
         mock_client = MagicMock()
         mock_script = MagicMock()
-        # Lua script returns [queue_name, tag, payload, restore_count]
+        # Lua script returns [queue_name, tag, payload, delivery_count]
         mock_script.return_value = [b"myqueue", b"tag123", b'{"body": "test"}', b"0"]
         mock_client.register_script.return_value = mock_script
 
@@ -2231,7 +2231,7 @@ class TestFastSlowConsumeMode:
         mock_connection = MagicMock()
         channel.connection = mock_connection
 
-        # EVALSHA returns [queue_name, tag, payload, restore_count]
+        # EVALSHA returns [queue_name, tag, payload, delivery_count]
         mock_client.parse_response.return_value = [
             b"my_queue",
             b"tag123",
@@ -2246,8 +2246,8 @@ class TestFastSlowConsumeMode:
         assert channel._in_poll is None
         mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
 
-    def test_fast_consume_read_with_restore_count(self, global_keyprefix: str) -> None:
-        """Test FAST mode injects x-restore-count header when restore_count > 0."""
+    def test_fast_consume_read_with_delivery_count(self, global_keyprefix: str) -> None:
+        """Test FAST mode injects x-delivery-count header when delivery_count > 0."""
         channel = object.__new__(Channel)
         channel.message_key_prefix = MESSAGE_KEY_PREFIX
         channel.global_keyprefix = global_keyprefix
@@ -2271,7 +2271,7 @@ class TestFastSlowConsumeMode:
 
         assert result is True
         delivered_msg = mock_connection._deliver.call_args[0][0]
-        assert delivered_msg["properties"]["headers"]["x-restore-count"] == 3
+        assert delivered_msg["properties"]["headers"]["x-delivery-count"] == 3
 
     def test_fast_consume_read_switches_to_slow_on_empty(self, global_keyprefix: str) -> None:
         """Test FAST mode switches to SLOW and sends BZMPOP when queue is empty."""
@@ -3764,7 +3764,7 @@ class TestMessageRequeue:
                     "routing_key": "celery",
                     "priority": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                     "eta": "0",
                 },
             )
@@ -3823,7 +3823,7 @@ class TestMessageRequeue:
                     "routing_key": "celery",
                     "priority": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                     "eta": "0",
                 },
             )
@@ -3874,7 +3874,7 @@ class TestMessageRequeue:
                     "routing_key": "celery",
                     "priority": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                     "eta": "0",
                 },
             )
@@ -3957,7 +3957,7 @@ class TestMessageRequeue:
                     "routing_key": "celery",
                     "priority": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                     "eta": "0",
                 },
             )
@@ -3975,7 +3975,7 @@ class TestMessageRequeue:
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that _requeue_by_tag increments restore_count in the hash."""
+        """Test that _requeue_by_tag increments delivery_count in the hash."""
 
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
@@ -4003,7 +4003,7 @@ class TestMessageRequeue:
                     "routing_key": "celery",
                     "priority": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                     "eta": "0",
                 },
             )
@@ -4013,7 +4013,7 @@ class TestMessageRequeue:
             assert result is True
 
             # The redelivery is counted, and no separate redelivered field is written
-            assert client.hget(message_key, "restore_count") == b"1"
+            assert client.hget(message_key, "delivery_count") == b"1"
             assert client.hget(message_key, "redelivered") is None
 
             # Message should be in queue
@@ -4051,7 +4051,7 @@ class TestMessageRequeue:
                     "priority": "0",
                     "redelivered": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                     "eta": "0",
                 },
             )
@@ -4096,7 +4096,7 @@ class TestMessageRequeue:
                     "routing_key": "celery",
                     "priority": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                     "eta": "0",
                 },
             )
@@ -4144,7 +4144,7 @@ class TestMessageRequeue:
                     "routing_key": "celery",
                     "priority": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                     "eta": "0",
                 },
             )
@@ -4606,7 +4606,7 @@ class TestSynchronousGet:
                     "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                 },
             )
             # Queued with no index entry at all
@@ -4733,7 +4733,7 @@ class TestSynchronousGet:
                     "payload": json_dumps(payload),
                     "routing_key": queue_name,
                     "priority": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                 },
             )
             old_queue_at = time.time() + 100.0
@@ -4939,14 +4939,14 @@ class TestTransportDelivery:
 
 
 @pytest.mark.integration
-class TestRestoreCount:
+class TestDeliveryCount:
     """Tests for restore count tracking and max restore count enforcement."""
 
-    def test_restore_count_initialized_to_zero(
+    def test_delivery_count_initialized_to_zero(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that _put stores restore_count=0 in the message hash."""
+        """Test that _put stores delivery_count=0 in the message hash."""
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
             client = channel.client
@@ -4966,8 +4966,8 @@ class TestRestoreCount:
             )
 
             message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
-            restore_count = client.hget(message_key, "restore_count")
-            assert restore_count == b"0"
+            delivery_count = client.hget(message_key, "delivery_count")
+            assert delivery_count == b"0"
 
     def test_a_backlogged_message_is_not_counted_as_redelivered(
         self,
@@ -4992,7 +4992,7 @@ class TestRestoreCount:
                     "routing_key": "celery",
                     "priority": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                 },
             )
 
@@ -5012,15 +5012,15 @@ class TestRestoreCount:
                 client.zadd(index_key, {delivery_tag: time.time() - 100})
 
             # Delivered exactly zero times, so the counter must still be zero
-            assert client.hget(message_key, "restore_count") == b"0"
+            assert client.hget(message_key, "delivery_count") == b"0"
             # And the queue entry is untouched, not re-scored
             assert client.zscore(queue_key, delivery_tag) == 100.0
 
-    def test_restore_count_incremented_on_redelivery(
+    def test_delivery_count_incremented_on_redelivery(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that restore_count increments each time a timed-out message is redelivered."""
+        """Test that delivery_count increments each time a timed-out message is redelivered."""
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
             client = channel.client
@@ -5031,7 +5031,7 @@ class TestRestoreCount:
             message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
             payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
 
-            # Simulate an unacked message with restore_count=0
+            # Simulate an unacked message with delivery_count=0
             client.hset(
                 message_key,
                 mapping={
@@ -5040,7 +5040,7 @@ class TestRestoreCount:
                     "priority": "0",
                     "redelivered": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                 },
             )
 
@@ -5053,7 +5053,7 @@ class TestRestoreCount:
 
             # First redelivery
             channel.enqueue_due_messages()
-            assert client.hget(message_key, "restore_count") == b"1"
+            assert client.hget(message_key, "delivery_count") == b"1"
 
             # Pop from queue and set index to past again for second redelivery
             client.zrem(f"{QUEUE_KEY_PREFIX}celery", delivery_tag)
@@ -5061,13 +5061,13 @@ class TestRestoreCount:
 
             # Second redelivery
             channel.enqueue_due_messages()
-            assert client.hget(message_key, "restore_count") == b"2"
+            assert client.hget(message_key, "delivery_count") == b"2"
 
-    def test_restore_count_not_incremented_for_native_delayed(
+    def test_delivery_count_not_incremented_for_native_delayed(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that restore_count is NOT incremented for native delayed first delivery."""
+        """Test that delivery_count is NOT incremented for native delayed first delivery."""
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
             client = channel.client
@@ -5087,7 +5087,7 @@ class TestRestoreCount:
                     "priority": "0",
                     "redelivered": "0",
                     "native_delayed": "1",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                     "eta": "0",
                 },
             )
@@ -5102,16 +5102,16 @@ class TestRestoreCount:
             # Enqueue due messages (first delivery of delayed message)
             channel.enqueue_due_messages()
 
-            # restore_count should still be 0 (not incremented for first delivery)
-            assert client.hget(message_key, "restore_count") == b"0"
+            # delivery_count should still be 0 (not incremented for first delivery)
+            assert client.hget(message_key, "delivery_count") == b"0"
             # native_delayed should be cleared
             assert client.hget(message_key, "native_delayed") == b"0"
 
-    def test_restore_count_header_injected(
+    def test_delivery_count_header_injected(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that x-restore-count header is injected when restore_count > 0."""
+        """Test that x-delivery-count header is injected when delivery_count > 0."""
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
             client = channel.client
@@ -5135,7 +5135,7 @@ class TestRestoreCount:
                     "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
-                    "restore_count": "3",
+                    "delivery_count": "3",
                 },
             )
             # Add to queue so _get can consume it via Lua script
@@ -5144,16 +5144,16 @@ class TestRestoreCount:
 
             message = channel._get("celery")
             assert message is not None
-            assert message["properties"]["headers"]["x-restore-count"] == 3
+            assert message["properties"]["headers"]["x-delivery-count"] == 3
             # celery reads delivery_info['redelivered'] in Request and trace, and
             # it gates worker_deduplicate_successful_tasks
             assert message["properties"]["delivery_info"]["redelivered"] is True
 
-    def test_restore_count_header_absent_when_zero(
+    def test_delivery_count_header_absent_when_zero(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that x-restore-count header is NOT injected when restore_count is 0."""
+        """Test that x-delivery-count header is NOT injected when delivery_count is 0."""
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
             client = channel.client
@@ -5177,7 +5177,7 @@ class TestRestoreCount:
                     "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                 },
             )
             # Add to queue so _get can consume it via Lua script
@@ -5186,16 +5186,16 @@ class TestRestoreCount:
 
             message = channel._get("celery")
             assert message is not None
-            assert "x-restore-count" not in message["properties"].get("headers", {})
+            assert "x-delivery-count" not in message["properties"].get("headers", {})
 
     def test_message_dropped_when_max_exceeded(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that message is dropped when restore_count exceeds max_restore_count."""
+        """Test that message is dropped when delivery_count exceeds delivery_limit."""
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
-            channel.max_restore_count = 2
+            channel.delivery_limit = 2
             client = channel.client
 
             delivery_tag = "restore-drop-test"
@@ -5213,7 +5213,7 @@ class TestRestoreCount:
                     "priority": "0",
                     "redelivered": "1",
                     "native_delayed": "0",
-                    "restore_count": "2",
+                    "delivery_count": "2",
                 },
             )
 
@@ -5224,7 +5224,7 @@ class TestRestoreCount:
                 channel._active_queues.append("celery")
             channel._queue_cycle = list(channel.active_queues)
 
-            # This should drop the message (restore_count would become 3, exceeding max of 2)
+            # This should drop the message (delivery_count would become 3, reaching the limit of 2)
             enqueued = channel.enqueue_due_messages()
             assert enqueued == 0
 
@@ -5232,6 +5232,54 @@ class TestRestoreCount:
             assert not client.exists(message_key)
             assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is None
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None
+
+    @pytest.mark.parametrize(
+        ("delivery_count", "expect_dropped"),
+        [("1", False), ("2", True)],
+        ids=["under-limit", "at-limit"],
+    )
+    def test_a_message_is_dropped_once_it_reaches_the_delivery_limit(
+        self,
+        celery_app: Celery,
+        delivery_count: str,
+        expect_dropped: bool,
+    ) -> None:
+        """Test the limit counts attempts, so the check is >= and not >.
+
+        With delivery_limit=3, a stored delivery_count of 2 means this restore is
+        the third delivery and must be the last. Under the old > comparison it
+        survived and got a fourth.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.delivery_limit = 3
+            client = channel.client
+
+            delivery_tag = f"delivery-limit-boundary-{delivery_count}"
+            index_key = f"{MESSAGES_INDEX_PREFIX}celery"
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", index_key, message_key)
+
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "native_delayed": "0",
+                    "delivery_count": delivery_count,
+                },
+            )
+            client.zadd(index_key, {delivery_tag: time.time() - 100})
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            channel.enqueue_due_messages()
+
+            assert bool(client.exists(message_key)) is not expect_dropped
 
     def test_message_dropped_cleans_up_queue_entry(
         self,
@@ -5246,7 +5294,7 @@ class TestRestoreCount:
         """
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
-            channel.max_restore_count = 0  # drop on first restore attempt
+            channel.delivery_limit = 0  # drop on first restore attempt
             client = channel.client
 
             delivery_tag = "restore-queue-cleanup-test"
@@ -5263,7 +5311,7 @@ class TestRestoreCount:
                     "priority": "0",
                     "redelivered": "0",
                     "native_delayed": "0",
-                    "restore_count": "0",
+                    "delivery_count": "0",
                 },
             )
 
@@ -5283,14 +5331,23 @@ class TestRestoreCount:
             assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is None
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None
 
-    def test_no_limit_when_max_is_none(
+    def test_default_delivery_limit_matches_rabbitmq(
         self,
         celery_app: Celery,
     ) -> None:
-        """Test that messages are not dropped when max_restore_count is None (default)."""
+        """Test that the default limit is RabbitMQ quorum queues' 20."""
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
-            assert channel.max_restore_count is None  # default
+            assert channel.delivery_limit == 20
+
+    def test_no_limit_when_limit_is_none(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test that messages are not dropped when delivery_limit is None."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.delivery_limit = None
             client = channel.client
 
             delivery_tag = "restore-no-limit-test"
@@ -5299,7 +5356,7 @@ class TestRestoreCount:
             message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
             payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
 
-            # Simulate a message with very high restore_count
+            # Simulate a message with very high delivery_count
             client.hset(
                 message_key,
                 mapping={
@@ -5308,7 +5365,7 @@ class TestRestoreCount:
                     "priority": "0",
                     "redelivered": "1",
                     "native_delayed": "0",
-                    "restore_count": "999",
+                    "delivery_count": "999",
                 },
             )
 
@@ -5322,9 +5379,9 @@ class TestRestoreCount:
             enqueued = channel.enqueue_due_messages()
             assert enqueued == 1
 
-            # Message should exist and restore_count incremented
+            # Message should exist and delivery_count incremented
             assert client.exists(message_key)
-            assert client.hget(message_key, "restore_count") == b"1000"
+            assert client.hget(message_key, "delivery_count") == b"1000"
 
     def test_requeue_by_tag_increments_but_does_not_enforce_the_limit(
         self,
@@ -5339,7 +5396,7 @@ class TestRestoreCount:
         """
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
-            channel.max_restore_count = 1
+            channel.delivery_limit = 1
             client = channel.client
 
             delivery_tag = "requeue-no-incr-test"
@@ -5354,17 +5411,17 @@ class TestRestoreCount:
                     "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
-                    "restore_count": "5",
+                    "delivery_count": "5",
                 },
             )
 
-            # Even though restore_count (5) exceeds max_restore_count (1),
+            # Even though delivery_count (5) exceeds delivery_limit (1),
             # _requeue_by_tag should succeed because it doesn't enforce the limit
             result = channel._requeue_by_tag(delivery_tag, queue="celery")
             assert result is True
 
             # The redelivery is counted, so the next enqueue_due_messages cycle
             # sees the raised count and drops the message
-            assert client.hget(message_key, "restore_count") == b"6"
+            assert client.hget(message_key, "delivery_count") == b"6"
             # Message should be in queue
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None

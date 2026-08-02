@@ -1,16 +1,16 @@
 -- Lua script for enqueuing messages whose queue_at time has passed.
 -- This handles both delayed messages (first delivery) and timed-out messages (redelivery).
--- Uses per-message hashes: message:{tag} with fields: payload, routing_key, priority, native_delayed, eta, restore_count
+-- Uses per-message hashes: message:{tag} with fields: payload, routing_key, priority, native_delayed, eta, delivery_count
 -- For native_delayed messages: set native_delayed=0 (first delivery, not a redelivery)
--- For timed-out messages: increment restore_count (message was consumed but not acked).
+-- For timed-out messages: increment delivery_count (message was consumed but not acked).
 -- A tag that is still in the queue was never delivered, only backlogged, so it is
 -- re-dated in the index but neither counted nor dropped.
--- If max_restore_count is set and exceeded, the message is dropped (removed from index, hash deleted).
+-- If delivery_limit is set and exceeded, the message is dropped (removed from index, hash deleted).
 -- Reads routing_key from hash to add message to the correct queue.
 -- KEYS: [1] = messages_index:{queue} (per-queue index, passed with global_keyprefix applied)
 -- ARGV: [1] = threshold, [2] = batch_limit, [3] = visibility_timeout,
 --       [4] = priority_multiplier, [5] = message_key_prefix, [6] = global_keyprefix,
---       [7] = queue_key_prefix, [8] = max_restore_count (-1 = no limit)
+--       [7] = queue_key_prefix, [8] = delivery_limit (-1 = no limit)
 -- Returns: {total_enqueued, total_dropped}
 
 local messages_index = KEYS[1]
@@ -21,7 +21,7 @@ local priority_multiplier = tonumber(ARGV[4])
 local message_key_prefix = ARGV[5]
 local global_keyprefix = ARGV[6]
 local queue_key_prefix = ARGV[7]
-local max_restore_count = tonumber(ARGV[8])
+local delivery_limit = tonumber(ARGV[8])
 local total_enqueued = 0
 local total_dropped = 0
 
@@ -38,7 +38,7 @@ for _, tag in ipairs(ready) do
     local message_key = global_keyprefix .. message_key_prefix .. tag
 
     -- Get all needed fields in a single call
-    local fields = redis.call('HMGET', message_key, 'priority', 'routing_key', 'eta', 'native_delayed', 'restore_count')
+    local fields = redis.call('HMGET', message_key, 'priority', 'routing_key', 'eta', 'native_delayed', 'delivery_count')
     local priority = fields[1]
 
     if priority then
@@ -47,7 +47,7 @@ for _, tag in ipairs(ready) do
         local eta = fields[3]
         eta = eta and tonumber(eta) or 0
         local native_delayed = fields[4]
-        local restore_count = tonumber(fields[5] or 0)
+        local delivery_count = tonumber(fields[5] or 0)
 
         -- Calculate queue score using eta if it's in the future, else use now
         local score_time_ms
@@ -70,11 +70,14 @@ for _, tag in ipairs(ready) do
             -- Native delayed message: clear the flag (this is the first delivery)
             redis.call('HSET', message_key, 'native_delayed', '0')
         elseif restored then
-            -- Timed-out message: increment restore_count
-            restore_count = restore_count + 1
+            -- Timed-out message: increment delivery_count
+            delivery_count = delivery_count + 1
 
-            -- Check if max restore count exceeded
-            if max_restore_count >= 0 and restore_count > max_restore_count then
+            -- Check if the delivery limit is reached. >= not >, because the limit
+            -- counts attempts as RabbitMQ's delivery-limit does: delivery_count
+            -- counts redeliveries and is 0 on the first delivery, so a limit of 3
+            -- allows a first delivery plus two redeliveries.
+            if delivery_limit >= 0 and delivery_count >= delivery_limit then
                 -- Drop the message: remove from index, queue, and delete hash
                 redis.call('ZREM', messages_index, tag)
                 redis.call('ZREM', queue_key, tag)
@@ -83,9 +86,9 @@ for _, tag in ipairs(ready) do
                 -- Skip to next message (do not use goto, use flag approach below)
                 routing_key = nil
             else
-                -- Update restore_count. The AMQP redelivered flag is derived
+                -- Update delivery_count. The AMQP redelivered flag is derived
                 -- from this counter at consume time, not stored separately.
-                redis.call('HSET', message_key, 'restore_count', tostring(restore_count))
+                redis.call('HSET', message_key, 'delivery_count', tostring(delivery_count))
             end
         end
 

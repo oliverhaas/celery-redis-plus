@@ -1,5 +1,5 @@
 -- Lua script for requeuing a single rejected message to its queue.
--- Increments restore_count and adds to queue with appropriate score.
+-- Increments delivery_count and adds to queue with appropriate score.
 -- Uses routing_key from the hash as the queue name.
 -- KEYS: [1] = message_key
 -- ARGV: [1] = leftmost (1 or 0), [2] = priority_multiplier, [3] = message_ttl,
@@ -32,7 +32,7 @@ end
 -- The limit is deliberately not enforced here: a requeued message keeps its
 -- index entry, so enqueue_due_messages sees the raised count at its next
 -- deadline and drops it. One place decides, one place deletes.
-redis.call('HINCRBY', message_key, 'restore_count', 1)
+redis.call('HINCRBY', message_key, 'delivery_count', 1)
 if message_ttl >= 0 then
     redis.call('EXPIRE', message_key, message_ttl)
 end

@@ -33,6 +33,12 @@ Transport Options
 * ``credential_provider``: A ``redis.credentials.CredentialProvider`` instance (or dotted
   import path string) for dynamic auth (e.g., AWS ElastiCache IAM, Azure Redis).
   Mutually exclusive with username/password in the broker URL.
+* ``delivery_limit``: Maximum number of times a message may be delivered before it is
+  dropped (default: 20, ``None`` disables the limit). Named and counted after RabbitMQ
+  quorum queues' ``delivery-limit`` policy: it counts attempts, so a limit of 3 allows a
+  first delivery plus two redeliveries. A redelivery is a visibility timeout restore or a
+  reject-with-requeue, the same two paths RabbitMQ counts. Consumed messages carry the
+  count in the ``x-delivery-count`` header once it is above zero.
 * ``sep``: Separator used inside ``_kombu.binding.{exchange}`` set members
   (default: ``"\\x06\\x16"``, same as kombu's Redis transport). The binding sets are the one
   piece of broker state this transport shares byte-for-byte with kombu's Redis transport, so
@@ -79,7 +85,7 @@ from vine import promise
 
 from .constants import (
     DEFAULT_HEALTH_CHECK_INTERVAL,
-    DEFAULT_MAX_RESTORE_COUNT,
+    DEFAULT_DELIVERY_LIMIT,
     DEFAULT_MESSAGE_TTL,
     DEFAULT_REQUEUE_BATCH_LIMIT,
     DEFAULT_REQUEUE_CHECK_INTERVAL,
@@ -796,7 +802,7 @@ class Channel(virtual.Channel):
     credential_provider = None
 
     # Max restore count (None = no limit)
-    max_restore_count: int | None = DEFAULT_MAX_RESTORE_COUNT
+    delivery_limit: int | None = DEFAULT_DELIVERY_LIMIT
 
     # Fanout settings
     fanout_prefix: bool | str = True
@@ -823,7 +829,7 @@ class Channel(virtual.Channel):
         "client_name",
         "stream_maxlen",
         "credential_provider",
-        "max_restore_count",
+        "delivery_limit",
     )
 
     connection_class = client_lib.Connection
@@ -1005,7 +1011,7 @@ class Channel(virtual.Channel):
         return self._consume_script_sha
 
     @staticmethod
-    def _mark_redelivered(message: dict[str, Any], restore_count: int) -> None:
+    def _mark_redelivered(message: dict[str, Any], delivery_count: int) -> None:
         """Set the AMQP redelivery flags on a consumed message.
 
         Both are derived from the stored counter rather than a separate field.
@@ -1013,10 +1019,10 @@ class Channel(virtual.Channel):
         it, and the only place celery looks, in Request and trace, for
         worker_deduplicate_successful_tasks.
         """
-        if restore_count <= 0:
+        if delivery_count <= 0:
             return
         properties = message.setdefault("properties", {})
-        properties.setdefault("headers", {})["x-restore-count"] = restore_count
+        properties.setdefault("headers", {})["x-delivery-count"] = delivery_count
         properties.setdefault("delivery_info", {})["redelivered"] = True
 
     def _parse_consume_result(self, result: list[Any]) -> tuple[str, dict[str, Any]]:
@@ -1143,7 +1149,7 @@ class Channel(virtual.Channel):
                 new_queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
                 with self.client.pipeline(transaction=False) as pipe:
                     pipe.zadd(index_key, {delivery_tag: new_queue_at})
-                    pipe.hmget(message_key, "payload", "restore_count")
+                    pipe.hmget(message_key, "payload", "delivery_count")
                     results = pipe.execute()
 
                 payload_json = results[1][0]
@@ -1329,7 +1335,7 @@ class Channel(virtual.Channel):
         threshold = now + DEFAULT_REQUEUE_CHECK_INTERVAL
         total_enqueued = 0
 
-        max_restore = -1 if self.max_restore_count is None else self.max_restore_count
+        delivery_limit = -1 if self.delivery_limit is None else self.delivery_limit
 
         with self.conn_or_acquire() as client:
             enqueue_script = client.register_script(_ENQUEUE_DUE_MESSAGES_LUA)
@@ -1348,7 +1354,7 @@ class Channel(virtual.Channel):
                             self.message_key_prefix,
                             self.global_keyprefix,
                             QUEUE_KEY_PREFIX,
-                            max_restore,
+                            delivery_limit,
                         ],
                     )
                     # Lua returns [enqueued_count, dropped_count]
@@ -1359,7 +1365,7 @@ class Channel(virtual.Channel):
                             "Queue %s: %d message(s) dropped after exceeding max restore count of %d.",
                             queue,
                             dropped,
-                            self.max_restore_count,
+                            self.delivery_limit,
                         )
                     if enqueued >= DEFAULT_REQUEUE_BATCH_LIMIT:
                         logger.warning(
@@ -1381,8 +1387,8 @@ class Channel(virtual.Channel):
         """Requeue a rejected message to its queue using Lua script.
 
         The Lua script atomically reads the routing_key (queue) from the message
-        hash and adds the message back to that queue, incrementing restore_count.
-        It does not enforce max_restore_count: the message keeps its index entry,
+        hash and adds the message back to that queue, incrementing delivery_count.
+        It does not enforce delivery_limit: the message keeps its index entry,
         so enqueue_due_messages drops it at the next deadline if it is over.
 
         Args:
@@ -1470,7 +1476,7 @@ class Channel(virtual.Channel):
                     "priority": priority,
                     "native_delayed": 1 if is_native_delayed else 0,
                     "eta": eta_timestamp or 0,
-                    "restore_count": 0,
+                    "delivery_count": 0,
                 },
             )
             effective_message_ttl = self.message_ttl
