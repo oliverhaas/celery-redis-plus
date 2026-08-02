@@ -33,6 +33,11 @@ Transport Options
 * ``credential_provider``: A ``redis.credentials.CredentialProvider`` instance (or dotted
   import path string) for dynamic auth (e.g., AWS ElastiCache IAM, Azure Redis).
   Mutually exclusive with username/password in the broker URL.
+* ``sep``: Separator used inside ``_kombu.binding.{exchange}`` set members
+  (default: ``"\\x06\\x16"``, same as kombu's Redis transport). The binding sets are the one
+  piece of broker state this transport shares byte-for-byte with kombu's Redis transport, so
+  a deployment migrating from it must carry over whatever ``sep`` it configured there.
+  A mismatch breaks routing in both directions -- see the migration guide.
 """
 
 from __future__ import annotations
@@ -756,6 +761,7 @@ class Channel(virtual.Channel):
     _in_poll = None
     _in_fanout_poll = None
     _warned_expires_clamp = False
+    _warned_binding_sep = False
     max_priority = MAX_PRIORITY  # Override kombu's default of 9 to enable full 0-255 range
 
     # Message storage keys
@@ -1563,10 +1569,29 @@ class Channel(virtual.Channel):
             result: list[tuple[str, str, str]] = []
             binding_parts_count = 3  # routing_key, pattern, queue
             for val in values:
-                parts = bytes_to_str(val).split(self.sep)
-                # Ensure exactly 3 parts (routing_key, pattern, queue)
-                while len(parts) < binding_parts_count:
-                    parts.append("")
+                member = bytes_to_str(val)
+                parts = member.split(self.sep)
+                if len(parts) != binding_parts_count:
+                    # Almost always a `sep` mismatch: another transport (usually kombu's Redis
+                    # transport, or an older deployment of this one) wrote the member with a
+                    # different separator. Padding keeps publishing alive, but the binding
+                    # matches no routing key, so messages for it are dropped silently.
+                    if not Channel._warned_binding_sep:
+                        logger.warning(
+                            "Binding %r on exchange %r does not split into %s parts with the"
+                            " configured sep %r, so it cannot be matched and messages routed to"
+                            " it are dropped. This usually means the binding was written with a"
+                            " different sep -- check that `sep` matches across every transport"
+                            " sharing this broker."
+                            " This warning is shown once; other bindings may also be affected.",
+                            member,
+                            exchange,
+                            binding_parts_count,
+                            self.sep,
+                        )
+                        Channel._warned_binding_sep = True
+                    # Pad/truncate to exactly 3 parts (routing_key, pattern, queue)
+                    parts = [*parts, "", ""][:binding_parts_count]
                 result.append((parts[0], parts[1], parts[2]))
             return result
 

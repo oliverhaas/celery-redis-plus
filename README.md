@@ -11,14 +11,18 @@ Enhanced Redis/Valkey transport for Celery/Kombu with native delayed delivery, i
 from celery import Celery
 import celery_redis_plus  # Register valkey:// transport
 
-app = Celery('myapp')
-app.config_from_object({
-    'broker_url': 'valkey://localhost:6379/0',
-})
+app = Celery("myapp")
+app.config_from_object(
+    {
+        "broker_url": "valkey://localhost:6379/0",
+    }
+)
+
 
 @app.task
 def my_task():
     print("Hello!")
+
 
 # Native delayed delivery - stored in Redis, not worker memory
 my_task.apply_async(countdown=120)

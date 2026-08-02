@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation & Diagnostics
+- Documented the `sep` transport option, which was accepted but never listed. A deployment migrating from the standard Redis transport has to carry over whatever `sep` it configured there, because `_kombu.binding.{exchange}` is the one piece of broker state shared byte-for-byte between the two transports
+- Added a "Carry over a custom `sep`" section to the migration guide covering both failure modes of a mismatch: kombu raising `ValueError: not enough values to unpack (expected 3, got 1)` on every publish, and this transport padding the member to `(member, "", "")` so routing silently matches nothing
+- `get_table` now logs a warning (once per process) naming the exchange and the offending member when a binding does not split into three parts. Padding behaviour is unchanged, so nothing starts raising
+
 ### Fixed
 - `QoS.restore_unacked_once` no longer shuts the worker thread pool down on broker reconnects. kombu calls it from `Channel.close()`, which also runs when the consumer reconnects, so every broker blip permanently disabled the pool (later `submit()` calls raised `RuntimeError` while the worker kept answering `inspect ping`). It is now gated on the worker blueprint having entered `CLOSE`/`TERMINATE`
 - Reconnects no longer requeue messages whose tasks are still running. Those messages stay in `messages_index` and are redelivered on their visibility deadline instead

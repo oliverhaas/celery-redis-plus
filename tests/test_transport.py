@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
@@ -754,6 +755,42 @@ class TestChannel:
 
         result = channel.get_table("nonexistent_exchange")
         assert result == []
+
+    def test_get_table_warns_once_on_separator_mismatch(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test get_table pads bindings written with a different sep and warns once."""
+        channel = object.__new__(Channel)
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+        Channel._warned_binding_sep = False
+
+        mock_client = MagicMock()
+        # Written by a deployment configured with sep=":"
+        mock_client.smembers.return_value = {b"test_key:test_pattern:test_queue"}
+
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        try:
+            with caplog.at_level(logging.WARNING, logger="celery_redis_plus.transport"):
+                result = channel.get_table("test_exchange")
+                assert result == [("test_key:test_pattern:test_queue", "", "")]
+                assert len(caplog.records) == 1
+                assert "test_exchange" in caplog.records[0].getMessage()
+                assert "test_key:test_pattern:test_queue" in caplog.records[0].getMessage()
+
+                # Second call hits the same mismatch but must not warn again
+                caplog.clear()
+                assert channel.get_table("test_exchange") == [
+                    ("test_key:test_pattern:test_queue", "", ""),
+                ]
+                assert caplog.records == []
+        finally:
+            Channel._warned_binding_sep = False
 
     def test_put_fanout(self) -> None:
         """Test _put_fanout publishes to stream."""
