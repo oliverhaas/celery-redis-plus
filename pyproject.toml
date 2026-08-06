@@ -49,7 +49,7 @@ dev = [
   "pytest-cov==7.1.0",
   "pytest-xdist>=3.8.0",
   "redis[hiredis]==7.4.0",
-  "ruff==0.16.0",
+  "ruff==0.16.1",
   "testcontainers==4.15.0",
   "ty==0.0.65",
   "valkey[libvalkey]==6.1.1",
