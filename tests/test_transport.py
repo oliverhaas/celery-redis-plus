@@ -3917,31 +3917,49 @@ class TestFanoutMessaging:
             stream_key = channel._fanout_stream_key("test_exchange")
             assert "test_exchange" in stream_key
 
-    def test_fanout_exchange_declaration(
+    def test_fanout_binding_table_is_not_written(
         self,
         celery_app: Celery,
         redis_client: Any,
         global_keyprefix: str,
     ) -> None:
-        """Test that fanout exchange can be declared."""
+        """A fanout binding lives in the channel, not in a broker-side table.
+
+        Fanout routing never consults the table: delivery is one XADD to the
+        exchange's stream, and consumers follow the streams their own channel
+        registered in _fanout_queues. A table nobody reads would only pile up
+        members.
+        """
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
 
             fanout_exchange = Exchange("test_fanout_decl", type="fanout")
             fanout_queue = Queue("fanout_decl_queue", exchange=fanout_exchange)
-
-            # Bind and declare
             fanout_queue.bind(channel).declare()  # type: ignore[attr-defined]
 
-            # The binding should be stored, scored +inf because the queue has no
-            # x-expires and so its route never goes stale
+            assert channel._fanout_queues["fanout_decl_queue"][0] == "test_fanout_decl"
             bindings_key = f"{global_keyprefix}_kombu.binding.test_fanout_decl"
-            bindings = redis_client.zrange(bindings_key, 0, -1, withscores=True)
-            assert len(bindings) >= 1
-            assert all(score == float("inf") for _, score in bindings)
+            assert not redis_client.exists(bindings_key)
 
-            # Cleanup
-            redis_client.delete(bindings_key)
+    def test_fanout_declare_clears_a_leftover_binding_table(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Earlier versions wrote fanout bindings to the table. Nothing reads
+        or rescores them anymore, so the declare cleans the key up."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            bindings_key = f"{global_keyprefix}_kombu.binding.legacy_fanout"
+            member = channel.sep.join(["legacy_fanout_q", "", "legacy_fanout_q"])
+            redis_client.zadd(bindings_key, {member: float("inf")})
+
+            fanout_exchange = Exchange("legacy_fanout", type="fanout")
+            fanout_queue = Queue("legacy_fanout_q", exchange=fanout_exchange)
+            fanout_queue.bind(channel).declare()  # type: ignore[attr-defined]
+
+            assert not redis_client.exists(bindings_key)
 
     def test_subclient_is_separate_from_client(
         self,

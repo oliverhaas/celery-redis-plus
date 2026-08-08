@@ -1795,7 +1795,12 @@ class Channel(virtual.Channel):
 
     def _queue_bind(self, exchange: str, routing_key: str, pattern: str, queue: str) -> None:
         if self.typeof(exchange).type == "fanout":
+            # Fanout never reads the binding table (delivery is one XADD to
+            # the stream), so drop any table an earlier version left behind
             self._fanout_queues[queue] = (exchange, routing_key.replace("#", "*"))
+            with self.conn_or_acquire() as client:
+                client.delete(self._binding_key(exchange))
+            return
         member = self._binding_member(routing_key, pattern, queue)
         self._bindings.setdefault(queue, set()).add((exchange, member))
         with self.conn_or_acquire() as client:
