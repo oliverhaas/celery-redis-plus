@@ -50,6 +50,10 @@ QUEUE_KEY_PREFIX = "queue:"
 # quorum queues have applied since 4.0.
 DEFAULT_DELIVERY_LIMIT: int | None = 20
 
+# Cap on dropped messages named per queue per sweep in the error log; the
+# drop deletes the hash, so that log line is the message's last trace
+DROPPED_REPORT_LIMIT = 10
+
 # Minimum allowed x-expires value in milliseconds (10 seconds)
 # Celery's control/reply queues use 10s by default
 MIN_QUEUE_EXPIRES = 10_000

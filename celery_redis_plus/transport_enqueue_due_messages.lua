@@ -10,8 +10,11 @@
 -- KEYS: [1] = messages_index:{queue} (per-queue index, passed with global_keyprefix applied)
 -- ARGV: [1] = threshold, [2] = batch_limit, [3] = visibility_timeout,
 --       [4] = priority_multiplier, [5] = message_key_prefix, [6] = global_keyprefix,
---       [7] = queue_key_prefix, [8] = delivery_limit (-1 = no limit)
--- Returns: {total_enqueued, total_dropped}
+--       [7] = queue_key_prefix, [8] = delivery_limit (-1 = no limit),
+--       [9] = dropped_report_limit (max dropped payloads returned)
+-- Returns: {total_enqueued, total_dropped, total_redelivered, total_orphaned, dropped_payloads}
+-- dropped_payloads holds the payloads of up to dropped_report_limit dropped
+-- messages; the DEL below is their last trace, so they go back for logging.
 
 local messages_index = KEYS[1]
 local threshold = tonumber(ARGV[1])
@@ -22,8 +25,12 @@ local message_key_prefix = ARGV[5]
 local global_keyprefix = ARGV[6]
 local queue_key_prefix = ARGV[7]
 local delivery_limit = tonumber(ARGV[8])
+local dropped_report_limit = tonumber(ARGV[9])
 local total_enqueued = 0
 local total_dropped = 0
+local total_redelivered = 0
+local total_orphaned = 0
+local dropped_payloads = {}
 
 -- Get current time in seconds and milliseconds
 local time_result = redis.call('TIME')
@@ -79,6 +86,12 @@ for _, tag in ipairs(ready) do
             -- allows a first delivery plus two redeliveries.
             if delivery_limit >= 0 and delivery_count >= delivery_limit then
                 -- Drop the message: remove from index, queue, and delete hash
+                if #dropped_payloads < dropped_report_limit then
+                    local dropped_payload = redis.call('HGET', message_key, 'payload')
+                    if dropped_payload then
+                        table.insert(dropped_payloads, dropped_payload)
+                    end
+                end
                 redis.call('ZREM', messages_index, tag)
                 redis.call('ZREM', queue_key, tag)
                 redis.call('DEL', message_key)
@@ -89,6 +102,7 @@ for _, tag in ipairs(ready) do
                 -- Update delivery_count. The AMQP redelivered flag is derived
                 -- from this counter at consume time, not stored separately.
                 redis.call('HSET', message_key, 'delivery_count', tostring(delivery_count))
+                total_redelivered = total_redelivered + 1
             end
         end
 
@@ -105,7 +119,8 @@ for _, tag in ipairs(ready) do
     else
         -- No message hash = message was already acked/deleted, clean up index
         redis.call('ZREM', messages_index, tag)
+        total_orphaned = total_orphaned + 1
     end
 end
 
-return {total_enqueued, total_dropped}
+return {total_enqueued, total_dropped, total_redelivered, total_orphaned, dropped_payloads}

@@ -20,6 +20,7 @@ from celery.bootsteps import (
 from kombu import Exchange, Queue
 from kombu.exceptions import InconsistencyError, OperationalError
 from kombu.transport import virtual
+from kombu.utils.encoding import bytes_to_str
 from kombu.utils.eventio import ERR
 from kombu.utils.json import dumps as json_dumps
 
@@ -27,6 +28,7 @@ import celery_redis_plus.transport as transport_mod
 from celery_redis_plus.constants import (
     DEFAULT_MESSAGE_TTL,
     DEFAULT_VISIBILITY_TIMEOUT,
+    DROPPED_REPORT_LIMIT,
     MESSAGE_KEY_PREFIX,
     MESSAGES_INDEX_PREFIX,
     MIN_BINDING_LIFETIME,
@@ -839,6 +841,15 @@ class TestChannel:
         # Raising on celeryev would make every worker buffer every task event
         # for as long as Flower is down.
         assert not channel._lookup("celeryev", "task.succeeded")
+
+    def test_describe_message_names_a_non_task_payload_by_delivery_tag(self) -> None:
+        """The drop log falls back to the delivery tag when there is no task header."""
+        payload = json_dumps({"body": "x", "properties": {"delivery_tag": "tag-123"}})
+        assert Channel._describe_message(payload) == "<non-task message tag-123>"
+
+    def test_describe_message_survives_an_undecodable_payload(self) -> None:
+        """A corrupt payload must not crash the sweep that is dropping it."""
+        assert Channel._describe_message(b"\xff not json") == "<undecodable message>"
 
     def test_get_table_empty_exchange(self) -> None:
         """Test get_table returns empty list for exchange with no bindings."""
@@ -4409,10 +4420,51 @@ class TestMessageRequeue:
             # Call enqueue_due_messages - should restore the message
             requeued = channel.enqueue_due_messages()
 
-            assert requeued >= 1
+            assert requeued.enqueued >= 1
 
             # Message should now be back in the queue
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None
+
+    def test_the_sweep_reports_redeliveries_and_orphans(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """enqueue_due_messages returns per-sweep counters, so an operator can
+        see visibility-timeout redeliveries and cleaned-up orphaned index
+        entries instead of both passing silently."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            # A consumed-but-never-acked message, past its deadline
+            redelivered_tag = "sweep-stats-redelivery"
+            client.hset(
+                f"{MESSAGE_KEY_PREFIX}{redelivered_tag}",
+                mapping={
+                    "payload": json_dumps({"body": "test", "properties": {"delivery_tag": redelivered_tag}}),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "native_delayed": "0",
+                    "delivery_count": "0",
+                },
+            )
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {redelivered_tag: time.time() - 100})
+
+            # An index entry whose message hash is gone (already acked elsewhere)
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {"sweep-stats-orphan": time.time() - 100})
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            stats = channel.enqueue_due_messages()
+
+            assert stats.enqueued == 1
+            assert stats.redelivered == 1
+            assert stats.orphaned == 1
+            assert stats.dropped == 0
 
     def test_requeue_skips_message_still_in_queue(
         self,
@@ -6108,12 +6160,107 @@ class TestDeliveryCount:
 
             # This should drop the message (delivery_count would become 3, reaching the limit of 2)
             enqueued = channel.enqueue_due_messages()
-            assert enqueued == 0
+            assert enqueued.enqueued == 0
 
             # Message hash and index entry should be gone
             assert not client.exists(message_key)
             assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is None
             assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None
+
+    def test_a_dropped_message_is_named_in_the_log(
+        self,
+        celery_app: Celery,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The drop log names the task so an operator can tell what was lost,
+        and speaks of the delivery limit, not the renamed max restore count."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.delivery_limit = 2
+            client = channel.client
+
+            delivery_tag = "drop-report-test"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            payload = {
+                "body": "test",
+                "headers": {"task": "myapp.tasks.add", "id": "0f8d9c3a-report"},
+                "properties": {"delivery_tag": delivery_tag},
+            }
+            client.hset(
+                f"{MESSAGE_KEY_PREFIX}{delivery_tag}",
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "native_delayed": "0",
+                    "delivery_count": "1",
+                },
+            )
+            # Past due and absent from the queue: a redelivery, which hits the limit of 2
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() - 100})
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            with caplog.at_level(logging.ERROR, logger="celery_redis_plus.transport"):
+                stats = channel.enqueue_due_messages()
+
+            assert stats.dropped == 1
+            dropped_records = [r for r in caplog.records if "dropped" in r.getMessage()]
+            assert len(dropped_records) == 1
+            text = dropped_records[0].getMessage()
+            assert "myapp.tasks.add" in text
+            assert "0f8d9c3a-report" in text
+            assert "delivery limit" in text
+            assert "max restore count" not in text
+
+    def test_the_drop_log_caps_at_the_report_limit(
+        self,
+        celery_app: Celery,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A poison flood names DROPPED_REPORT_LIMIT messages and marks the rest."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.delivery_limit = 2
+            client = channel.client
+
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+            flood_size = DROPPED_REPORT_LIMIT + 2
+            for i in range(flood_size):
+                delivery_tag = f"drop-cap-{i}"
+                payload = {
+                    "body": "test",
+                    "headers": {"task": "myapp.tasks.flood", "id": f"flood-{i}"},
+                    "properties": {"delivery_tag": delivery_tag},
+                }
+                client.hset(
+                    f"{MESSAGE_KEY_PREFIX}{delivery_tag}",
+                    mapping={
+                        "payload": json_dumps(payload),
+                        "routing_key": "celery",
+                        "priority": "0",
+                        "native_delayed": "0",
+                        "delivery_count": "2",
+                    },
+                )
+                client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() - 100})
+
+            if "celery" not in channel._active_queues:
+                channel._active_queues.append("celery")
+            channel._queue_cycle = list(channel.active_queues)
+
+            with caplog.at_level(logging.ERROR, logger="celery_redis_plus.transport"):
+                stats = channel.enqueue_due_messages()
+
+            assert stats.dropped == flood_size
+            dropped_records = [r for r in caplog.records if "dropped" in r.getMessage()]
+            assert len(dropped_records) == 1
+            text = dropped_records[0].getMessage()
+            assert text.count("(id ") == DROPPED_REPORT_LIMIT
+            assert text.endswith(", ...")
 
     @pytest.mark.parametrize(
         ("delivery_count", "expect_dropped"),
@@ -6206,7 +6353,7 @@ class TestDeliveryCount:
             channel._queue_cycle = list(channel.active_queues)
 
             enqueued = channel.enqueue_due_messages()
-            assert enqueued == 0
+            assert enqueued.enqueued == 0
 
             # All traces of the message should be gone
             assert not client.exists(message_key)
@@ -6259,7 +6406,7 @@ class TestDeliveryCount:
 
             # Should still enqueue (no limit)
             enqueued = channel.enqueue_due_messages()
-            assert enqueued == 1
+            assert enqueued.enqueued == 1
 
             # Message should exist and delivery_count incremented
             assert client.exists(message_key)

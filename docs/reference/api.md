@@ -181,6 +181,7 @@ The following constants are used internally and define default behavior:
 | `DEFAULT_REQUEUE_BATCH_LIMIT` | `1000` | Max messages processed per requeue cycle |
 | `DEFAULT_STREAM_MAXLEN` | `10000` | Default max length for fanout streams |
 | `DEFAULT_MESSAGE_TTL` | `-1` | Default TTL for message hashes (no TTL) |
+| `DROPPED_REPORT_LIMIT` | `10` | Max dropped messages named per queue per sweep in the error log |
 | `PRIORITY_SCORE_MULTIPLIER` | `10^13` | Multiplier for priority in score calculation |
 | `QUEUE_KEY_PREFIX` | `"queue:"` | Prefix for queue sorted sets |
 | `MESSAGE_KEY_PREFIX` | `"message:"` | Prefix for message hashes |

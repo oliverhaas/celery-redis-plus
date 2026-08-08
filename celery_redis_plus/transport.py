@@ -70,7 +70,7 @@ from contextlib import contextmanager, suppress
 from pathlib import Path
 from queue import Empty
 from time import time
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -106,6 +106,7 @@ from .constants import (
     DEFAULT_REQUEUE_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
     DEFAULT_VISIBILITY_TIMEOUT,
+    DROPPED_REPORT_LIMIT,
     MAX_PRIORITY,
     MESSAGE_KEY_PREFIX,
     MESSAGES_INDEX_PREFIX,
@@ -166,6 +167,15 @@ _channel_errors = virtual.Transport.channel_errors + (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class SweepStats(NamedTuple):
+    """What one requeue sweep did, per enqueue_due_messages call."""
+
+    enqueued: int = 0
+    dropped: int = 0
+    redelivered: int = 0
+    orphaned: int = 0
 
 
 DEFAULT_PORT = 6379
@@ -543,7 +553,7 @@ class QoS(virtual.QoS):
         except Exception:
             logger.warning("Failed to update messages index, will retry next cycle", exc_info=True)
 
-    def enqueue_due_messages(self) -> int:
+    def enqueue_due_messages(self) -> SweepStats:
         """Enqueue messages due before the next requeue cycle.
 
         This unified method handles both:
@@ -553,7 +563,7 @@ class QoS(virtual.QoS):
         Uses a Lua script for atomic, efficient batch processing.
 
         Returns:
-            Number of messages enqueued.
+            SweepStats totalled across the channel's active queues.
         """
         return self.channel.enqueue_due_messages()
 
@@ -682,7 +692,7 @@ class MultiChannelPoller:
         for channel in self._channels:
             qos = channel.qos
             if qos is not None and channel.active_queues:
-                total_enqueued += cast("QoS", qos).enqueue_due_messages()
+                total_enqueued += cast("QoS", qos).enqueue_due_messages().enqueued
         return total_enqueued
 
     def maybe_update_messages_index(self) -> None:
@@ -1421,7 +1431,7 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             return int(client.zcard(self._queue_key(queue)))
 
-    def enqueue_due_messages(self) -> int:
+    def enqueue_due_messages(self) -> SweepStats:
         """Enqueue messages due before the next requeue cycle.
 
         This unified method handles both:
@@ -1432,14 +1442,14 @@ class Channel(virtual.Channel):
         a Lua script that atomically moves due messages into the queue.
 
         Returns:
-            Number of messages enqueued.
+            SweepStats totalled across the active queues.
         """
         if not self._queue_cycle:
-            return 0
+            return SweepStats()
 
         now = time()
         threshold = now + DEFAULT_REQUEUE_CHECK_INTERVAL
-        total_enqueued = 0
+        totals = SweepStats()
 
         delivery_limit = -1 if self.delivery_limit is None else self.delivery_limit
 
@@ -1461,17 +1471,34 @@ class Channel(virtual.Channel):
                             self.global_keyprefix,
                             QUEUE_KEY_PREFIX,
                             delivery_limit,
+                            DROPPED_REPORT_LIMIT,
                         ],
                     )
-                    # Lua returns [enqueued_count, dropped_count]
-                    enqueued = result[0] if result else 0
-                    dropped = result[1] if result and len(result) > 1 else 0
+                    enqueued, dropped, redelivered, orphaned, dropped_payloads = result
                     if dropped:
+                        # The Lua script deleted these hashes, so this log line
+                        # is the only remaining trace of the messages
+                        described = ", ".join(self._describe_message(payload) for payload in dropped_payloads)
+                        if dropped > len(dropped_payloads):
+                            described += ", ..."
                         logger.error(
-                            "Queue %s: %d message(s) dropped after exceeding max restore count of %d.",
+                            "Queue %s: %d message(s) dropped after reaching the delivery limit of %d: %s",
                             queue,
                             dropped,
                             self.delivery_limit,
+                            described,
+                        )
+                    if redelivered:
+                        logger.info(
+                            "Queue %s: %d message(s) redelivered after their visibility timeout expired.",
+                            queue,
+                            redelivered,
+                        )
+                    if orphaned:
+                        logger.info(
+                            "Queue %s: removed %d orphaned index entries (message already acked or expired).",
+                            queue,
+                            orphaned,
                         )
                     if enqueued >= DEFAULT_REQUEUE_BATCH_LIMIT:
                         logger.warning(
@@ -1479,7 +1506,12 @@ class Channel(virtual.Channel):
                             queue,
                             DEFAULT_REQUEUE_BATCH_LIMIT,
                         )
-                    total_enqueued += enqueued
+                    totals = SweepStats(
+                        totals.enqueued + enqueued,
+                        totals.dropped + dropped,
+                        totals.redelivered + redelivered,
+                        totals.orphaned + orphaned,
+                    )
                 except Exception:
                     logger.warning(
                         "Failed to enqueue due messages for queue %s, will retry next cycle",
@@ -1487,7 +1519,25 @@ class Channel(virtual.Channel):
                         exc_info=True,
                     )
 
-        return total_enqueued
+        return totals
+
+    @staticmethod
+    def _describe_message(payload: bytes | str) -> str:
+        """One-line description of a raw payload, for log lines about messages
+        that no longer exist anywhere else."""
+        try:
+            message = loads(bytes_to_str(payload))
+            headers = message.get("headers") or {}
+            task = headers.get("task")
+            task_id = headers.get("id")
+            if task or task_id:
+                return f"{task or '<unknown task>'} (id {task_id or '?'})"
+            delivery_tag = (message.get("properties") or {}).get("delivery_tag")
+            if delivery_tag:
+                return f"<non-task message {delivery_tag}>"
+        except Exception:
+            logger.debug("Could not decode a dropped message payload for logging.", exc_info=True)
+        return "<undecodable message>"
 
     def _requeue_by_tag(self, delivery_tag: str, queue: str | None = None, leftmost: bool = False) -> bool:
         """Requeue a rejected message to its queue using Lua script.
