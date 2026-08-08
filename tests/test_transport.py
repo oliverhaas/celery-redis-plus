@@ -2572,7 +2572,7 @@ class TestFastSlowConsumeMode:
 
         assert result is True
         delivered_msg = mock_connection._deliver.call_args[0][0]
-        assert delivered_msg["properties"]["headers"]["x-delivery-count"] == 3
+        assert delivered_msg["headers"]["x-delivery-count"] == 3
 
     def test_fast_consume_read_switches_to_slow_on_empty(self, global_keyprefix: str) -> None:
         """Test FAST mode switches to SLOW and sends BZMPOP when queue is empty."""
@@ -5939,10 +5939,54 @@ class TestDeliveryCount:
 
             message = channel._get("celery")
             assert message is not None
-            assert message["properties"]["headers"]["x-delivery-count"] == 3
+            assert message["headers"]["x-delivery-count"] == 3
+            # properties["headers"] never reaches the consumer
+            assert "x-delivery-count" not in message["properties"]["headers"]
             # celery reads delivery_info['redelivered'] in Request and trace, and
             # it gates worker_deduplicate_successful_tasks
             assert message["properties"]["delivery_info"]["redelivered"] is True
+
+    def test_a_redelivery_is_visible_to_the_consumer(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """kombu's Message builds .headers from the payload's top-level headers
+        dict, so that is where x-delivery-count has to live to reach a consumer
+        or a task. properties["headers"] is never surfaced."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "redelivery-visibility-test"
+            payload = {
+                "body": "test",
+                "headers": {},
+                "properties": {
+                    "delivery_tag": delivery_tag,
+                    "headers": {},
+                },
+            }
+
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "delivery_count": "3",
+                },
+            )
+            client.zadd(f"{QUEUE_KEY_PREFIX}celery", {delivery_tag: 1.0})
+            client.zadd(f"{MESSAGES_INDEX_PREFIX}celery", {delivery_tag: time.time() + 300})
+
+            raw = channel._get("celery")
+            assert raw is not None
+            message = channel.Message(raw, channel=channel)
+            assert message.headers["x-delivery-count"] == 3
+            assert message.delivery_info["redelivered"] is True
 
     def test_delivery_count_header_absent_when_zero(
         self,
@@ -5981,7 +6025,7 @@ class TestDeliveryCount:
 
             message = channel._get("celery")
             assert message is not None
-            assert "x-delivery-count" not in message["properties"].get("headers", {})
+            assert "x-delivery-count" not in (message.get("headers") or {})
 
     def test_message_dropped_when_max_exceeded(
         self,

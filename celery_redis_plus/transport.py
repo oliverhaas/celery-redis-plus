@@ -1096,14 +1096,18 @@ class Channel(virtual.Channel):
         """Set the AMQP redelivery flags on a consumed message.
 
         Both are derived from the stored counter rather than a separate field.
+        x-delivery-count goes into the payload's top-level headers dict, which
+        is what kombu's virtual Message builds .headers from; a value in
+        properties['headers'] never reaches a consumer or a task.
         delivery_info['redelivered'] is where kombu's own Redis transport puts
         it, and the only place celery looks, in Request and trace, for
         worker_deduplicate_successful_tasks.
         """
         if delivery_count <= 0:
             return
+        message["headers"] = headers = message.get("headers") or {}
+        headers["x-delivery-count"] = delivery_count
         properties = message.setdefault("properties", {})
-        properties.setdefault("headers", {})["x-delivery-count"] = delivery_count
         properties.setdefault("delivery_info", {})["redelivered"] = True
 
     def _parse_consume_result(self, result: list[Any]) -> tuple[str, dict[str, Any]]:
