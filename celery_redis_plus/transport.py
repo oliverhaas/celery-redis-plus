@@ -1764,7 +1764,7 @@ class Channel(virtual.Channel):
             return bool(client.exists(self._queue_key(queue)))
 
     def _lookup(self, exchange: str, routing_key: str, default: str | None = None) -> list[str] | set[str]:
-        """Find queues bound to an exchange, raising rather than dropping for direct.
+        """Find queues bound to an exchange, raising rather than dropping for durable direct.
 
         kombu returns an empty list when an exchange's binding table is empty and
         the publish is silently discarded. That was a deliberate change in kombu
@@ -1772,22 +1772,21 @@ class Channel(virtual.Channel):
         empty table is the normal AMQP state for an exchange whose queues were all
         unbound.
 
-        The reasoning holds for topic and fanout. It does not hold for direct,
-        where the binding is known to exist, and it especially does not hold once
-        bindings carry a staleness deadline, which they do here, because then an
-        empty table also means the binding aged out.
+        The reasoning holds for topic and fanout. It does not hold for a durable
+        direct exchange, where the binding is known to exist, and it especially
+        does not hold once bindings carry a staleness deadline, which they do
+        here, because then an empty table also means the binding aged out.
 
         InconsistencyError is in this transport's connection_errors, so kombu's
         Connection.ensure reconnects, clears declared_entities, redeclares (which
         recreates the binding via ZADD) and retries. If it fails again the caller
-        gets an OperationalError. That is also what a worker replying to a client
-        that is already gone gets: Mailbox._publish_reply does catch
-        InconsistencyError, but it publishes with retry=True, so Connection.ensure
-        converts the second raise into an OperationalError that the catch misses,
-        and the worker logs it and resets its pidbox channel. That predates the
-        staleness deadline -- a client that cleans up after itself empties the
-        reply table on its way out -- but the deadline makes it reachable for a
-        client that did not.
+        gets an OperationalError.
+
+        A transient direct exchange gets kombu's drop instead, with an INFO log.
+        Its bindings empty by design whenever its consumers go away: a pidbox
+        reply exchange loses its binding the moment the control client leaves,
+        and the publisher redeclaring its own entities could never recreate a
+        binding that belonged to someone else, so the retry loop only churned.
 
         Raised here rather than in get_table like pre-5.2 kombu did, because
         exchange_delete, queue_unbind and list_bindings also call get_table and
@@ -1797,6 +1796,13 @@ class Channel(virtual.Channel):
         # get_table runs a second time only on the miss path, to tell "no bindings
         # at all" apart from "bindings exist but none match this routing key".
         if not queues and self.typeof(exchange).type == "direct" and not self.get_table(exchange):
+            if not self._exchange_is_durable(exchange):
+                logger.info(
+                    "Dropped message to transient exchange %r with routing key %r: binding table is empty.",
+                    exchange,
+                    routing_key,
+                )
+                return queues
             key = self._binding_key(exchange)
             msg = (
                 f"Cannot route message for direct exchange {exchange!r}: binding table is empty. "
@@ -1805,6 +1811,18 @@ class Channel(virtual.Channel):
             )
             raise InconsistencyError(msg)
         return queues
+
+    def _exchange_is_durable(self, exchange: str) -> bool:
+        """Whether the exchange was declared durable.
+
+        An exchange this process never declared has no state entry. Assume
+        durable then, which keeps the raise-and-redeclare path the default for
+        exchanges whose bindings are supposed to outlive their consumers.
+        """
+        entry = (self.state.exchanges or {}).get(exchange)
+        if not entry:
+            return True
+        return bool(entry.get("durable", True))
 
     def _read_bindings(self, client: Any, exchange: str) -> Any:
         """Read the live bindings of an exchange, dropping the ones that aged out.

@@ -758,12 +758,15 @@ class TestChannel:
             channel._prepare_virtual_host("invalid")
 
     def test_publish_to_an_exchange_without_bindings_raises(self) -> None:
-        """Test that a direct exchange with an empty binding table raises, not drops."""
+        """Test that a durable direct exchange with an empty binding table raises, not drops."""
         channel = object.__new__(Channel)
         channel.keyprefix_queue = "_kombu.binding.%s"
         channel.sep = "\x06\x16"
         channel.typeof = MagicMock(return_value=virtual.exchange.DirectExchange(channel))
         channel.deadletter_queue = None
+        # Never declared by this process, so durability is unknown and assumed
+        channel.connection = MagicMock()
+        channel.connection.state = virtual.BrokerState()
 
         mock_client = MagicMock()
         _stub_binding_table(mock_client, [])
@@ -773,11 +776,50 @@ class TestChannel:
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
 
         with pytest.raises(InconsistencyError, match="binding table is empty"):
-            channel._lookup("reply.celery.pidbox", "some-ticket-uuid")
+            channel._lookup("myapp.direct", "some-routing-key")
 
         # InconsistencyError is in connection_errors, so kombu's ensure reconnects,
         # redeclares the binding and retries instead of surfacing it directly.
         assert InconsistencyError in Transport.connection_errors
+
+    def test_publish_to_a_transient_exchange_without_bindings_is_dropped(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A transient exchange empties by design when its consumers go away:
+        a pidbox reply exchange loses its binding the moment the control
+        client leaves. Redeclaring could never recreate someone else's
+        binding, so the message is dropped instead of retried forever."""
+        channel = object.__new__(Channel)
+        channel.keyprefix_queue = "_kombu.binding.%s"
+        channel.sep = "\x06\x16"
+        channel.typeof = MagicMock(return_value=virtual.exchange.DirectExchange(channel))
+        channel.deadletter_queue = None
+        channel.connection = MagicMock()
+        channel.connection.state = virtual.BrokerState()
+        channel.connection.state.exchanges = {
+            "reply.celery.pidbox": {
+                "type": "direct",
+                "durable": False,
+                "auto_delete": True,
+                "arguments": None,
+                "table": [],
+            },
+        }
+
+        mock_client = MagicMock()
+        _stub_binding_table(mock_client, [])
+        mock_context = MagicMock()
+        mock_context.__enter__ = MagicMock(return_value=mock_client)
+        mock_context.__exit__ = MagicMock(return_value=False)
+        channel.conn_or_acquire = MagicMock(return_value=mock_context)
+
+        with caplog.at_level(logging.INFO, logger="celery_redis_plus.transport"):
+            assert not channel._lookup("reply.celery.pidbox", "some-ticket-uuid")
+
+        dropped_records = [r for r in caplog.records if "transient" in r.getMessage()]
+        assert len(dropped_records) == 1
+        assert "reply.celery.pidbox" in dropped_records[0].getMessage()
 
     def test_lookup_topic_exchange_without_bindings_still_discards(self) -> None:
         """Test that only direct exchanges raise: celeryev must not block publishers."""
@@ -3624,7 +3666,8 @@ class TestQueueOperations:
         bindings_key = f"{global_keyprefix}_kombu.binding.test_abandoned"
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
-            channel.exchange_declare(exchange="test_abandoned", type="direct")
+            # durable, because a transient exchange would get kombu's silent drop
+            channel.exchange_declare(exchange="test_abandoned", type="direct", durable=True)
             channel._queue_bind(
                 exchange="test_abandoned",
                 routing_key="live_key",
