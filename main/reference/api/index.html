@@ -983,6 +983,12 @@
 <td>Seconds BZMPOP and XREAD block on the server per poll</td>
 </tr>
 <tr>
+<td><code>queue_expires</code></td>
+<td><code>int</code> or <code>None</code></td>
+<td><code>None</code></td>
+<td>Expiry in seconds for queues declared without <code>x-expires</code>; also puts TTLs on binding tables and fanout streams</td>
+</tr>
+<tr>
 <td><code>global_keyprefix</code></td>
 <td><code>str</code></td>
 <td><code>""</code></td>
@@ -1009,7 +1015,27 @@ read as <code>blocking_timeout</code> and logs a deprecation warning, and the sl
 stays off.</p>
 <p>Keep <code>blocking_timeout</code> below <code>socket_timeout</code> if you set one. The poll is
 an ordinary read on the connection, so a socket timeout shorter than the
-block turns every empty poll into a read timeout and a reconnect.</p>
+block turns every empty poll into a read timeout and a reconnect. A value
+of <code>0</code> is passed through as-is and makes the server hold every poll open
+until a message arrives.</p>
+</div>
+<div class="admonition note">
+<p class="admonition-title"><code>queue_expires</code> cleans up the broker, deployment-wide</p>
+<p>With <code>queue_expires</code> set, queues and their message indexes carry TTLs (as
+if each queue had <code>x-expires</code>), and so do binding tables and fanout
+streams. Everything is refreshed by the same declares, publishes and
+periodic refreshes that keep queues alive, so an abandoned deployment's
+keys expire on their own. The exception is <code>message:{tag}</code> hashes: they
+only get a TTL from <code>message_ttl</code> (or a queue's <code>x-message-ttl</code>), and once
+a queue's index has expired no sweep can reach them again, so pair
+<code>queue_expires</code> with <code>message_ttl</code> if unconsumed payloads must not outlive
+their queue. A per-queue <code>x-expires</code> still wins over the global value, and
+the same 10-second floor applies.</p>
+<p>Set it in every process sharing the broker. A process running without the
+option never refreshes these TTLs, so routes it depends on could expire
+from under it (the durable-exchange redeclare path heals this, at the cost
+of a retry). Size it like <code>x-expires</code>: longer than the longest gap in which
+no worker, producer, or refresh timer touches the busiest queue.</p>
 </div>
 <div class="admonition note">
 <p class="admonition-title">How <code>delivery_limit</code> counts</p>
@@ -1281,6 +1307,16 @@ thread, so the event loop keeps ticking and the refresh works.</p>
 <td><code>DEFAULT_MESSAGE_TTL</code></td>
 <td><code>-1</code></td>
 <td>Default TTL for message hashes (no TTL)</td>
+</tr>
+<tr>
+<td><code>DEFAULT_QUEUE_EXPIRES</code></td>
+<td><code>None</code></td>
+<td>Default global queue expiry (queues persist)</td>
+</tr>
+<tr>
+<td><code>DROPPED_REPORT_LIMIT</code></td>
+<td><code>10</code></td>
+<td>Max dropped messages named per queue per sweep in the error log</td>
 </tr>
 <tr>
 <td><code>PRIORITY_SCORE_MULTIPLIER</code></td>
