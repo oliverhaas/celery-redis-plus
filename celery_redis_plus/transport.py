@@ -902,6 +902,9 @@ class Channel(virtual.Channel):
         self.ResponseError = _client_exceptions.ResponseError
         self.active_fanout_queues: set[str] = set()
         self.auto_delete_queues: set[str] = set()
+        # Queues consumed with no_ack=True; the consume script dequeues these at
+        # pop time instead of giving them a deadline nothing would ever ack away
+        self._no_ack_queues: set[str] = set()
         self._fanout_queues: dict[str, tuple[str, str]] = {}
         self.handlers = {"BZMPOP": self._bzmpop_read, "XREAD": self._xread_read}
         # Track last-read stream ID per stream for fanout (start with $ = only new messages)
@@ -969,6 +972,15 @@ class Channel(virtual.Channel):
         """Get the Redis key for a message's per-message hash."""
         return f"{self.message_key_prefix}{delivery_tag}"
 
+    def _next_queue_at(self) -> float:
+        """The visibility deadline for a message delivered right now.
+
+        DEFAULT_REQUEUE_CHECK_INTERVAL on top of the visibility timeout
+        compensates for the look-ahead threshold in enqueue_due_messages, so
+        a message is never restored before its full timeout has passed.
+        """
+        return time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
+
     def _queue_key(self, queue: str) -> str:
         """Get the Redis key for a queue's sorted set.
 
@@ -1014,15 +1026,15 @@ class Channel(virtual.Channel):
         """
         consume_script = self.client.register_script(_CONSUME_MESSAGE_LUA)
         queue_key = f"{self.global_keyprefix}{self._queue_key(queue)}"
-        new_queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
         result = consume_script(
             keys=[queue_key],
             args=[
                 self.global_keyprefix,
                 self.message_key_prefix,
-                str(new_queue_at),
+                str(self._next_queue_at()),
                 MESSAGES_INDEX_PREFIX,
                 queue,
+                "1" if queue in self._no_ack_queues else "0",
             ],
         )
         if not result:
@@ -1042,10 +1054,12 @@ class Channel(virtual.Channel):
     def _restore_at_beginning(self, message: Any) -> None:
         return self._restore(message, leftmost=True)
 
-    def basic_consume(self, queue: str, *args: Any, **kwargs: Any) -> str:
+    def basic_consume(self, queue: str, no_ack: bool, callback: Any, consumer_tag: str | None, **kwargs: Any) -> str:
         if queue in self._fanout_queues:
             self.active_fanout_queues.add(queue)
-        ret = super().basic_consume(queue, *args, **kwargs)
+        if no_ack:
+            self._no_ack_queues.add(queue)
+        ret = super().basic_consume(queue, no_ack, callback, consumer_tag, **kwargs)
         self._queue_cycle = list(self.active_queues)
         return ret
 
@@ -1064,6 +1078,7 @@ class Channel(virtual.Channel):
             return None
         with suppress(KeyError):
             self.active_fanout_queues.remove(queue)
+        self._no_ack_queues.discard(queue)
         ret = super().basic_cancel(consumer_tag)
         self._queue_cycle = list(self.active_queues)
         return ret
@@ -1113,13 +1128,13 @@ class Channel(virtual.Channel):
             # FAST mode: send non-blocking EVALSHA (atomic ZPOPMIN + ZADD + HMGET)
             sha = self._ensure_consume_script_sha()
             keys = [f"{self.global_keyprefix}{self._queue_key(q)}" for q in self._queue_cycle]
-            new_queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
             args = [
                 self.global_keyprefix,
                 self.message_key_prefix,
-                str(new_queue_at),
+                str(self._next_queue_at()),
                 MESSAGES_INDEX_PREFIX,
                 *self._queue_cycle,
+                *("1" if q in self._no_ack_queues else "0" for q in self._queue_cycle),
             ]
             self.client.connection.send_command(
                 "EVALSHA",
@@ -1212,10 +1227,16 @@ class Channel(virtual.Channel):
                 # the entry again.
                 index_key = self._messages_index_key(dest)
                 message_key = self._message_key(delivery_tag)
-                new_queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
                 with self.client.pipeline(transaction=False) as pipe:
-                    pipe.zadd(index_key, {delivery_tag: new_queue_at})
-                    pipe.hmget(message_key, "payload", "delivery_count")
+                    if dest in self._no_ack_queues:
+                        # Finished on delivery: drop the index entry and, after
+                        # reading it, the hash, like the consume script does
+                        pipe.zrem(index_key, delivery_tag)
+                        pipe.hmget(message_key, "payload", "delivery_count")
+                        pipe.delete(message_key)
+                    else:
+                        pipe.zadd(index_key, {delivery_tag: self._next_queue_at()})
+                        pipe.hmget(message_key, "payload", "delivery_count")
                     results = pipe.execute()
 
                 payload_json = results[1][0]
@@ -1353,7 +1374,22 @@ class Channel(virtual.Channel):
                 cmd_type = "EVALSHA"
         return client.parse_response(client.connection, cmd_type)
 
-    def _get(self, queue: str, timeout: float | None = None) -> dict[str, Any]:
+    def basic_get(self, queue: str, no_ack: bool = False, **kwargs: Any) -> Any:
+        """Get a single message synchronously.
+
+        Reimplements the kombu base method so no_ack reaches _get: a no_ack
+        get must dequeue the message inside the atomic pop rather than leave
+        it with a visibility deadline nobody will ever ack away.
+        """
+        try:
+            message = self.Message(self._get(queue, no_ack=no_ack), channel=self)
+            if not no_ack:
+                self.qos.append(message, message.delivery_tag)
+        except Empty:
+            return None
+        return message
+
+    def _get(self, queue: str, timeout: float | None = None, *, no_ack: bool = False) -> dict[str, Any]:
         """Get single message from queue (synchronous).
 
         Uses the atomic consume Lua script (ZPOPMIN + ZADD index + HMGET).
@@ -1361,15 +1397,15 @@ class Channel(virtual.Channel):
         with self.conn_or_acquire() as client:
             consume_script = client.register_script(_CONSUME_MESSAGE_LUA)
             queue_key = f"{self.global_keyprefix}{self._queue_key(queue)}"
-            new_queue_at = time() + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
             result = consume_script(
                 keys=[queue_key],
                 args=[
                     self.global_keyprefix,
                     self.message_key_prefix,
-                    str(new_queue_at),
+                    str(self._next_queue_at()),
                     MESSAGES_INDEX_PREFIX,
                     queue,
+                    "1" if no_ack else "0",
                 ],
             )
             if not result:
@@ -1525,9 +1561,7 @@ class Channel(virtual.Channel):
         # For native delayed messages: queue_at = eta (requeue mechanism delivers at eta)
         # For immediate messages: queue_at = now + VT + RCI (requeue if not acked;
         #   +RCI compensates for the look-ahead threshold in enqueue_due_messages)
-        queue_at = (
-            eta_timestamp if is_native_delayed else now + self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL
-        )
+        queue_at = eta_timestamp if is_native_delayed else self._next_queue_at()
 
         message_key = self._message_key(delivery_tag)
 

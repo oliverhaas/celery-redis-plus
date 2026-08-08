@@ -35,6 +35,7 @@ from celery_redis_plus.constants import (
     QUEUE_KEY_PREFIX,
 )
 from celery_redis_plus.transport import (
+    _CONSUME_MESSAGE_LUA,
     DEFAULT_DB,
     Channel,
     GlobalKeyPrefixMixin,
@@ -1459,6 +1460,7 @@ class TestChannel:
         channel.global_keyprefix = global_keyprefix
         channel._in_poll = True
         channel._consume_fast_mode = False  # SLOW mode (BZMPOP path)
+        channel._no_ack_queues = set()
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
 
         mock_client = MagicMock()
@@ -2664,6 +2666,7 @@ class TestFastSlowConsumeMode:
         channel.global_keyprefix = global_keyprefix
         channel._in_poll = True
         channel._consume_fast_mode = False
+        channel._no_ack_queues = set()
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
 
         mock_client = MagicMock()
@@ -2725,6 +2728,7 @@ class TestFastSlowConsumeMode:
         channel._consume_fast_mode = True
         channel._consume_script_sha = "test_sha_123"
         channel._queue_cycle = ["celery"]
+        channel._no_ack_queues = set()
         channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
 
         mock_conn = MagicMock()
@@ -2764,6 +2768,66 @@ class TestFastSlowConsumeMode:
         assert channel._in_poll is mock_conn
         sent_args = mock_conn.send_command.call_args[0]
         assert sent_args[0] == "BZMPOP"
+
+    def test_fast_consume_sends_a_no_ack_flag_per_queue(self, global_keyprefix: str) -> None:
+        """FAST mode appends one '0'/'1' flag per queue so the Lua script can
+        dequeue no_ack deliveries instead of giving them a visibility deadline."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._consume_fast_mode = True
+        channel._consume_script_sha = "test_sha_123"
+        channel._queue_cycle = ["celery", "replies"]
+        channel._no_ack_queues = {"replies"}
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+
+        mock_conn = MagicMock()
+        mock_client = MagicMock()
+        mock_client.connection = mock_conn
+        channel.client = mock_client
+        channel.connection = MagicMock()
+        channel.connection.blocking_timeout = 1
+
+        channel._bzmpop_start(timeout=1)
+
+        sent_args = mock_conn.send_command.call_args[0]
+        # ARGV tail: the queue names, then their flags in the same order
+        assert sent_args[-4:] == ("celery", "replies", "0", "1")
+
+    def test_slow_consume_read_dequeues_for_a_no_ack_queue(self, global_keyprefix: str) -> None:
+        """SLOW mode must not give a no_ack delivery a visibility deadline:
+        it removes the index entry and deletes the hash after reading it."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = False
+        channel._no_ack_queues = {"my_queue"}
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        mock_client.parse_response.return_value = (
+            b"queue:my_queue",
+            [(b"tag123", 100.0)],
+        )
+
+        mock_pipe = MagicMock()
+        mock_pipe.execute.return_value = [1, [b'{"body": "test"}', b"0"], 1]
+        mock_client.pipeline.return_value.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_client.pipeline.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = channel._bzmpop_read()
+
+        assert result is True
+        mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
+        mock_pipe.zadd.assert_not_called()
+        mock_pipe.zrem.assert_called_once()
+        mock_pipe.delete.assert_called_once()
 
     def test_poll_error_uses_evalsha_in_fast_mode(self) -> None:
         """Test _poll_error parses EVALSHA response when in FAST mode."""
@@ -5506,6 +5570,167 @@ class TestTransportDelivery:
         # Verify timing for delayed tasks
         if countdown:
             assert elapsed >= countdown - 0.5, f"Completed too fast: {elapsed:.2f}s"
+
+
+@pytest.mark.integration
+class TestNoAckConsumption:
+    """A no_ack consumer never acks, so the atomic pop itself must dequeue.
+
+    Otherwise the index entry leaks until the requeue sweep restores the
+    already-consumed message for a second delivery nobody can ack away
+    either. pidbox control and reply queues all consume with no_ack=True.
+    """
+
+    def test_no_ack_consumption_leaves_no_index_entry(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "no-ack-get-test"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+            channel._put(
+                "celery",
+                {
+                    "body": "test",
+                    "properties": {
+                        "delivery_tag": delivery_tag,
+                        "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    },
+                },
+            )
+
+            message = channel.basic_get("celery", no_ack=True)
+
+            assert message is not None
+            assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is None
+            assert not client.exists(f"{MESSAGE_KEY_PREFIX}{delivery_tag}")
+
+    def test_an_ordinary_get_still_gets_a_visibility_deadline(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            delivery_tag = "acked-get-test"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+            channel._put(
+                "celery",
+                {
+                    "body": "test",
+                    "properties": {
+                        "delivery_tag": delivery_tag,
+                        "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    },
+                },
+            )
+
+            message = channel.basic_get("celery")
+
+            assert message is not None
+            assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is not None
+            assert client.exists(f"{MESSAGE_KEY_PREFIX}{delivery_tag}")
+            channel.basic_ack(message.delivery_tag)
+
+    def test_no_ack_leaves_no_index_entry_on_the_consume_path(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """The registered-consumer path: basic_consume(no_ack=True) must flag
+        the queue so the consume script dequeues, and basic_cancel must
+        unflag it."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
+
+            received = []
+            channel.basic_consume(
+                "celery",
+                no_ack=True,
+                callback=received.append,
+                consumer_tag="no-ack-consumer",
+            )
+            try:
+                assert "celery" in channel._no_ack_queues
+
+                delivery_tag = "no-ack-consume-test"
+                channel._put(
+                    "celery",
+                    {
+                        "body": "test",
+                        "properties": {
+                            "delivery_tag": delivery_tag,
+                            "delivery_info": {"exchange": "", "routing_key": "celery"},
+                        },
+                    },
+                )
+
+                assert channel._drain_expired_and_deliver("celery") is True
+
+                assert len(received) == 1
+                assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is None
+                assert not client.exists(f"{MESSAGE_KEY_PREFIX}{delivery_tag}")
+            finally:
+                channel.basic_cancel("no-ack-consumer")
+            assert "celery" not in channel._no_ack_queues
+
+    def test_the_consume_script_reads_the_flag_of_the_right_queue(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """The per-queue no_ack flags ride ARGV after the queue names, so with
+        several queues the script must pair each pop with its own queue's flag."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+            prefix = channel.global_keyprefix
+
+            for queue, tag in (("acked_q", "flag-acked"), ("noack_q", "flag-noack")):
+                client.delete(f"{QUEUE_KEY_PREFIX}{queue}", f"{MESSAGES_INDEX_PREFIX}{queue}")
+                channel._put(
+                    queue,
+                    {
+                        "body": "test",
+                        "properties": {
+                            "delivery_tag": tag,
+                            "delivery_info": {"exchange": "", "routing_key": queue},
+                        },
+                    },
+                )
+
+            consume_script = client.register_script(_CONSUME_MESSAGE_LUA)
+            keys = [f"{prefix}{QUEUE_KEY_PREFIX}acked_q", f"{prefix}{QUEUE_KEY_PREFIX}noack_q"]
+            args = [
+                prefix,
+                MESSAGE_KEY_PREFIX,
+                str(time.time() + 300),
+                MESSAGES_INDEX_PREFIX,
+                "acked_q",
+                "noack_q",
+                "0",
+                "1",
+            ]
+            first = consume_script(keys=keys, args=args)
+            second = consume_script(keys=keys, args=args)
+            popped = {bytes_to_str(result[0]) for result in (first, second)}
+            assert popped == {"acked_q", "noack_q"}
+
+            assert client.zscore(f"{MESSAGES_INDEX_PREFIX}acked_q", "flag-acked") is not None
+            assert client.exists(f"{MESSAGE_KEY_PREFIX}flag-acked")
+            assert client.zscore(f"{MESSAGES_INDEX_PREFIX}noack_q", "flag-noack") is None
+            assert not client.exists(f"{MESSAGE_KEY_PREFIX}flag-noack")
+
+            client.delete(
+                f"{QUEUE_KEY_PREFIX}acked_q",
+                f"{MESSAGES_INDEX_PREFIX}acked_q",
+                f"{MESSAGE_KEY_PREFIX}flag-acked",
+            )
 
 
 @pytest.mark.integration

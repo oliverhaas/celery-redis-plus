@@ -10,7 +10,8 @@
 -- ARGV: [1] = global_keyprefix, [2] = message_key_prefix,
 --       [3] = new_queue_at (now + visibility_timeout, as string number),
 --       [4] = messages_index_prefix,
---       [5..5+N-1] = queue_name_1, queue_name_2, ... (raw names, same order as KEYS)
+--       [5..4+N] = queue_name_1, queue_name_2, ... (raw names, same order as KEYS),
+--       [5+N..4+2N] = no_ack flag per queue ('1' or '0', same order as KEYS)
 -- Returns: {queue_name, delivery_tag, payload, delivery_count} or nil
 
 local global_keyprefix = ARGV[1]
@@ -53,13 +54,22 @@ for _attempt = 1, max_attempts do
     local fields = redis.call('HMGET', message_key, 'payload', 'delivery_count')
 
     if fields[1] then
-        -- Valid message: set the messages_index score for visibility timeout.
-        -- Not 'XX': an entry missing here would leave the message delivered with
-        -- nothing tracking it, so a worker crash would lose it permanently. The
-        -- guard bought nothing anyway, since this runs only after HMGET confirmed
-        -- the hash exists and the whole script is atomic.
         local index_key = global_keyprefix .. messages_index_prefix .. queue_name
-        redis.call('ZADD', index_key, new_queue_at, tag)
+        if ARGV[4 + num_queues + best_idx] == '1' then
+            -- no_ack consumer: the message is finished the moment it is
+            -- delivered. Dequeue it here instead of giving it a visibility
+            -- deadline nobody will ever ack away, which would leak the index
+            -- entry and redeliver the message on the next requeue sweep.
+            redis.call('ZREM', index_key, tag)
+            redis.call('DEL', message_key)
+        else
+            -- Valid message: set the messages_index score for visibility timeout.
+            -- Not 'XX': an entry missing here would leave the message delivered with
+            -- nothing tracking it, so a worker crash would lose it permanently. The
+            -- guard bought nothing anyway, since this runs only after HMGET confirmed
+            -- the hash exists and the whole script is atomic.
+            redis.call('ZADD', index_key, new_queue_at, tag)
+        end
         return {queue_name, tag, fields[1], fields[2] or '0'}
     else
         -- Message hash expired (x-message-ttl): clean up index and try next
