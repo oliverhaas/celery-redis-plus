@@ -102,6 +102,7 @@ from .constants import (
     DEFAULT_HEALTH_CHECK_INTERVAL,
     DEFAULT_DELIVERY_LIMIT,
     DEFAULT_MESSAGE_TTL,
+    DEFAULT_QUEUE_EXPIRES,
     DEFAULT_REQUEUE_BATCH_LIMIT,
     DEFAULT_REQUEUE_CHECK_INTERVAL,
     DEFAULT_STREAM_MAXLEN,
@@ -841,6 +842,7 @@ class Channel(virtual.Channel):
     _in_poll = None
     _in_fanout_poll = None
     _warned_expires_clamp = False
+    _warned_queue_expires_clamp = False
     _warned_binding_sep = False
     max_priority = MAX_PRIORITY  # Override kombu's default of 9 to enable full 0-255 range
 
@@ -848,6 +850,10 @@ class Channel(virtual.Channel):
     # Per-message hash keys use format: {message_key_prefix}{delivery_tag}
     message_key_prefix = MESSAGE_KEY_PREFIX
     message_ttl = DEFAULT_MESSAGE_TTL  # TTL for per-message hashes (-1 = no TTL)
+
+    # Expiry in seconds for queues declared without x-expires; when set, binding
+    # tables and fanout streams get TTLs too (None = queues persist)
+    queue_expires: int | None = DEFAULT_QUEUE_EXPIRES
 
     # Visibility and timeout settings
     visibility_timeout: float = DEFAULT_VISIBILITY_TIMEOUT
@@ -883,6 +889,7 @@ class Channel(virtual.Channel):
         "sep",
         "message_key_prefix",
         "message_ttl",
+        "queue_expires",
         "visibility_timeout",
         "fanout_prefix",
         "fanout_patterns",
@@ -1649,26 +1656,34 @@ class Channel(virtual.Channel):
                 ttl_ms = self._expires[queue]
                 pipe.pexpire(self._queue_key(queue), ttl_ms)
                 pipe.pexpire(self._messages_index_key(queue), ttl_ms)
-                # A producer has no event loop and so never runs the periodic
-                # refresh. Publishing already keeps the queue alive; the route
-                # to it has to stay alive with it.
+                # Publishing keeps the route alive (producers run no refresh
+                # timer); GT never pulls back another channel's longer deadline
                 stale_at = self._binding_stale_at(queue, now=now)
+                binding_ttl_ms = self._binding_ttl_ms(queue)
                 for exchange, member in self._bindings.get(queue, ()):
-                    pipe.zadd(self._binding_key(exchange), {member: stale_at})
+                    pipe.zadd(self._binding_key(exchange), {member: stale_at}, gt=True)
+                    if binding_ttl_ms is not None:
+                        pipe.pexpire(self._binding_key(exchange), binding_ttl_ms, gt=True)
             pipe.execute()
 
     def _put_fanout(self, exchange: str, message: dict[str, Any], routing_key: str, **kwargs: Any) -> None:
         """Deliver fanout message using Redis Streams."""
         stream_key = self._fanout_stream_key(exchange)
+        global_expires_ms = self._global_expires_ms()
 
-        with self.conn_or_acquire() as client:
-            client.xadd(
+        with self.conn_or_acquire() as client, client.pipeline(transaction=False) as pipe:
+            pipe.xadd(
                 name=stream_key,
                 fields={"payload": dumps(message)},
                 id="*",
                 maxlen=self.stream_maxlen,
                 approximate=True,
             )
+            if global_expires_ms is not None:
+                # Only publishers can keep a broadcast stream alive; consumers
+                # only read, and fanout is not durable anyway
+                pipe.pexpire(stream_key, global_expires_ms)
+            pipe.execute()
 
     def prepare_queue_arguments(self, arguments: dict[str, Any] | None, **kwargs: Any) -> dict[str, Any] | None:
         return to_rabbitmq_queue_arguments(arguments, **kwargs)
@@ -1678,7 +1693,9 @@ class Channel(virtual.Channel):
             self.auto_delete_queues.add(queue)
         arguments = kwargs.get("arguments") or {}
         x_expires = arguments.get("x-expires")
-        if x_expires is not None and queue not in self._expires:
+        if x_expires is None:
+            x_expires = self._global_expires_ms()
+        elif queue not in self._expires:
             x_expires = int(x_expires)
             if x_expires < MIN_QUEUE_EXPIRES:
                 if not self._warned_expires_clamp:
@@ -1690,11 +1707,28 @@ class Channel(virtual.Channel):
                     )
                     Channel._warned_expires_clamp = True
                 x_expires = MIN_QUEUE_EXPIRES
+        if x_expires is not None and queue not in self._expires:
             self._expires[queue] = x_expires
             self.connection.cycle._update_expires_timer()
         x_message_ttl = arguments.get("x-message-ttl")
         if x_message_ttl is not None and queue not in self._message_ttls:
             self._message_ttls[queue] = int(x_message_ttl)
+
+    def _global_expires_ms(self) -> int | None:
+        """The queue_expires option in milliseconds, floored like x-expires is."""
+        if self.queue_expires is None:
+            return None
+        expires_ms = int(self.queue_expires * 1000)
+        if expires_ms < MIN_QUEUE_EXPIRES:
+            if not self._warned_queue_expires_clamp:
+                logger.warning(
+                    "queue_expires %dms is below minimum %dms, clamping.",
+                    expires_ms,
+                    MIN_QUEUE_EXPIRES,
+                )
+                Channel._warned_queue_expires_clamp = True
+            expires_ms = MIN_QUEUE_EXPIRES
+        return expires_ms
 
     def _binding_key(self, exchange: str) -> str:
         return self.keyprefix_queue % (exchange,)
@@ -1718,6 +1752,34 @@ class Channel(virtual.Channel):
         if expires_ms is None:
             return float("inf")
         return (time() if now is None else now) + max(expires_ms / 1000, MIN_BINDING_LIFETIME)
+
+    def _binding_ttl_ms(self, queue: str) -> int | None:
+        """TTL to put on a binding key touched on behalf of this queue.
+
+        Only with the global queue_expires option: a per-queue x-expires alone
+        must not put a TTL on a table that may also hold the bindings of queues
+        that never expire. The floor mirrors _binding_stale_at, so the key
+        outlives its own members' staleness deadlines.
+        """
+        global_ms = self._global_expires_ms()
+        if global_ms is None:
+            return None
+        expires_ms = self._expires.get(queue, global_ms)
+        return max(expires_ms, MIN_BINDING_LIFETIME * 1000)
+
+    def _touch_binding_key(self, client: Any, exchange: str, queue: str) -> None:
+        """Give the binding key a TTL when the global queue_expires option is on.
+
+        GT, so a queue with a short window cannot shrink a TTL that another
+        queue's touch pushed further out. GT treats a key without a TTL as
+        infinite and declines, so a key that has none yet gets one directly.
+        """
+        ttl_ms = self._binding_ttl_ms(queue)
+        if ttl_ms is None:
+            return
+        key = self._binding_key(exchange)
+        if not client.pexpire(key, ttl_ms, gt=True) and client.pttl(key) == -1:
+            client.pexpire(key, ttl_ms)
 
     def _convert_binding_set(self, client: Any, exchange: str) -> None:
         """Turn a binding table left behind as a plain set into a sorted set."""
@@ -1744,6 +1806,7 @@ class Channel(virtual.Channel):
                     raise
                 self._convert_binding_set(client, exchange)
                 client.zadd(self._binding_key(exchange), {member: self._binding_stale_at(queue)})
+            self._touch_binding_key(client, exchange, queue)
 
     def _delete(self, queue: str, *args: Any, **kwargs: Any) -> None:
         # kombu calls: _delete(queue, exchange, routing_key, pattern)
@@ -1797,13 +1860,21 @@ class Channel(virtual.Channel):
         try:
             with self.conn_or_acquire() as client, client.pipeline() as pipe:
                 now = time()
+                touch: set[tuple[str, str]] = set()
                 for queue, ttl_ms in self._expires.items():
                     pipe.pexpire(self._queue_key(queue), ttl_ms)
                     pipe.pexpire(self._messages_index_key(queue), ttl_ms)
+                    # GT, as in _put: never pull a deadline backwards that
+                    # another channel pushed further out.
                     stale_at = self._binding_stale_at(queue, now=now)
                     for exchange, member in self._bindings.get(queue, ()):
-                        pipe.zadd(self._binding_key(exchange), {member: stale_at})
+                        pipe.zadd(self._binding_key(exchange), {member: stale_at}, gt=True)
+                        touch.add((exchange, queue))
                 pipe.execute()
+                # Off the pipeline because the bootstrap needs the PTTL reply:
+                # PEXPIRE GT declines on a key that lost its TTL
+                for exchange, queue in touch:
+                    self._touch_binding_key(client, exchange, queue)
         except Exception:
             logger.warning("Failed to refresh queue expires, will retry next cycle", exc_info=True)
             return False
@@ -1882,22 +1953,36 @@ class Channel(virtual.Channel):
         ones that pile up are precisely the ones whose process is gone. The
         removal costs no extra round trip, and in steady state it removes
         nothing, so Redis has nothing to propagate.
+
+        The pruned members are read back first and logged: dropping a binding
+        silently reroutes messages, so the log line is the only way to tell an
+        aged-out route from one that never existed.
         """
         key = self._binding_key(exchange)
+        now = time()
         try:
             # Not a transaction: this runs on the publish path, and a bind landing
-            # between the two commands is indistinguishable from one landing just
+            # between the commands is indistinguishable from one landing just
             # after the read.
             with client.pipeline(transaction=False) as pipe:
-                pipe.zremrangebyscore(key, "-inf", time())
+                pipe.zrangebyscore(key, "-inf", now)
+                pipe.zremrangebyscore(key, "-inf", now)
                 pipe.zrange(key, 0, -1)
-                return pipe.execute()[1]
+                stale, _removed, live = pipe.execute()
         except _client_exceptions.ResponseError as exc:
             if not _is_wrongtype(exc):
                 raise
             # Table still a plain set from an older deployment or from kombu's
             # own Redis transport. Readable as it is; the next bind converts it.
             return client.smembers(key)
+        if stale:
+            logger.info(
+                "Exchange %r: dropped %d abandoned binding(s): %s",
+                exchange,
+                len(stale),
+                ", ".join(sorted(bytes_to_str(member) for member in stale)),
+            )
+        return live
 
     def get_table(self, exchange: str) -> list[tuple[str, str, str]]:
         with self.conn_or_acquire() as client:

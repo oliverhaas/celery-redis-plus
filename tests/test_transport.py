@@ -434,13 +434,13 @@ class TestGlobalKeyPrefixMixin:
 def _stub_binding_table(mock_client: MagicMock, members: list[bytes]) -> MagicMock:
     """Point a mocked client at a binding table holding `members`.
 
-    get_table reads the table by pruning and ranging in one pipeline, so the
+    get_table collects stale members, prunes and ranges in one pipeline, so the
     members live on the pipeline's result, not on a plain command.
     """
     mock_pipe = MagicMock()
     mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
     mock_pipe.__exit__ = MagicMock(return_value=False)
-    mock_pipe.execute.return_value = [0, members]
+    mock_pipe.execute.return_value = [[], 0, members]
     mock_client.pipeline.return_value = mock_pipe
     return mock_pipe
 
@@ -910,8 +910,13 @@ class TestChannel:
         channel.keyprefix_fanout = "/0."
         channel.fanout_patterns = False
         channel.stream_maxlen = 1000
+        channel.queue_expires = None
 
         mock_client = MagicMock()
+        mock_pipe = MagicMock()
+        mock_pipe.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_pipe.__exit__ = MagicMock(return_value=False)
+        mock_client.pipeline.return_value = mock_pipe
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
         mock_context.__exit__ = MagicMock(return_value=False)
@@ -920,11 +925,13 @@ class TestChannel:
         message = {"body": "test", "properties": {}}
         channel._put_fanout("myexchange", message, "routing_key")
 
-        mock_client.xadd.assert_called_once()
-        call_kwargs = mock_client.xadd.call_args[1]
+        mock_pipe.xadd.assert_called_once()
+        call_kwargs = mock_pipe.xadd.call_args[1]
         assert call_kwargs["name"] == "/0.myexchange"
         assert call_kwargs["maxlen"] == 1000
         assert "payload" in call_kwargs["fields"]
+        # Without queue_expires the stream keeps no TTL
+        mock_pipe.pexpire.assert_not_called()
 
     def test_get_synchronous(self) -> None:
         """Test _get retrieves message synchronously via Lua script."""
@@ -3706,6 +3713,103 @@ class TestQueueOperations:
 
         redis_client.delete(bindings_key)
 
+    def test_get_table_names_the_bindings_it_drops(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The read path says which abandoned bindings it pruned."""
+        bindings_key = f"{global_keyprefix}_kombu.binding.test_dropped_named"
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel._queue_bind(
+                exchange="test_dropped_named",
+                routing_key="live_key",
+                pattern="",
+                queue="live_queue",
+            )
+            abandoned = channel.sep.join(["gone_key", "", "gone_queue"])
+            redis_client.zadd(bindings_key, {abandoned: time.time() - 1})
+
+            with caplog.at_level(logging.INFO, logger="celery_redis_plus.transport"):
+                table = channel.get_table("test_dropped_named")
+
+            assert table == [("live_key", "", "live_queue")]
+            dropped_logs = [r.getMessage() for r in caplog.records if "abandoned" in r.getMessage()]
+            assert len(dropped_logs) == 1
+            assert abandoned in dropped_logs[0]
+            assert "test_dropped_named" in dropped_logs[0]
+        redis_client.delete(bindings_key)
+
+    def test_a_refresh_never_pulls_a_binding_deadline_backwards(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """A rescore only pushes a deadline out, never back.
+
+        Another channel with a longer x-expires window may have pushed the
+        member's deadline further out than this channel's window reaches.
+        """
+        bindings_key = f"{global_keyprefix}_kombu.binding.test_rescore"
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel._expires["rescore_queue"] = 10_000
+            channel._queue_bind(
+                exchange="test_rescore",
+                routing_key="rescore_key",
+                pattern="",
+                queue="rescore_queue",
+            )
+            member = channel.sep.join(["rescore_key", "", "rescore_queue"])
+            far_deadline = time.time() + 1_000_000
+            redis_client.zadd(bindings_key, {member: far_deadline})
+
+            channel._refresh_queue_expires()
+
+            assert redis_client.zscore(bindings_key, member) == pytest.approx(far_deadline)
+            channel._delete("rescore_queue", "test_rescore", "rescore_key", "")
+        redis_client.delete(bindings_key)
+
+    def test_a_publish_rescore_never_pulls_a_binding_deadline_backwards(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """The keep-alive rescore on the publish path backs off from a later deadline too."""
+        bindings_key = f"{global_keyprefix}_kombu.binding.test_put_rescore"
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel._expires["put_rescore_queue"] = 10_000
+            channel._queue_bind(
+                exchange="test_put_rescore",
+                routing_key="put_rescore_key",
+                pattern="",
+                queue="put_rescore_queue",
+            )
+            member = channel.sep.join(["put_rescore_key", "", "put_rescore_queue"])
+            far_deadline = time.time() + 1_000_000
+            redis_client.zadd(bindings_key, {member: far_deadline})
+
+            channel._put(
+                "put_rescore_queue",
+                {
+                    "body": "test",
+                    "properties": {
+                        "delivery_tag": "put-rescore-1",
+                        "delivery_info": {"exchange": "", "routing_key": "put_rescore_queue"},
+                    },
+                },
+            )
+
+            assert redis_client.zscore(bindings_key, member) == pytest.approx(far_deadline)
+            channel._delete("put_rescore_queue", "test_put_rescore", "put_rescore_key", "")
+        redis_client.delete(bindings_key)
+
     def test_queue_bind_converts_a_legacy_binding_set(
         self,
         celery_app: Celery,
@@ -5053,6 +5157,207 @@ class TestQueueTTL:
 
             assert "celery" not in channel._expires
             assert "celery" not in channel._message_ttls
+
+
+@pytest.mark.integration
+class TestGlobalQueueExpires:
+    """Tests for the global queue_expires transport option."""
+
+    def test_a_global_queue_expires_registers_declared_queues(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+    ) -> None:
+        """A queue declared without x-expires picks up the global default."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.queue_expires = 60
+
+            channel._new_queue("global_expires_queue")
+            assert channel._expires["global_expires_queue"] == 60_000
+
+            # An explicit x-expires still wins over the global default
+            channel._new_queue("explicit_expires_queue", arguments={"x-expires": 30_000})
+            assert channel._expires["explicit_expires_queue"] == 30_000
+
+            # The global default gets the same floor as x-expires
+            channel.queue_expires = 1
+            channel._new_queue("clamped_expires_queue")
+            assert channel._expires["clamped_expires_queue"] == MIN_QUEUE_EXPIRES
+
+    def test_a_clamped_queue_expires_warns_like_x_expires_does(
+        self,
+        celery_app: Celery,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Silently turning queue_expires=1 into 10s would surprise whoever
+        meant to disable it, so the floor warns like the x-expires clamp."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.queue_expires = 1
+            Channel._warned_queue_expires_clamp = False
+            try:
+                with caplog.at_level(logging.WARNING, logger="celery_redis_plus.transport"):
+                    assert channel._global_expires_ms() == MIN_QUEUE_EXPIRES
+            finally:
+                Channel._warned_queue_expires_clamp = False
+
+        clamp_records = [r for r in caplog.records if "queue_expires" in r.getMessage()]
+        assert len(clamp_records) == 1
+        assert "clamping" in clamp_records[0].getMessage()
+
+    def test_the_refresh_restores_a_ttl_a_recreated_binding_key_lost(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """PEXPIRE GT declines on a TTL-less key, so the periodic refresh has
+        to bootstrap like _queue_bind does, or a binding key recreated by a
+        publish rescore would never expire again."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+            channel.queue_expires = 60
+
+            channel._new_queue("refresh_boot_queue")
+            channel._queue_bind(
+                exchange="refresh_boot_exchange",
+                routing_key="refresh_boot_queue",
+                pattern="",
+                queue="refresh_boot_queue",
+            )
+            redis_client.persist(f"{global_keyprefix}_kombu.binding.refresh_boot_exchange")
+            assert client.pttl("_kombu.binding.refresh_boot_exchange") == -1
+
+            assert channel._refresh_queue_expires() is True
+
+            assert client.pttl("_kombu.binding.refresh_boot_exchange") > 0
+
+            channel._delete("refresh_boot_queue", "refresh_boot_exchange", "refresh_boot_queue", "")
+            client.delete("_kombu.binding.refresh_boot_exchange")
+
+    def test_queue_expires_arrives_via_transport_options(
+        self,
+        redis_container: tuple[str, int, str],
+    ) -> None:
+        """The option is read from broker_transport_options like its siblings."""
+        from celery import Celery as CeleryApp
+
+        host, port, _image = redis_container
+
+        app = CeleryApp("test_queue_expires_option")
+        app.conf.update(
+            broker_url=f"redis://{host}:{port}/0",
+            broker_transport="celery_redis_plus.transport:Transport",
+            broker_transport_options={"queue_expires": 60},
+            task_always_eager=False,
+        )
+
+        with app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            assert channel.queue_expires == 60
+
+    def test_broker_keys_expire_without_manual_cleanup(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """With queue_expires set, every broker key this channel touches carries a TTL."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+            channel.queue_expires = 60
+
+            channel._new_queue("cleanup_queue")
+            channel._queue_bind(
+                exchange="cleanup_exchange",
+                routing_key="cleanup_queue",
+                pattern="",
+                queue="cleanup_queue",
+            )
+            channel._put(
+                "cleanup_queue",
+                {
+                    "body": "test",
+                    "properties": {
+                        "delivery_tag": "cleanup-1",
+                        "delivery_info": {"exchange": "", "routing_key": "cleanup_queue"},
+                    },
+                },
+            )
+            channel._put_fanout("cleanup_fanout", {"body": "test", "properties": {}}, "")
+            stream_key = channel._fanout_stream_key("cleanup_fanout")
+
+            assert client.pttl(f"{QUEUE_KEY_PREFIX}cleanup_queue") > 0
+            assert client.pttl(f"{MESSAGES_INDEX_PREFIX}cleanup_queue") > 0
+            assert client.pttl("_kombu.binding.cleanup_exchange") > 0
+            assert client.pttl(stream_key) > 0
+
+            channel._delete("cleanup_queue", "cleanup_exchange", "cleanup_queue", "")
+            client.delete("_kombu.binding.cleanup_exchange", stream_key)
+
+    def test_a_short_window_touch_never_shrinks_a_binding_key_ttl(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """PEXPIRE GT: one queue's short x-expires window cannot cut down the
+        TTL that another queue sharing the exchange pushed further out."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+            channel.queue_expires = 60
+
+            channel._new_queue("long_window_queue", arguments={"x-expires": 3_600_000})
+            channel._queue_bind(
+                exchange="shared_ttl_exchange",
+                routing_key="long_window_queue",
+                pattern="",
+                queue="long_window_queue",
+            )
+            assert client.pttl("_kombu.binding.shared_ttl_exchange") > 3_000_000
+
+            channel._new_queue("short_window_queue", arguments={"x-expires": 30_000})
+            channel._queue_bind(
+                exchange="shared_ttl_exchange",
+                routing_key="short_window_queue",
+                pattern="",
+                queue="short_window_queue",
+            )
+
+            assert client.pttl("_kombu.binding.shared_ttl_exchange") > 3_000_000
+
+            channel._delete("long_window_queue", "shared_ttl_exchange", "long_window_queue", "")
+            channel._delete("short_window_queue", "shared_ttl_exchange", "short_window_queue", "")
+            client.delete("_kombu.binding.shared_ttl_exchange")
+
+    def test_broker_keys_persist_without_queue_expires(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """Binding and stream keys keep no TTL unless the option is set."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+
+            channel._queue_bind(
+                exchange="persist_exchange",
+                routing_key="persist_queue",
+                pattern="",
+                queue="persist_queue",
+            )
+            channel._put_fanout("persist_fanout", {"body": "test", "properties": {}}, "")
+            stream_key = channel._fanout_stream_key("persist_fanout")
+
+            assert client.pttl("_kombu.binding.persist_exchange") == -1
+            assert client.pttl(stream_key) == -1
+
+            client.delete("_kombu.binding.persist_exchange", stream_key)
 
 
 @pytest.mark.integration

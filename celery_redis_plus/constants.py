@@ -54,6 +54,10 @@ DEFAULT_DELIVERY_LIMIT: int | None = 20
 # drop deletes the hash, so that log line is the message's last trace
 DROPPED_REPORT_LIMIT = 10
 
+# Global fallback expiry in seconds for queues declared without x-expires
+# None keeps kombu semantics: queues persist until deleted
+DEFAULT_QUEUE_EXPIRES: int | None = None
+
 # Minimum allowed x-expires value in milliseconds (10 seconds)
 # Celery's control/reply queues use 10s by default
 MIN_QUEUE_EXPIRES = 10_000

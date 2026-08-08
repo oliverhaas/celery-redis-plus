@@ -41,6 +41,7 @@ All options are passed via Celery's `broker_transport_options` configuration.
 | `visibility_timeout` | `int` | `300` | Seconds before unacked messages are reclaimed |
 | `delivery_limit` | `int` or `None` | `20` | Delivery attempts before a message is dropped (`None` = no limit) |
 | `blocking_timeout` | `int` | `10` | Seconds BZMPOP and XREAD block on the server per poll |
+| `queue_expires` | `int` or `None` | `None` | Expiry in seconds for queues declared without `x-expires`; also puts TTLs on binding tables and fanout streams |
 | `global_keyprefix` | `str` | `""` | Prefix for all Redis keys |
 | `stream_maxlen` | `int` | `10000` | Max messages per fanout stream (approximate) |
 
@@ -60,6 +61,25 @@ All options are passed via Celery's `broker_transport_options` configuration.
     Keep `blocking_timeout` below `socket_timeout` if you set one. The poll is
     an ordinary read on the connection, so a socket timeout shorter than the
     block turns every empty poll into a read timeout and a reconnect.
+
+!!! note "`queue_expires` cleans up the broker, deployment-wide"
+
+    With `queue_expires` set, queues and their message indexes carry TTLs (as
+    if each queue had `x-expires`), and so do binding tables and fanout
+    streams. Everything is refreshed by the same declares, publishes and
+    periodic refreshes that keep queues alive, so an abandoned deployment's
+    keys expire on their own. The exception is `message:{tag}` hashes: they
+    only get a TTL from `message_ttl` (or a queue's `x-message-ttl`), and once
+    a queue's index has expired no sweep can reach them again, so pair
+    `queue_expires` with `message_ttl` if unconsumed payloads must not outlive
+    their queue. A per-queue `x-expires` still wins over the global value, and
+    the same 10-second floor applies.
+
+    Set it in every process sharing the broker. A process running without the
+    option never refreshes these TTLs, so routes it depends on could expire
+    from under it (the durable-exchange redeclare path heals this, at the cost
+    of a retry). Size it like `x-expires`: longer than the longest gap in which
+    no worker, producer, or refresh timer touches the busiest queue.
 
 !!! note "How `delivery_limit` counts"
 
@@ -181,6 +201,7 @@ The following constants are used internally and define default behavior:
 | `DEFAULT_REQUEUE_BATCH_LIMIT` | `1000` | Max messages processed per requeue cycle |
 | `DEFAULT_STREAM_MAXLEN` | `10000` | Default max length for fanout streams |
 | `DEFAULT_MESSAGE_TTL` | `-1` | Default TTL for message hashes (no TTL) |
+| `DEFAULT_QUEUE_EXPIRES` | `None` | Default global queue expiry (queues persist) |
 | `DROPPED_REPORT_LIMIT` | `10` | Max dropped messages named per queue per sweep in the error log |
 | `PRIORITY_SCORE_MULTIPLIER` | `10^13` | Multiplier for priority in score calculation |
 | `QUEUE_KEY_PREFIX` | `"queue:"` | Prefix for queue sorted sets |
