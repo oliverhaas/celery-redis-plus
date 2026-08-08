@@ -243,6 +243,16 @@ def _get_worker_owner_for_channel(channel: Channel) -> Any:
     return None
 
 
+def _worker_is_stopping(owner: Any) -> bool:
+    """Whether this worker is really shutting down, not just reconnecting.
+
+    Blueprint.stop() sets CLOSE before it stops a step, so only a real
+    shutdown reads CLOSE/TERMINATE here.
+    """
+    blueprint = getattr(owner, "blueprint", None)
+    return getattr(blueprint, "state", None) in {CLOSE, TERMINATE}
+
+
 def _queue_score(priority: int, timestamp: float | None = None) -> float:
     """Compute sorted set score for queue ordering.
 
@@ -487,12 +497,10 @@ class QoS(virtual.QoS):
         self._drain_hub_callbacks()
 
         # kombu calls this from Channel.close(), which also runs on broker
-        # reconnects; Blueprint.stop() sets CLOSE before it stops a step, so
-        # only a real shutdown reads CLOSE/TERMINATE here.  Reconnects fall
-        # back to messages_index redelivery on the visibility deadline.
+        # reconnects.  Reconnects fall back to messages_index redelivery on
+        # the visibility deadline.
         owner = _get_worker_owner_for_channel(self.channel)
-        blueprint = getattr(owner, "blueprint", None)
-        if owner is not None and getattr(blueprint, "state", None) not in {CLOSE, TERMINATE}:
+        if owner is not None and not _worker_is_stopping(owner):
             return
 
         # Celery fires this BEFORE Pool.on_stop() waits for threads, so wait
