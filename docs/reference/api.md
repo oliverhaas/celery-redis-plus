@@ -60,7 +60,9 @@ All options are passed via Celery's `broker_transport_options` configuration.
 
     Keep `blocking_timeout` below `socket_timeout` if you set one. The poll is
     an ordinary read on the connection, so a socket timeout shorter than the
-    block turns every empty poll into a read timeout and a reconnect.
+    block turns every empty poll into a read timeout and a reconnect. A value
+    of `0` is passed through as-is and makes the server hold every poll open
+    until a message arrives.
 
 !!! note "`queue_expires` cleans up the broker, deployment-wide"
 

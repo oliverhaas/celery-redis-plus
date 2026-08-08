@@ -842,6 +842,40 @@ class TestChannel:
         # for as long as Flower is down.
         assert not channel._lookup("celeryev", "task.succeeded")
 
+    def test_close_skips_the_poll_drain_when_the_block_never_times_out(self) -> None:
+        """A poll sent with timeout 0 never replies on its own, so draining it
+        would hang shutdown; the sockets are torn down right after anyway."""
+        channel = object.__new__(Channel)
+        channel._in_poll = True
+        channel._in_fanout_poll = True
+        channel.blocking_timeout = 0
+        channel.closed = True
+        channel._bzmpop_read = MagicMock()
+        channel._xread_read = MagicMock()
+
+        with patch.object(virtual.Channel, "close"):
+            channel.close()
+
+        channel._bzmpop_read.assert_not_called()
+        channel._xread_read.assert_not_called()
+
+    def test_close_drains_a_poll_that_will_time_out(self) -> None:
+        """With a finite block the outstanding reply arrives within the
+        timeout, so close waits for it and leaves the connection clean."""
+        channel = object.__new__(Channel)
+        channel._in_poll = True
+        channel._in_fanout_poll = True
+        channel.blocking_timeout = 10
+        channel.closed = True
+        channel._bzmpop_read = MagicMock()
+        channel._xread_read = MagicMock()
+
+        with patch.object(virtual.Channel, "close"):
+            channel.close()
+
+        channel._bzmpop_read.assert_called_once()
+        channel._xread_read.assert_called_once()
+
     def test_describe_message_names_a_non_task_payload_by_delivery_tag(self) -> None:
         """The drop log falls back to the delivery tag when there is no task header."""
         payload = json_dumps({"body": "x", "properties": {"delivery_tag": "tag-123"}})
@@ -2653,7 +2687,7 @@ class TestFastSlowConsumeMode:
         mock_client._prefix_args.side_effect = lambda args: args
         channel.client = mock_client
         channel.connection = MagicMock()
-        channel.connection.blocking_timeout = 1
+        channel.blocking_timeout = 1
 
         # EVALSHA returns nil (queue empty)
         mock_client.parse_response.return_value = None
@@ -2828,6 +2862,32 @@ class TestFastSlowConsumeMode:
         assert channel._in_poll is mock_conn
         sent_args = mock_conn.send_command.call_args[0]
         assert sent_args[0] == "BZMPOP"
+
+    def test_bzmpop_start_reads_the_channel_blocking_timeout(self, global_keyprefix: str) -> None:
+        """Without a timeout arg the channel's own blocking_timeout is sent, uncoerced.
+
+        0 tells BZMPOP to block forever, and an `or 1` coercion would silently
+        turn that configuration into a 1s poll.
+        """
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._consume_fast_mode = False
+        channel._queue_cycle = ["celery"]
+
+        mock_conn = MagicMock()
+        mock_client = MagicMock()
+        mock_client.connection = mock_conn
+        mock_client._prefix_args.side_effect = lambda args: args
+        channel.client = mock_client
+        channel.connection = MagicMock()
+        channel.blocking_timeout = 0
+
+        channel._bzmpop_start()
+
+        sent_args = mock_conn.send_command.call_args[0]
+        assert sent_args[0] == "BZMPOP"
+        assert sent_args[1] == 0
 
     def test_fast_consume_sends_a_no_ack_flag_per_queue(self, global_keyprefix: str) -> None:
         """FAST mode appends one '0'/'1' flag per queue so the Lua script can
@@ -3847,6 +3907,37 @@ class TestQueueOperations:
 @pytest.mark.integration
 class TestChannelConnection:
     """Tests for channel connection handling."""
+
+    def test_the_channel_copies_the_transport_blocking_timeout(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """The channel snapshots blocking_timeout so the consume paths read one place."""
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            transport = cast("Transport", conn.transport)
+            assert channel.blocking_timeout == transport.blocking_timeout
+
+    def test_blocking_timeout_arrives_via_transport_options(
+        self,
+        redis_container: tuple[str, int, str],
+    ) -> None:
+        """The option is read from broker_transport_options like its siblings."""
+        from celery import Celery as CeleryApp
+
+        host, port, _image = redis_container
+
+        app = CeleryApp("test_blocking_timeout_option")
+        app.conf.update(
+            broker_url=f"redis://{host}:{port}/0",
+            broker_transport="celery_redis_plus.transport:Transport",
+            broker_transport_options={"blocking_timeout": 7},
+            task_always_eager=False,
+        )
+
+        with app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            assert channel.blocking_timeout == 7
 
     def test_channel_creates_connection_pool(
         self,
@@ -5862,7 +5953,7 @@ class TestBlockingTimeout:
         channel.client = mock_client
         channel.subclient = mock_client
         channel.connection = MagicMock()
-        channel.connection.blocking_timeout = 7
+        channel.blocking_timeout = 7
 
         channel._bzmpop_start()
         bzmpop_args = mock_client.connection.send_command.call_args[0]

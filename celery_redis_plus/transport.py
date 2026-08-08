@@ -940,6 +940,9 @@ class Channel(virtual.Channel):
         # FAST/SLOW consume mode: FAST uses atomic Lua ZPOPMIN, SLOW uses blocking BZMPOP
         self._consume_fast_mode: bool = True
         self._consume_script_sha: str | None = None
+        # Snapshot of the transport's blocking_timeout, so the consume paths
+        # read one place and 0 (block forever) survives uncoerced
+        self.blocking_timeout: float = self.connection.blocking_timeout
 
         if self.fanout_prefix:
             if isinstance(self.fanout_prefix, str):
@@ -1141,7 +1144,7 @@ class Channel(virtual.Channel):
 
     def _bzmpop_start(self, timeout: float | None = None) -> None:
         if timeout is None:
-            timeout = self.connection.blocking_timeout or 1
+            timeout = self.blocking_timeout
         if not self._queue_cycle:
             return
 
@@ -1291,7 +1294,7 @@ class Channel(virtual.Channel):
     def _xread_start(self, timeout: float | None = None) -> None:
         """Start XREAD for fanout streams (true broadcast - every consumer gets every message)."""
         if timeout is None:
-            timeout = self.connection.blocking_timeout or 1
+            timeout = self.blocking_timeout
 
         streams: dict[str, str] = {}
 
@@ -2040,10 +2043,12 @@ class Channel(virtual.Channel):
             return size
 
     def close(self) -> None:
-        if self._in_poll:
+        # blocking_timeout 0 holds the poll open until a message arrives, so a
+        # drain could hang forever; the sweep restores an unread pop instead
+        if self._in_poll and self.blocking_timeout != 0:
             with suppress(Empty, *_connection_errors):
                 self._bzmpop_read()
-        if self._in_fanout_poll:
+        if self._in_fanout_poll and self.blocking_timeout != 0:
             with suppress(Empty, *_connection_errors):
                 self._xread_read()
         if not self.closed:
