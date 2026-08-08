@@ -5482,7 +5482,6 @@ class TestGlobalKeyPrefix:
 
         host, port, _image = redis_container
 
-        # Create app with global_keyprefix
         app = Celery("test_prefix")
         app.conf.update(
             broker_url=f"redis://{host}:{port}/0",
@@ -5496,10 +5495,8 @@ class TestGlobalKeyPrefix:
         def add(x: int, y: int) -> int:
             return x + y
 
-        # Publish a task
         add.delay(2, 3)
 
-        # Verify the message is stored with the prefix
         client = client_lib.Redis(host=host, port=port, db=0)
 
         # The queue should be prefixed with both global prefix and queue: prefix
