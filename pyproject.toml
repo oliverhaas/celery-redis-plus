@@ -81,6 +81,7 @@ ignore = [
   "ARG002",
   "C901",    # Some functions are inherently complex
   "COM812",  # Conflicts with ruff-format
+  "CPY",     # No copyright notices in this repo
   "D",       # Docstring rules are too extensive
   "E5",      # 120 char limit is sufficient
   "EM101",   # Extracting exception messages to variables hurts readability
@@ -90,6 +91,7 @@ ignore = [
   "N802",    # Naming follows kombu conventions
   "N806",
   "PLC0415", # Lazy imports for optional dependencies
+  "PLR0917", # Positional signatures follow kombu APIs
   "PLR1704", # Redefining argument in context manager
   "PYI024",  # namedtuple usage follows kombu patterns
   "RUF005",  # Tuple concatenation is clearer
