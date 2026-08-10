@@ -1145,6 +1145,10 @@ class Channel(virtual.Channel):
         if no_ack:
             self._no_ack_queues.add(queue)
         ret = super().basic_consume(queue, no_ack, callback, consumer_tag, **kwargs)
+        if not self._queue_cycle and not self._in_poll:
+            # An idle spell voids SLOW mode's confirmed-empty precondition.
+            # Not while a poll is pending: replies parse by the current mode.
+            self._consume_fast_mode = True
         self._queue_cycle = list(self.active_queues)
         return ret
 
@@ -1223,6 +1227,12 @@ class Channel(virtual.Channel):
         if timeout is None:
             timeout = self.blocking_timeout
         if not self._queue_cycle:
+            # A stale _in_poll here (basic_cancel emptied the cycle after the
+            # in-flight reply was read) starves basic_consume and hangs close().
+            self._in_poll = None
+            # Nothing sent, so SLOW mode's confirmed-empty precondition is
+            # gone; the next consume must re-confirm through FAST.
+            self._consume_fast_mode = True
             return
 
         if self._consume_fast_mode:
@@ -1264,7 +1274,9 @@ class Channel(virtual.Channel):
 
         On success: delivers message, clears _in_poll, returns True.
         On empty: switches to SLOW mode, sends BZMPOP, raises Empty
-        (keeps _in_poll set since BZMPOP is now pending).
+        (keeps _in_poll set since BZMPOP is now pending). If the cycle
+        emptied meanwhile, nothing is sent and the channel goes back to
+        FAST with _in_poll cleared.
         """
         try:
             try:
@@ -1295,7 +1307,7 @@ class Channel(virtual.Channel):
 
         # Queue empty: switch to SLOW mode and send BZMPOP
         self._consume_fast_mode = False
-        self._bzmpop_start()  # sends BZMPOP, keeps _in_poll set
+        self._bzmpop_start()  # sends BZMPOP (or aborts back to FAST on an empty cycle)
         raise Empty
 
     def _slow_consume_read(self, **options: Any) -> bool:

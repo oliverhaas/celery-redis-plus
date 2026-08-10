@@ -2814,6 +2814,114 @@ class TestFastSlowConsumeMode:
         sent_args = mock_conn.send_command.call_args[0]
         assert sent_args[0] == "BZMPOP"
 
+    def test_fast_consume_read_empty_with_no_queues_leaves_nothing_pending(self, global_keyprefix: str) -> None:
+        """An empty reply arriving after basic_cancel emptied the queue cycle.
+
+        _bzmpop_start has nothing to send then, and it must not leave _in_poll
+        set with no command on the wire: a later basic_consume checks _in_poll
+        before starting a poll, so the consumer would starve and close() would
+        block waiting for a reply that never comes.
+        """
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = True
+        channel._consume_script_sha = "fakeSHA"
+        channel._queue_cycle = []
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+        channel.blocking_timeout = 1
+
+        mock_client = MagicMock()
+        mock_conn = MagicMock()
+        mock_client.connection = mock_conn
+        channel.client = mock_client
+        channel.connection = MagicMock()
+
+        mock_client.parse_response.return_value = None
+
+        with pytest.raises(Empty):
+            channel._bzmpop_read()
+
+        assert channel._in_poll is None
+        mock_conn.send_command.assert_not_called()
+
+    def test_bzmpop_start_with_no_queues_clears_in_poll(self, global_keyprefix: str) -> None:
+        """With nothing to poll, _bzmpop_start must not report a pending poll."""
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = True
+        channel._queue_cycle = []
+        channel.blocking_timeout = 1
+        channel.client = MagicMock()
+
+        channel._bzmpop_start()
+
+        assert channel._in_poll is None
+
+    def test_bzmpop_start_with_no_queues_returns_to_fast_mode(self, global_keyprefix: str) -> None:
+        """SLOW mode is only safe straight after FAST confirmed the queues
+        empty; an aborted start sends nothing, so the next consume must
+        re-confirm instead of BZMPOPing a possibly overdue backlog.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = None
+        channel._consume_fast_mode = False
+        channel._queue_cycle = []
+        channel.blocking_timeout = 1
+        channel.client = MagicMock()
+
+        channel._bzmpop_start()
+
+        assert channel._consume_fast_mode is True
+
+    def test_basic_consume_after_an_idle_spell_rearms_in_fast_mode(self, global_keyprefix: str) -> None:
+        """A queue added after the cycle sat empty was never confirmed empty,
+        so consumption must restart in FAST mode.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._consume_fast_mode = False
+        channel._in_poll = None
+        channel._queue_cycle = []
+        channel._fanout_queues = {}
+        channel._no_ack_queues = set()
+        channel._tag_to_queue = {}
+        channel._active_queues = []
+        channel._consumers = set()
+        channel.active_fanout_queues = set()
+        channel.connection = MagicMock()
+        channel._reset_cycle = MagicMock()  # type: ignore[method-assign]
+
+        channel.basic_consume("my_queue", no_ack=False, callback=MagicMock(), consumer_tag="t1")
+
+        assert channel._consume_fast_mode is True
+        assert channel._queue_cycle == ["my_queue"]
+
+    def test_basic_consume_with_a_poll_pending_keeps_slow_mode(self, global_keyprefix: str) -> None:
+        """With a BZMPOP on the wire the mode must not flip: _bzmpop_read
+        parses the pending reply by the current mode.
+        """
+        channel = object.__new__(Channel)
+        channel.global_keyprefix = global_keyprefix
+        channel._consume_fast_mode = False
+        channel._in_poll = True
+        channel._queue_cycle = []
+        channel._fanout_queues = {}
+        channel._no_ack_queues = set()
+        channel._tag_to_queue = {}
+        channel._active_queues = []
+        channel._consumers = set()
+        channel.active_fanout_queues = set()
+        channel.connection = MagicMock()
+        channel._reset_cycle = MagicMock()  # type: ignore[method-assign]
+
+        channel.basic_consume("my_queue", no_ack=False, callback=MagicMock(), consumer_tag="t1")
+
+        assert channel._consume_fast_mode is False
+
     def test_fast_consume_read_noscript_error(self, global_keyprefix: str) -> None:
         """Test FAST mode handles NOSCRIPT error by clearing SHA and raising Empty."""
         channel = object.__new__(Channel)
