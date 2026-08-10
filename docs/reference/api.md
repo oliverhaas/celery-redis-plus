@@ -127,7 +127,10 @@ All options are passed via Celery's `broker_transport_options` configuration.
     worker gets away with it because its own requeue scan is frozen too, but a
     second worker of any pool type will reclaim the message and run it again.
     `prefork` and `threads` are unaffected: they execute tasks off the main
-    thread, so the event loop keeps ticking and the refresh works.
+    thread, so the event loop keeps ticking and the refresh works. `gevent` and
+    `eventlet` have no event loop; there the refresh and the requeue scan ride
+    the drain path instead, which keeps ticking while tasks run as long as they
+    yield, as everything on those pools requires.
 
 #### Message Storage Options
 
