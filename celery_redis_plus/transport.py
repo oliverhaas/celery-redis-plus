@@ -428,6 +428,18 @@ class PrefixedRedisPipeline(GlobalKeyPrefixMixin, client_lib.client.Pipeline):
         client_lib.client.Pipeline.__init__(self, *args, **kwargs)
 
 
+def _delivered_queue(message: Any) -> str:
+    """The queue a message was consumed from.
+
+    Channel._stamp_delivered_queue records it in delivery_info at pop time.
+    routing_key is the publish-time key, which only names the queue under
+    default direct routing; it remains as the fallback for messages consumed
+    by an older version and restored by this one.
+    """
+    delivery_info = message.delivery_info
+    return delivery_info.get("queue") or delivery_info["routing_key"]
+
+
 class QoS(virtual.QoS):
     """Redis QoS with sorted set based message tracking.
 
@@ -465,7 +477,7 @@ class QoS(virtual.QoS):
         else:
             # Regular sorted set message
             if requeue:
-                queue = self._delivered[delivery_tag].delivery_info["routing_key"]
+                queue = _delivered_queue(self._delivered[delivery_tag])
                 self.requeue_by_tag(delivery_tag, queue=queue, leftmost=True)
             else:
                 self._remove_from_indices(delivery_tag)
@@ -483,7 +495,7 @@ class QoS(virtual.QoS):
         the queue, and only this ZREM can cancel that restored copy before
         another worker pops it.
         """
-        queue = cast("dict", self._delivered)[delivery_tag].delivery_info["routing_key"]
+        queue = _delivered_queue(cast("dict", self._delivered)[delivery_tag])
         # Prefix keys since EVALSHA doesn't auto-prefix
         index_key = f"{self.channel.global_keyprefix}{self.channel._messages_index_key(queue)}"
         message_key = f"{self.channel.global_keyprefix}{self.channel._message_key(delivery_tag)}"
@@ -554,7 +566,7 @@ class QoS(virtual.QoS):
                 for tag, message in self._delivered.items():
                     # Skip fanout messages (they don't use the index)
                     if tag not in self._fanout_tags:
-                        queue = message.delivery_info["routing_key"]
+                        queue = _delivered_queue(message)
                         index_key = self.channel._messages_index_key(queue)
                         # XX = only update if member already exists (prevents re-adding acked messages)
                         pipe.zadd(index_key, {tag: queue_at}, xx=True)
@@ -1076,7 +1088,7 @@ class Channel(virtual.Channel):
 
         This method is called by Kombu's virtual.Channel for message recovery.
         """
-        queue = message.delivery_info.get("routing_key")
+        queue = message.delivery_info.get("queue") or message.delivery_info.get("routing_key")
         self._requeue_by_tag(message.delivery_tag, queue=queue, leftmost=leftmost)
 
     def _restore_at_beginning(self, message: Any) -> None:
@@ -1138,6 +1150,17 @@ class Channel(virtual.Channel):
         properties = message.setdefault("properties", {})
         properties.setdefault("delivery_info", {})["redelivered"] = True
 
+    @staticmethod
+    def _stamp_delivered_queue(message: dict[str, Any], queue: str) -> None:
+        """Record the queue a message was popped from in its delivery_info.
+
+        delivery_info's routing_key is the publish-time key, which only names
+        the queue under default direct routing; the heartbeat, ack and requeue
+        paths need the queue itself (see _delivered_queue).
+        """
+        properties = message.setdefault("properties", {})
+        properties.setdefault("delivery_info", {})["queue"] = queue
+
     def _parse_consume_result(self, result: list[Any]) -> tuple[str, dict[str, Any]]:
         """Parse the result from consume_message Lua script.
 
@@ -1148,6 +1171,7 @@ class Channel(virtual.Channel):
         payload_json = result[2]
         message: dict[str, Any] = loads(bytes_to_str(payload_json))
         self._mark_redelivered(message, int(result[3] or 0))
+        self._stamp_delivered_queue(message, queue_name)
         return queue_name, message
 
     def _bzmpop_start(self, timeout: float | None = None) -> None:
@@ -1275,6 +1299,7 @@ class Channel(virtual.Channel):
                 if payload_json:
                     message: dict[str, Any] = loads(bytes_to_str(payload_json))
                     self._mark_redelivered(message, int(results[1][1] or 0))
+                    self._stamp_delivered_queue(message, dest)
                     self._consume_fast_mode = True  # Switch back to FAST
                     self.connection._deliver(message, dest)
                     return True

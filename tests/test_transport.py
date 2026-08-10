@@ -987,7 +987,7 @@ class TestChannel:
         channel.conn_or_acquire = MagicMock(return_value=mock_context)
 
         result = channel._get("myqueue")
-        assert result == {"body": "test"}
+        assert result == {"body": "test", "properties": {"delivery_info": {"queue": "myqueue"}}}
         mock_client.register_script.assert_called_once()
         mock_script.assert_called_once()
 
@@ -1524,7 +1524,7 @@ class TestChannel:
 
         result = channel._get("my_queue")
 
-        assert result == {"body": "test"}
+        assert result == {"body": "test", "properties": {"delivery_info": {"queue": "my_queue"}}}
 
     def test_get_raises_empty_when_all_expired(self, global_keyprefix: str) -> None:
         """Test that _get raises Empty when all messages have expired."""
@@ -1582,7 +1582,10 @@ class TestChannel:
         result = channel._bzmpop_read()
 
         assert result is True
-        mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
+        mock_connection._deliver.assert_called_once_with(
+            {"body": "test", "properties": {"delivery_info": {"queue": "my_queue"}}},
+            "my_queue",
+        )
         # After draining, should switch back to FAST mode
         assert channel._consume_fast_mode is True
 
@@ -1751,6 +1754,23 @@ class TestChannel:
 
         assert channel.get_table("my_exchange") == [("my_key", "", "my_queue")]
         mock_client.smembers.assert_called_once_with("_kombu.binding.my_exchange")
+
+    def test_restore_prefers_the_stamped_queue_over_the_routing_key(self) -> None:
+        """_restore must requeue under the queue stamped at consume time.
+
+        The queue only selects the per-queue message TTL (the requeue script
+        reads the queue itself from the hash), but a routing key finds no TTL.
+        """
+        channel = object.__new__(Channel)
+        channel._requeue_by_tag = MagicMock()  # type: ignore[method-assign]
+
+        message = MagicMock()
+        message.delivery_tag = "tag123"
+        message.delivery_info = {"queue": "email_q", "routing_key": "custom.route"}
+
+        channel._restore(message)
+
+        channel._requeue_by_tag.assert_called_once_with("tag123", queue="email_q", leftmost=False)  # type: ignore[attr-defined]
 
 
 def _make_restore_qos(channel: MagicMock, call_order: list[str]) -> QoS:
@@ -2639,7 +2659,10 @@ class TestFastSlowConsumeMode:
         assert result is True
         assert channel._consume_fast_mode is True  # stays in FAST mode
         assert channel._in_poll is None
-        mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
+        mock_connection._deliver.assert_called_once_with(
+            {"body": "test", "properties": {"delivery_info": {"queue": "my_queue"}}},
+            "my_queue",
+        )
 
     def test_fast_consume_read_with_delivery_count(self, global_keyprefix: str) -> None:
         """Test FAST mode injects x-delivery-count header when delivery_count > 0."""
@@ -2786,13 +2809,78 @@ class TestFastSlowConsumeMode:
         assert result is True
         assert channel._consume_fast_mode is True  # switched back to FAST
         assert channel._in_poll is None
-        mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
+        mock_connection._deliver.assert_called_once_with(
+            {"body": "test", "properties": {"delivery_info": {"queue": "my_queue"}}},
+            "my_queue",
+        )
         # Verify pipeline was used (ZADD + HMGET)
         mock_pipe.zadd.assert_called_once()
         mock_pipe.hmget.assert_called_once()
         # Unconditional ZADD: xx=True would leave a delivery with no visibility
         # deadline whenever the index entry was missing.
         assert mock_pipe.zadd.call_args.kwargs.get("xx") is None
+
+    def test_fast_consume_read_stamps_the_queue_into_delivery_info(self, global_keyprefix: str) -> None:
+        """FAST mode records the popped queue in the payload's delivery_info.
+
+        routing_key is the publish-time key, not the queue, so the QoS paths
+        (heartbeat, ack, requeue) need the queue stamped at consume time.
+        """
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = True
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        mock_client.parse_response.return_value = [
+            b"my_queue",
+            b"tag123",
+            b'{"body": "test", "properties": {"delivery_info": {"routing_key": "custom.route"}}}',
+            b"0",
+        ]
+
+        channel._bzmpop_read()
+
+        delivered_msg = mock_connection._deliver.call_args[0][0]
+        assert delivered_msg["properties"]["delivery_info"]["queue"] == "my_queue"
+        assert delivered_msg["properties"]["delivery_info"]["routing_key"] == "custom.route"
+
+    def test_slow_consume_read_stamps_the_queue_into_delivery_info(self, global_keyprefix: str) -> None:
+        """SLOW mode builds the message itself and must stamp the queue too."""
+        channel = object.__new__(Channel)
+        channel.message_key_prefix = MESSAGE_KEY_PREFIX
+        channel.global_keyprefix = global_keyprefix
+        channel._in_poll = True
+        channel._consume_fast_mode = False
+        channel._no_ack_queues = set()
+        channel.visibility_timeout = DEFAULT_VISIBILITY_TIMEOUT
+
+        mock_client = MagicMock()
+        channel.client = mock_client
+
+        mock_connection = MagicMock()
+        channel.connection = mock_connection
+
+        mock_client.parse_response.return_value = (
+            b"queue:my_queue",
+            [(b"tag123", 100.0)],
+        )
+
+        mock_pipe = MagicMock()
+        mock_pipe.execute.return_value = [1, [b'{"body": "test"}', b"0"]]
+        mock_client.pipeline.return_value.__enter__ = MagicMock(return_value=mock_pipe)
+        mock_client.pipeline.return_value.__exit__ = MagicMock(return_value=False)
+
+        channel._bzmpop_read()
+
+        delivered_msg = mock_connection._deliver.call_args[0][0]
+        assert delivered_msg["properties"]["delivery_info"]["queue"] == "my_queue"
 
     def test_slow_consume_read_empty_raises(self, global_keyprefix: str) -> None:
         """Test SLOW mode raises Empty when BZMPOP times out."""
@@ -2944,7 +3032,10 @@ class TestFastSlowConsumeMode:
         result = channel._bzmpop_read()
 
         assert result is True
-        mock_connection._deliver.assert_called_once_with({"body": "test"}, "my_queue")
+        mock_connection._deliver.assert_called_once_with(
+            {"body": "test", "properties": {"delivery_info": {"queue": "my_queue"}}},
+            "my_queue",
+        )
         mock_pipe.zadd.assert_not_called()
         mock_pipe.zrem.assert_called_once()
         mock_pipe.delete.assert_called_once()
@@ -4991,6 +5082,118 @@ class TestMessageRequeue:
             # Message should be in queue with score 0
             score = client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag)
             assert score == 0
+
+
+@pytest.mark.integration
+class TestCustomRoutingKeys:
+    """QoS paths for a queue bound under a routing key that is not its name.
+
+    kombu stamps the publish-time routing key into delivery_info at
+    basic_publish and never rewrites it on delivery, so with a custom binding
+    (queue "email_q" bound as "custom.route") routing_key is not the queue
+    name. The consume paths stamp the real queue into delivery_info["queue"]
+    and the QoS paths read that instead.
+    """
+
+    @staticmethod
+    def _deliver_one(channel: Channel, queue: str, delivery_tag: str) -> Any:
+        """Publish to `queue` under a foreign routing key and consume it."""
+        client = channel.client
+        client.delete(
+            f"{QUEUE_KEY_PREFIX}{queue}",
+            f"{MESSAGES_INDEX_PREFIX}{queue}",
+            f"{MESSAGE_KEY_PREFIX}{delivery_tag}",
+        )
+        channel._put(
+            queue,
+            {
+                "body": "test",
+                "properties": {
+                    "delivery_tag": delivery_tag,
+                    "delivery_info": {"exchange": "tasks", "routing_key": "custom.route"},
+                },
+            },
+        )
+        message = channel.basic_get(queue)
+        assert message is not None
+        assert message.delivery_info["routing_key"] == "custom.route"
+        return message
+
+    def test_the_heartbeat_reaches_a_queue_bound_under_a_foreign_routing_key(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """maybe_update_messages_index must bump the real queue's index entry.
+
+        A ZADD XX against messages_index:{routing_key} is a silent no-op, so
+        the deadline never moves and a long task is redelivered mid-run.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+            delivery_tag = "foreign-key-heartbeat"
+
+            self._deliver_one(channel, "email_q", delivery_tag)
+            index_key = f"{MESSAGES_INDEX_PREFIX}email_q"
+            before = client.zscore(index_key, delivery_tag)
+            assert before is not None
+
+            time.sleep(0.1)
+            channel.qos.maybe_update_messages_index()
+
+            assert client.zscore(index_key, delivery_tag) > before
+
+    def test_acking_cleans_the_index_of_a_queue_bound_under_a_foreign_routing_key(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """basic_ack must remove the entry from the real queue's index.
+
+        A ZREM against messages_index:{routing_key} leaves the real entry
+        behind, and the queue-entry ZREM that cancels a visibility-timeout
+        restore misses the real queue the same way.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+            delivery_tag = "foreign-key-ack"
+
+            message = self._deliver_one(channel, "email_q", delivery_tag)
+            index_key = f"{MESSAGES_INDEX_PREFIX}email_q"
+            assert client.zscore(index_key, delivery_tag) is not None
+
+            channel.basic_ack(message.delivery_tag)
+
+            assert client.zscore(index_key, delivery_tag) is None
+            assert not client.exists(f"{MESSAGE_KEY_PREFIX}{delivery_tag}")
+
+    def test_reject_requeue_applies_the_message_ttl_of_the_real_queue(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Reject-with-requeue must look up x-message-ttl under the queue name.
+
+        The requeue script itself reads the queue from the message hash; the
+        queue passed down from delivery_info only selects the per-queue TTL,
+        and a routing key finds none.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            client = channel.client
+            delivery_tag = "foreign-key-reject"
+
+            message = self._deliver_one(channel, "email_q", delivery_tag)
+            channel._message_ttls["email_q"] = 5000
+            try:
+                channel.basic_reject(message.delivery_tag, requeue=True)
+                assert 0 < client.pttl(f"{MESSAGE_KEY_PREFIX}{delivery_tag}") <= 5000
+            finally:
+                channel._message_ttls.pop("email_q", None)
+                client.delete(
+                    f"{QUEUE_KEY_PREFIX}email_q",
+                    f"{MESSAGES_INDEX_PREFIX}email_q",
+                    f"{MESSAGE_KEY_PREFIX}{delivery_tag}",
+                )
 
 
 @pytest.mark.integration
