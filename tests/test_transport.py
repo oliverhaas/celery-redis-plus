@@ -7026,48 +7026,145 @@ class TestDeliveryCount:
             assert client.exists(message_key)
             assert client.hget(message_key, "delivery_count") == b"1000"
 
-    def test_requeue_by_tag_increments_but_does_not_enforce_the_limit(
+    def test_a_reject_requeue_loop_stops_at_the_delivery_limit(
         self,
         celery_app: Celery,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Test that _requeue_by_tag counts the redelivery without dropping the message.
+        """A consumer rejecting with requeue in a loop must not spin forever.
 
-        Reject-with-requeue is a redelivery, as it is in RabbitMQ, so it counts.
-        The limit is not enforced here: the message keeps its index entry, so
-        enqueue_due_messages sees the raised count at its next deadline and drops
-        it. One place decides, one place deletes.
+        Every consume re-stamps the index deadline, so the sweep never sees
+        the message due and its limit check never runs. The requeue script
+        itself has to drop at the limit, with the same attempt counting as
+        the sweep: limit 3 = first delivery plus two redeliveries.
         """
         with celery_app.connection() as conn:
             channel = cast("Channel", conn.default_channel)
-            channel.delivery_limit = 1
+            channel.delivery_limit = 3
             client = channel.client
 
-            delivery_tag = "requeue-no-incr-test"
-            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery")
-
+            delivery_tag = "reject-loop-test"
             message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
-            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", f"{MESSAGES_INDEX_PREFIX}celery", message_key)
 
+            channel._put(
+                "celery",
+                {
+                    "body": "test",
+                    "headers": {"task": "myapp.tasks.add", "id": "0f8d9c3a-loop"},
+                    "properties": {
+                        "delivery_tag": delivery_tag,
+                        "delivery_info": {"exchange": "", "routing_key": "celery"},
+                    },
+                },
+            )
+
+            with caplog.at_level(logging.ERROR, logger="celery_redis_plus.transport"):
+                for _ in range(channel.delivery_limit):
+                    message = channel.basic_get("celery")
+                    assert message is not None
+                    channel.basic_reject(message.delivery_tag, requeue=True)
+
+            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None
+            assert client.zscore(f"{MESSAGES_INDEX_PREFIX}celery", delivery_tag) is None
+            assert not client.exists(message_key)
+            assert channel.basic_get("celery") is None
+
+            dropped_records = [r for r in caplog.records if "dropped" in r.getMessage()]
+            assert len(dropped_records) == 1
+            text = dropped_records[0].getMessage()
+            assert "myapp.tasks.add" in text
+            assert "delivery limit" in text
+
+    @pytest.mark.parametrize(
+        ("delivery_count", "expect_dropped"),
+        [("1", False), ("2", True)],
+        ids=["under-limit", "at-limit"],
+    )
+    def test_requeue_by_tag_drops_once_the_count_reaches_the_limit(
+        self,
+        celery_app: Celery,
+        delivery_count: str,
+        expect_dropped: bool,
+    ) -> None:
+        """Test _requeue_by_tag counts attempts with the sweep's >= check.
+
+        With delivery_limit=3, a stored delivery_count of 2 means this requeue
+        would start a fourth delivery, so the message is dropped instead and
+        the requeue reports False.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.delivery_limit = 3
+            client = channel.client
+
+            delivery_tag = f"requeue-limit-boundary-{delivery_count}"
+            index_key = f"{MESSAGES_INDEX_PREFIX}celery"
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            client.delete(f"{QUEUE_KEY_PREFIX}celery", index_key, message_key)
+
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
             client.hset(
                 message_key,
                 mapping={
                     "payload": json_dumps(payload),
                     "routing_key": "celery",
                     "priority": "0",
-                    "delivery_count": "5",
+                    "native_delayed": "0",
+                    "delivery_count": delivery_count,
                 },
             )
+            client.zadd(index_key, {delivery_tag: time.time() + 300})
 
-            # Even though delivery_count (5) exceeds delivery_limit (1),
-            # _requeue_by_tag should succeed because it doesn't enforce the limit
             result = channel._requeue_by_tag(delivery_tag, queue="celery")
-            assert result is True
 
-            # The redelivery is counted, so the next enqueue_due_messages cycle
-            # sees the raised count and drops the message
-            assert client.hget(message_key, "delivery_count") == b"6"
-            # Message should be in queue
-            assert client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is not None
+            assert result is not expect_dropped
+            assert bool(client.exists(message_key)) is not expect_dropped
+            assert (client.zscore(f"{QUEUE_KEY_PREFIX}celery", delivery_tag) is None) is expect_dropped
+            assert (client.zscore(index_key, delivery_tag) is None) is expect_dropped
+
+    def test_requeue_after_the_sweep_already_restored_neither_counts_nor_drops(
+        self,
+        celery_app: Celery,
+    ) -> None:
+        """Test a stale reject for a tag the sweep already re-enqueued.
+
+        The sweep counted the redelivery when it restored the tag, so counting
+        it again here would inflate delivery_count. At the limit boundary that
+        drops the message after fewer real attempts than the limit allows,
+        cancelling the queue entry the sweep legitimately restored.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+            channel.delivery_limit = 3
+            client = channel.client
+
+            delivery_tag = "requeue-after-sweep"
+            queue_key = f"{QUEUE_KEY_PREFIX}celery"
+            index_key = f"{MESSAGES_INDEX_PREFIX}celery"
+            message_key = f"{MESSAGE_KEY_PREFIX}{delivery_tag}"
+            client.delete(queue_key, index_key, message_key)
+
+            payload = {"body": "test", "headers": {}, "properties": {"delivery_tag": delivery_tag}}
+            client.hset(
+                message_key,
+                mapping={
+                    "payload": json_dumps(payload),
+                    "routing_key": "celery",
+                    "priority": "0",
+                    "native_delayed": "0",
+                    "delivery_count": "2",
+                },
+            )
+            sweep_score = 42.0
+            client.zadd(queue_key, {delivery_tag: sweep_score})
+            client.zadd(index_key, {delivery_tag: time.time() + 300})
+
+            assert channel._requeue_by_tag(delivery_tag, queue="celery") is True
+
+            assert client.hget(message_key, "delivery_count") == b"2"
+            assert client.zscore(queue_key, delivery_tag) == sweep_score
+            assert client.zscore(index_key, delivery_tag) is not None
 
 
 @pytest.mark.integration

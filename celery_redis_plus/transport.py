@@ -1587,8 +1587,10 @@ class Channel(virtual.Channel):
 
         The Lua script atomically reads the routing_key (queue) from the message
         hash and adds the message back to that queue, incrementing delivery_count.
-        It does not enforce delivery_limit: the message keeps its index entry,
-        so enqueue_due_messages drops it at the next deadline if it is over.
+        It enforces delivery_limit with the same attempt counting as
+        enqueue_due_messages: a live reject loop re-stamps the index deadline
+        on every consume, so the sweep never sees the entry come due and its
+        check alone cannot stop the loop.
 
         Args:
             delivery_tag: The message's delivery tag.
@@ -1596,7 +1598,8 @@ class Channel(virtual.Channel):
             leftmost: If True, requeue to front of queue (score=0).
 
         Returns:
-            True if message was requeued, False if not found.
+            True if message was requeued, False if not found or dropped at the
+            delivery limit.
         """
         # Prefix key since EVALSHA doesn't auto-prefix KEYS
         message_key = f"{self.global_keyprefix}{self._message_key(delivery_tag)}"
@@ -1620,8 +1623,18 @@ class Channel(virtual.Channel):
                     self.message_key_prefix,
                     self.visibility_timeout + DEFAULT_REQUEUE_CHECK_INTERVAL,
                     MESSAGES_INDEX_PREFIX,
+                    -1 if self.delivery_limit is None else self.delivery_limit,
                 ],
             )
+            if isinstance(result, list):
+                # The script deleted the hash, so this log line is the
+                # message's last trace
+                logger.error(
+                    "Message dropped on requeue after reaching the delivery limit of %d: %s",
+                    self.delivery_limit,
+                    self._describe_message(result[1]),
+                )
+                return False
             return bool(result)
 
     def _put(self, queue: str, message: dict[str, Any], **kwargs: Any) -> None:
