@@ -1077,7 +1077,10 @@ single task, the same way you would with no refresh mechanism. A lone solo
 worker gets away with it because its own requeue scan is frozen too, but a
 second worker of any pool type will reclaim the message and run it again.
 <code>prefork</code> and <code>threads</code> are unaffected: they execute tasks off the main
-thread, so the event loop keeps ticking and the refresh works.</p>
+thread, so the event loop keeps ticking and the refresh works. <code>gevent</code> and
+<code>eventlet</code> have no event loop; there the refresh and the requeue scan ride
+the drain path instead, which keeps ticking while tasks run as long as they
+yield, as everything on those pools requires.</p>
 </div>
 <h4 id="message-storage-options">Message Storage Options<a class="headerlink" href="#message-storage-options" title="Permanent link">&para;</a></h4>
 <table>
