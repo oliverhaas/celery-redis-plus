@@ -631,6 +631,8 @@ class MultiChannelPoller:
         self._expires_timer_entry: Any = None
         self._expires_timer_interval: float | None = None
         self._last_expires_refresh: float = 0.0
+        self._last_due_sweep: float = 0.0
+        self._last_index_heartbeat: float = 0.0
 
     def close(self) -> None:
         for fd in self._chan_to_sock.values():
@@ -717,10 +719,15 @@ class MultiChannelPoller:
         return total_enqueued
 
     def maybe_update_messages_index(self) -> None:
-        """Update message index scores to keep delivered messages alive."""
+        """Update message index scores to keep delivered messages alive.
+
+        No active_queues gate: unacked deliveries outlive consumption (a
+        cancelled consumer's task can still be running), and the QoS method
+        is a no-op with nothing delivered anyway.
+        """
         for channel in self._channels:
             qos = channel.qos
-            if qos is not None and channel.active_queues:
+            if qos is not None:
                 cast("QoS", qos).maybe_update_messages_index()
 
     def maybe_refresh_queue_expires(self) -> None:
@@ -769,6 +776,42 @@ class MultiChannelPoller:
         self._last_expires_refresh = now
         self.maybe_refresh_queue_expires()
 
+    def maybe_enqueue_due_messages_without_loop(self) -> None:
+        """Sweep from the drain path on a connection that has no event loop.
+
+        The call_repeatedly timer only exists inside a worker's hub. gevent
+        and eventlet workers run a synloop that drains events instead, so
+        without this nothing ever restores timed-out messages or delivers
+        native-delayed ones on those pools.
+        """
+        if self._loop is not None:
+            return
+        now = time()
+        if now - self._last_due_sweep < DEFAULT_REQUEUE_CHECK_INTERVAL:
+            return
+        self._last_due_sweep = now
+        self.maybe_enqueue_due_messages()
+
+    def maybe_update_messages_index_without_loop(self) -> None:
+        """Heartbeat from the drain path on a connection that has no event loop.
+
+        Same reasoning as the sweep above: without this, a hub-less consumer's
+        in-flight messages hit their visibility deadline mid-task and get
+        redelivered to another worker.
+        """
+        if self._loop is not None:
+            return
+        timeouts = [channel.visibility_timeout for channel in self._channels]
+        if not timeouts:
+            return
+        now = time()
+        # A third of the shortest visibility timeout, matching the interval
+        # register_with_event_loop uses for the hub timer
+        if now - self._last_index_heartbeat < min(timeouts) / 3:
+            return
+        self._last_index_heartbeat = now
+        self.maybe_update_messages_index()
+
     def _update_expires_timer(self) -> None:
         """Register or update the periodic PEXPIRE timer based on configured TTLs."""
         interval = self._expires_refresh_interval()
@@ -810,6 +853,8 @@ class MultiChannelPoller:
 
     def get(self, callback: Any, timeout: float | None = None) -> None:
         self.maybe_refresh_queue_expires_without_loop()
+        self.maybe_enqueue_due_messages_without_loop()
+        self.maybe_update_messages_index_without_loop()
         self._in_protected_read = True
         try:
             for channel in self._channels:

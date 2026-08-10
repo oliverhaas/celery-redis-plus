@@ -2627,6 +2627,95 @@ class TestMultiChannelPoller:
 
         poller.maybe_refresh_queue_expires.assert_not_called()  # type: ignore[attr-defined]
 
+    def test_drain_sweeps_due_messages_without_a_loop(self) -> None:
+        """A connection with no hub restores timed-out messages off the drain path.
+
+        gevent and eventlet workers run a synloop that never calls
+        register_with_event_loop, so without this nothing ever runs
+        enqueue_due_messages and a crashed worker's unacked messages stay
+        stuck forever.
+        """
+        poller = MultiChannelPoller()
+        poller.maybe_enqueue_due_messages = MagicMock()  # type: ignore[method-assign]
+        channel = MagicMock()
+        poller._channels = {channel}  # type: ignore[assignment]
+
+        poller.maybe_enqueue_due_messages_without_loop()
+        poller._last_due_sweep = time.time() - 1
+        poller.maybe_enqueue_due_messages_without_loop()
+
+        poller.maybe_enqueue_due_messages.assert_called_once()  # type: ignore[attr-defined]
+
+        poller._last_due_sweep = time.time() - 3
+        poller.maybe_enqueue_due_messages_without_loop()
+
+        assert poller.maybe_enqueue_due_messages.call_count == 2  # type: ignore[attr-defined]
+
+    def test_drain_heartbeats_the_index_without_a_loop(self) -> None:
+        """A connection with no hub keeps in-flight messages alive off the drain path."""
+        poller = MultiChannelPoller()
+        poller.maybe_update_messages_index = MagicMock()  # type: ignore[method-assign]
+        channel = MagicMock()
+        channel.visibility_timeout = 60  # heartbeat interval 60 / 3 = 20s
+        poller._channels = {channel}  # type: ignore[assignment]
+
+        poller.maybe_update_messages_index_without_loop()
+        poller._last_index_heartbeat = time.time() - 10
+        poller.maybe_update_messages_index_without_loop()
+
+        poller.maybe_update_messages_index.assert_called_once()  # type: ignore[attr-defined]
+
+        poller._last_index_heartbeat = time.time() - 21
+        poller.maybe_update_messages_index_without_loop()
+
+        assert poller.maybe_update_messages_index.call_count == 2  # type: ignore[attr-defined]
+
+    def test_heartbeat_covers_channels_with_no_active_queues(self) -> None:
+        """Unacked deliveries outlive consumption.
+
+        After cancel_consumer a still-running acks_late task's tag remains in
+        QoS._delivered with no active queue, and its deadline must keep moving.
+        """
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        channel.active_queues = set()
+        poller._channels = {channel}  # type: ignore[assignment]
+
+        poller.maybe_update_messages_index()
+
+        channel.qos.maybe_update_messages_index.assert_called_once()
+
+    def test_drain_leaves_sweep_and_heartbeat_to_the_loop(self) -> None:
+        """With a hub the call_repeatedly timers own both jobs."""
+        poller = MultiChannelPoller()
+        poller.maybe_enqueue_due_messages = MagicMock()  # type: ignore[method-assign]
+        poller.maybe_update_messages_index = MagicMock()  # type: ignore[method-assign]
+        poller._loop = MagicMock()
+        channel = MagicMock()
+        channel.visibility_timeout = 60
+        poller._channels = {channel}  # type: ignore[assignment]
+
+        poller.maybe_enqueue_due_messages_without_loop()
+        poller.maybe_update_messages_index_without_loop()
+
+        poller.maybe_enqueue_due_messages.assert_not_called()  # type: ignore[attr-defined]
+        poller.maybe_update_messages_index.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_get_runs_the_drain_path_maintenance(self) -> None:
+        """The synloop's only entry point is get(), so maintenance rides on it."""
+        poller = MultiChannelPoller()
+        poller.maybe_refresh_queue_expires_without_loop = MagicMock()  # type: ignore[method-assign]
+        poller.maybe_enqueue_due_messages_without_loop = MagicMock()
+        poller.maybe_update_messages_index_without_loop = MagicMock()
+        poller.poller = MagicMock()
+        poller.poller.poll.return_value = []
+
+        with pytest.raises(Empty):
+            poller.get(MagicMock())
+
+        poller.maybe_enqueue_due_messages_without_loop.assert_called_once()
+        poller.maybe_update_messages_index_without_loop.assert_called_once()
+
 
 @pytest.mark.unit
 class TestFastSlowConsumeMode:
