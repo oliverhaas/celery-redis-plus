@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-15
 
 ### Changed
 - **BREAKING**: `_kombu.binding.{exchange}` is now a sorted set instead of a plain set, scored with the unix time each binding goes stale. Bindings were never removed: Redis cannot expire an individual member, and only `queue_delete` removes one, which reaches just the bindings the calling process declared itself. So the routing table of a long-lived exchange grew for the life of the deployment, and a celery control client, which binds a fresh reply queue per call and does not always get to unbind it, drove that growth. The deadline is `x-expires` after the last refresh and never less than `MIN_BINDING_LIFETIME` (300 seconds); a queue without `x-expires` is scored `+inf` and still only goes away on an explicit unbind. Declaring, refreshing and publishing all rescore, and `get_table` drops whatever has aged out before it reads, so cleanup rides the read path and nothing has to sweep. Rescores use `ZADD GT`, so a channel with a short `x-expires` window cannot pull back a deadline that a channel with a longer window pushed further out. The first `_queue_bind` converts an inherited set in place, keeping every member and scoring it `+inf`. The conversion is one-way and the key name is shared with kombu's own Redis transport, so the two can no longer declare against the same exchange: run `celery.contrib.migrate.migrate_tasks` before deploying this version, or `DEL` the binding keys if you already did. See the [migration guide](../getting-started/migration.md)
