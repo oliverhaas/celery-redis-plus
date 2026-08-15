@@ -64,7 +64,7 @@ build-backend = "hatchling.build"
 packages = ["celery_redis_plus"]
 
 [tool.hatch.build.targets.sdist]
-include = ["celery_redis_plus"]
+include = ["/celery_redis_plus"]
 
 [tool.ruff]
 line-length = 120
