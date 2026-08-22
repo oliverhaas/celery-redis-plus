@@ -405,24 +405,6 @@
         
       
       
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    Migration
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
       <a href="./" class="md-nav__link md-nav__link--active">
         
   
@@ -439,58 +421,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#run-the-migration-before-you-deploy" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Run the migration before you deploy
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#carry-over-a-custom-sep" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Carry over a custom sep
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#binding-lifetime" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Binding lifetime
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
       
     </li>
   
@@ -634,47 +564,6 @@
     
   
   
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#run-the-migration-before-you-deploy" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Run the migration before you deploy
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#carry-over-a-custom-sep" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Carry over a custom sep
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#binding-lifetime" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Binding lifetime
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
 </nav>
                   </div>
                 </div>
@@ -694,7 +583,7 @@
 
 
 <h1 id="migrating-from-standard-redis-transport">Migrating from Standard Redis Transport<a class="headerlink" href="#migrating-from-standard-redis-transport" title="Permanent link">&para;</a></h1>
-<p>The two transports use different Redis data structures (list vs sorted set), so existing tasks won't be picked up after switching. Use Celery's built-in migration to move them:</p>
+<p>The two transports use different Redis data structures (list vs sorted set), so tasks queued before the switch are not picked up after it. Celery's built-in migration moves them:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">celery</span><span class="w"> </span><span class="kn">import</span> <span class="n">Celery</span>
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">celery.contrib.migrate</span><span class="w"> </span><span class="kn">import</span> <span class="n">migrate_tasks</span>
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
@@ -709,36 +598,16 @@
 </span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>    <span class="n">broker_transport</span><span class="o">=</span><span class="s2">&quot;celery_redis_plus.transport:Transport&quot;</span><span class="p">,</span>
 </span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="p">)</span>
 </span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>
-</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="c1"># Migrate</span>
-</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="k">with</span> <span class="n">source_app</span><span class="o">.</span><span class="n">connection</span><span class="p">()</span> <span class="k">as</span> <span class="n">src</span><span class="p">,</span> <span class="n">dest_app</span><span class="o">.</span><span class="n">connection</span><span class="p">()</span> <span class="k">as</span> <span class="n">dst</span><span class="p">:</span>
-</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>    <span class="n">state</span> <span class="o">=</span> <span class="n">migrate_tasks</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">app</span><span class="o">=</span><span class="n">dest_app</span><span class="p">,</span> <span class="n">ack_messages</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Migrated </span><span class="si">{</span><span class="n">state</span><span class="o">.</span><span class="n">count</span><span class="si">}</span><span class="s2"> tasks&quot;</span><span class="p">)</span>
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="k">with</span> <span class="n">source_app</span><span class="o">.</span><span class="n">connection</span><span class="p">()</span> <span class="k">as</span> <span class="n">src</span><span class="p">,</span> <span class="n">dest_app</span><span class="o">.</span><span class="n">connection</span><span class="p">()</span> <span class="k">as</span> <span class="n">dst</span><span class="p">:</span>
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>    <span class="n">state</span> <span class="o">=</span> <span class="n">migrate_tasks</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">,</span> <span class="n">app</span><span class="o">=</span><span class="n">dest_app</span><span class="p">,</span> <span class="n">ack_messages</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Migrated </span><span class="si">{</span><span class="n">state</span><span class="o">.</span><span class="n">count</span><span class="si">}</span><span class="s2"> tasks&quot;</span><span class="p">)</span>
 </span></code></pre></div>
-<p>The <code>dest_app</code> is probably just the app of your new deployment and does not need to be explicitely defined, while <code>source_app</code> is a temporary dummy app for the old transports.</p>
-<p>For most cases where a few minutes of task delays do not matter, the migration is fairly straight forward. Run the migration script while the old deployment is still the one talking to the broker, then deploy the new code, then remove the <code>source_app</code> or any other leftovers in the next deployment. Running the script after the new transport has already declared its queues fails with <code>WRONGTYPE</code>, for the reason in the next section.</p>
-<h2 id="run-the-migration-before-you-deploy">Run the migration before you deploy<a class="headerlink" href="#run-the-migration-before-you-deploy" title="Permanent link">&para;</a></h2>
-<p>Queues, message hashes and indices all use key prefixes that differ from the standard Redis transport, so the two transports cannot read each other's messages. That is what the migration above is for. Exchange bindings are the exception: both transports store them under the same key name, <code>_kombu.binding.{exchange}</code>, with members packed as <code>routing_key + sep + pattern + sep + queue</code>.</p>
-<p>They do not store them in the same <strong>type</strong>. The standard transport uses a plain set. celery-redis-plus uses a sorted set, scored with the unix time each binding goes stale, so that a binding whose process is gone cleans itself up (see <a href="#binding-lifetime">Binding lifetime</a>). The first <code>_queue_bind</code> this transport runs converts an inherited set in place, keeping every member and scoring it <code>+inf</code>, because this transport did not write those members and cannot know when they go stale.</p>
-<p>The conversion is one-way, so <strong>the two transports cannot both declare against the same exchange</strong>. Once converted, the standard transport's <code>SADD</code> and <code>SMEMBERS</code> on that key raise <code>WRONGTYPE Operation against a key holding the wrong kind of value</code>, and since kombu declares queues when a consumer or producer is created, that hits the <code>source_app</code> in the script above too.</p>
-<p>Run the migration script <strong>before</strong> deploying the new transport, from a process where only the old transport has touched the broker. If you already deployed and the script now fails with <code>WRONGTYPE</code>, delete the binding keys and let the old transport recreate them:</p>
+<p>In practice <code>dest_app</code> is just the app of your new deployment; <code>source_app</code> is a throwaway configured for the old transport.</p>
+<p>Run this <strong>before</strong> deploying the new transport. Both transports store exchange bindings under <code>_kombu.binding.{exchange}</code>, but celery-redis-plus converts that key from a plain set to a sorted set on its first declare, and the conversion is one-way: afterwards the standard transport, including the <code>source_app</code> above, fails on it with <code>WRONGTYPE</code>. If that already happened, <code>DEL</code> the binding keys and move on; every live process rewrites its own bindings on its next declare:</p>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>DEL _kombu.binding.celery
 </span></code></pre></div>
-<p>Losing binding members costs nothing: every live process rewrites its own bindings the next time it declares, and celery-redis-plus keeps rescoring them from then on.</p>
-<h2 id="carry-over-a-custom-sep">Carry over a custom <code>sep</code><a class="headerlink" href="#carry-over-a-custom-sep" title="Permanent link">&para;</a></h2>
-<p><code>sep</code> defaults to <code>"\x06\x16"</code> in both transports. If your deployment overrode it in <code>broker_transport_options</code>, the override <strong>must</strong> come along:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">broker_transport_options</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;sep&quot;</span><span class="p">:</span> <span class="s2">&quot;:&quot;</span><span class="p">}</span>
-</span></code></pre></div>
-<p>Miss it and the two sides write bindings in two different formats into the same table, and each misreads the other's:</p>
-<ul>
-<li>The standard Redis transport splits without padding and unpacks 3-tuples, so it raises <code>ValueError: not enough values to unpack (expected 3, got 1)</code> on every <code>_lookup</code>, meaning on every publish.</li>
-<li>celery-redis-plus pads a short split to <code>(member, "", "")</code>, which matches no routing key. <code>_lookup</code> returns an empty set and kombu's <code>DirectExchange.deliver</code> drops the message with no exception, no warning and no deadletter.</li>
-</ul>
-<p>The second case produces no error at all, so <code>get_table</code> logs a warning (once per process) naming the exchange and the offending member whenever a binding does not split into three parts.</p>
-<p>The bindings are rewritten by <code>_queue_bind</code> on worker/producer startup, so fixing <code>sep</code> and restarting is normally enough. Members in the old format linger until they go stale; <code>ZREM</code> them from <code>_kombu.binding.{exchange}</code> if the warning persists.</p>
-<h2 id="binding-lifetime">Binding lifetime<a class="headerlink" href="#binding-lifetime" title="Permanent link">&para;</a></h2>
-<p><code>_kombu.binding.{exchange}</code> is a sorted set scored with the unix time each binding goes stale, which is <code>x-expires</code> after its last refresh, and never less than <code>MIN_BINDING_LIFETIME</code> (300 seconds). A queue without <code>x-expires</code> is scored <code>+inf</code> and its binding only ever goes away on an explicit unbind.</p>
-<p>Declaring, refreshing and publishing all rescore, so a binding lives exactly as long as some process keeps using its queue. <code>get_table</code> drops whatever has aged out before it reads, so cleanup rides the read path and nothing has to sweep. Redis cannot expire an individual member of a key, and only <code>queue_delete</code> removes a binding, which reaches just the bindings a process declared itself. Without the deadline the routing table of a long-lived exchange grows for the life of the deployment: a celery control client binds a fresh reply queue per call and does not always get to unbind it.</p>
-<p>The window comes from <code>x-expires</code>, so lower it on a queue whose bindings should be reclaimed sooner. The floor is there because the processes that abandon bindings are the ones that cannot refresh them: a control client has no event loop, and the 10 second <code>x-expires</code> celery puts on its reply queue is shorter than the control call the binding has to outlive.</p>
+<p>If you overrode <code>sep</code> in <code>broker_transport_options</code>, carry the override over. With mismatched separators the two sides misread each other's bindings: the standard transport raises <code>ValueError</code> on every publish, celery-redis-plus silently drops the message (and logs a warning naming the offending member).</p>
+<p>My own migration skipped all of this: hard-switch to the new transport, then requeue what the old deployment left behind with a couple of Django shell functions that pop the raw messages from the old list keys and re-send the tasks. If your tasks can sit for the few minutes that takes, it beats orchestrating two apps.</p>
 
 
 
