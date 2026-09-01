@@ -28,6 +28,12 @@ Transport Options
   under a name that also covers XREAD, and it is not kombu's ``polling_interval``, which is
   the sleep between unsuccessful polls and stays disabled here.
 * ``stream_maxlen``: Maximum stream length for fanout streams (default: 10000)
+* ``stream_read_count``: Maximum messages XREAD returns per poll for fanout streams
+  (default: 1000). Fanout carries celery's event and pidbox traffic, which a busy fleet
+  emits faster than one message per event-loop tick.
+* ``stream_max_age``: How far back in seconds a fanout consumer replays after falling
+  behind (default: 60), measured off the Redis server clock rather than the local one.
+  Negative disables the bound and replays the whole backlog.
 * ``global_keyprefix``: Global prefix for all Redis keys
 * ``socket_timeout``: Socket timeout in seconds
 * ``socket_connect_timeout``: Socket connection timeout in seconds
@@ -69,7 +75,7 @@ import weakref
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from queue import Empty
-from time import time
+from time import monotonic, time
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, cast
 
 if TYPE_CHECKING:
@@ -105,7 +111,9 @@ from .constants import (
     DEFAULT_QUEUE_EXPIRES,
     DEFAULT_REQUEUE_BATCH_LIMIT,
     DEFAULT_REQUEUE_CHECK_INTERVAL,
+    DEFAULT_STREAM_MAX_AGE,
     DEFAULT_STREAM_MAXLEN,
+    DEFAULT_STREAM_READ_COUNT,
     DEFAULT_VISIBILITY_TIMEOUT,
     DROPPED_REPORT_LIMIT,
     MAX_PRIORITY,
@@ -693,7 +701,8 @@ class MultiChannelPoller:
             qos = channel.qos
             if qos is not None and channel.active_queues and qos.can_consume():
                 self._register_BZMPOP(channel)
-            if qos is not None and channel.active_fanout_queues and qos.can_consume():
+            # Fanout is ungated: a broadcast delivery occupies no prefetch slot
+            if channel.active_fanout_queues:
                 self._register_XREAD(channel)
 
     def on_poll_init(self, poller: Any) -> None:
@@ -839,7 +848,9 @@ class MultiChannelPoller:
     def on_readable(self, fileno: int) -> bool | None:
         chan, cmd_type = self._fd_to_chan[fileno]
         qos = chan.qos
-        if qos is not None and qos.can_consume():
+        # An XREAD reply is already on the socket; leaving it unparsed until the
+        # prefetch window drains is what makes event timestamps drift
+        if cmd_type == "XREAD" or (qos is not None and qos.can_consume()):
             return chan.handlers[cmd_type]()
         return None
 
@@ -861,7 +872,8 @@ class MultiChannelPoller:
                 qos = channel.qos
                 if qos is not None and channel.active_queues and qos.can_consume():
                     self._register_BZMPOP(channel)
-                if qos is not None and channel.active_fanout_queues and qos.can_consume():
+                # Fanout is ungated: a broadcast delivery occupies no prefetch slot
+                if channel.active_fanout_queues:
                     self._register_XREAD(channel)
 
             events = self.poller.poll(timeout)
@@ -933,6 +945,8 @@ class Channel(virtual.Channel):
 
     # Streams configuration
     stream_maxlen = DEFAULT_STREAM_MAXLEN
+    stream_read_count = DEFAULT_STREAM_READ_COUNT
+    stream_max_age = DEFAULT_STREAM_MAX_AGE
 
     # Global key prefix
     global_keyprefix = ""
@@ -968,6 +982,8 @@ class Channel(virtual.Channel):
         "retry_on_timeout",
         "client_name",
         "stream_maxlen",
+        "stream_read_count",
+        "stream_max_age",
         "credential_provider",
         "delivery_limit",
     )
@@ -991,6 +1007,9 @@ class Channel(virtual.Channel):
         self.handlers = {"BZMPOP": self._bzmpop_read, "XREAD": self._xread_read}
         # Track last-read stream ID per stream for fanout (start with $ = only new messages)
         self._stream_offsets: dict[str, str] = {}
+        # Newest stream ID seen per stream as (server_ms, monotonic instant), the
+        # server-clock anchor _bound_offset_age measures backlog age against
+        self._stream_seen: dict[str, tuple[int, float]] = {}
         # Per-queue TTL state from x-expires and x-message-ttl queue arguments.
         # Aliases of the transport-wide registries, not copies: kombu caches
         # declarations per connection (Connection.declared_entities), so only
@@ -1381,6 +1400,34 @@ class Channel(virtual.Channel):
         """
         return f"{self.keyprefix_fanout}{exchange}"
 
+    def _bound_offset_age(self, stream_key: str, offset: str) -> str:
+        """Clamp a stored stream offset to the ``stream_max_age`` window.
+
+        A consumer that fell behind would otherwise replay the whole backlog to
+        reach the present. Streams carry no consumer-side TTL, but a stream id
+        is ``<unix-ms>-<seq>``, so an id built from a timestamp is a valid start
+        offset. Ids are unpadded, so the comparison has to be numeric.
+
+        The cutoff is measured off the newest id seen on this stream and the
+        ``monotonic()`` instant it arrived, never off the local wall clock: ids
+        carry the Redis server clock, so a worker running ahead would compute a
+        cutoff past every id in the stream and skip it for good.
+        """
+        if offset == "$" or self.stream_max_age < 0:
+            return offset
+        anchor = self._stream_seen.get(stream_key)
+        if anchor is None:
+            return offset
+        try:
+            offset_ms = int(offset.split("-", maxsplit=1)[0])
+        except ValueError:
+            return offset
+        seen_ms, seen_at = anchor
+        oldest_ms = seen_ms + int((monotonic() - seen_at - self.stream_max_age) * 1000)
+        if offset_ms < oldest_ms:
+            return f"{oldest_ms}-0"
+        return offset
+
     def _xread_start(self, timeout: float | None = None) -> None:
         """Start XREAD for fanout streams (true broadcast - every consumer gets every message)."""
         if timeout is None:
@@ -1394,7 +1441,7 @@ class Channel(virtual.Channel):
                 stream_key = self._fanout_stream_key(exchange)
                 # Use stored offset or "$" for only new messages
                 offset = self._stream_offsets.get(stream_key, "$")
-                streams[stream_key] = offset
+                streams[stream_key] = self._bound_offset_age(stream_key, offset)
 
         if not streams:
             return
@@ -1408,7 +1455,7 @@ class Channel(virtual.Channel):
         command_args: list[Any] = [
             "XREAD",
             "COUNT",
-            "1",
+            str(self.stream_read_count),
             "BLOCK",
             str(int(timeout * 1000)),
             "STREAMS",
@@ -1433,6 +1480,7 @@ class Channel(virtual.Channel):
             if not messages:
                 raise Empty
 
+            delivered = False
             for stream, message_list in messages:
                 stream_str = bytes_to_str(stream) if isinstance(stream, bytes) else stream
                 for message_id, fields in message_list:
@@ -1445,6 +1493,13 @@ class Channel(virtual.Channel):
                     if prefix and stream_str.startswith(prefix):
                         offset_key = stream_str[len(prefix) :]
                     self._stream_offsets[offset_key] = message_id_str
+                    # Anchor the server clock: this id's timestamp paired with
+                    # the local monotonic instant it arrived
+                    with suppress(ValueError):
+                        self._stream_seen[offset_key] = (
+                            int(message_id_str.split("-", maxsplit=1)[0]),
+                            monotonic(),
+                        )
 
                     # Find which queue this stream belongs to
                     queue_name = None
@@ -1466,15 +1521,18 @@ class Channel(virtual.Channel):
                     delivery_tag = self._next_delivery_tag()
                     payload["properties"]["delivery_tag"] = delivery_tag
 
-                    # Mark as fanout message (no ack needed)
-                    if self.qos is not None:
+                    # _fanout_tags is only discarded in ack/reject, so a no_ack
+                    # queue's tags would leak for the life of the process
+                    if self.qos is not None and queue_name not in self._no_ack_queues:
                         cast("QoS", self.qos)._fanout_tags.add(delivery_tag)
 
                     # Deliver message
                     self.connection._deliver(payload, queue_name)
-                    return True
+                    delivered = True
 
-            raise Empty
+            if not delivered:
+                raise Empty
+            return True
         finally:
             self._in_fanout_poll = None
 

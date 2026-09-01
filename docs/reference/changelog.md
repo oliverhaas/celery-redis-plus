@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Fanout consumption is no longer gated on the prefetch window. `MultiChannelPoller.on_poll_start` and `get` only issued the XREAD when `qos.can_consume()` was true, and `on_readable` refused to parse an XREAD reply already sitting readable on the socket under the same condition. A worker holding a full prefetch window (`prefetch_multiplier` × concurrency unacked, with `acks_late`) therefore stopped reading fanout entirely. Fanout deliveries are broadcast and never occupy a prefetch slot, so the gate protected against nothing. Celery rides fanout for the `celeryev` event exchange and the pidbox control exchange, so the visible symptoms were `Substantial drift ... may mean clocks are out of sync` warnings from `celery.events.state.State._warn_drift` on workers with correct clocks, and `celery inspect ping` timing out on a busy worker. BZMPOP stays gated. kombu's own Redis transport leaves the equivalent LISTEN registration ungated for the same reason
+- A fanout poll now drains the whole reply instead of one message. `_xread_start` sent `XREAD COUNT 1` and `_xread_read` returned after the first `_deliver`, so a consumer could never advance faster than one message per event-loop tick, which a fleet publishing events at any rate outruns. Every message in the reply is now delivered, with `Empty` still raised when nothing was, matching how kombu's `_receive` drains everything readable and returns `any(ret)`
+- A fanout consumer that fell behind no longer replays the whole backlog to reach the present. Streams have no consumer-side TTL, but a stream id is `<unix-ms>-<seq>`, so an id built from a timestamp is a valid start offset; a stored offset older than `stream_max_age` is skipped forward. The cutoff is measured off the newest id seen on that stream paired with the `monotonic()` instant it arrived, never off the local wall clock: ids carry the Redis server clock, so a `time()`-derived cutoff on a worker running ahead would land past every id in the stream and skip it permanently. Ids are unpadded, so the comparison is numeric rather than lexicographic. `$`, a negative `stream_max_age` and a stream with no anchor yet pass through unchanged
+- `QoS._fanout_tags` no longer grows for the life of the process. Every fanout delivery was added to the set, which is only discarded in `ack()`/`reject()`, and celery's event and pidbox consumers are `no_ack=True`, so `basic_consume` never calls `qos.append` and nothing ever acked. Tags are now tracked only for fanout queues consumed with acks, where the set is still needed so the index heartbeat skips them; kombu's Redis transport tracks nothing here at all
+
+### Added
+- `stream_read_count` transport option (default `1000`), the `XREAD COUNT` for fanout polls
+- `stream_max_age` transport option (default `60`), how many seconds of fanout backlog a consumer replays after falling behind. Negative disables the bound and replays whatever the stream still holds
+
 ## [0.4.0] - 2026-08-15
 
 ### Changed

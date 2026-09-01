@@ -74,6 +74,8 @@ broker_transport = "celery_redis_plus.transport:Transport"
 - `DEFAULT_QUEUE_EXPIRES`: `None` - global fallback expiry (seconds) for queues declared without `x-expires`; when set, binding keys and fanout streams get TTLs too
 - `MIN_QUEUE_EXPIRES`: `10_000` - floor under `x-expires`, in milliseconds
 - `MIN_BINDING_LIFETIME`: `300` - floor under how long a binding survives without a refresh, in seconds
+- `DEFAULT_STREAM_READ_COUNT`: `1000` - XREAD `COUNT` for fanout polls
+- `DEFAULT_STREAM_MAX_AGE`: `60` - seconds of fanout backlog a lagging consumer replays (negative disables the bound)
 
 ### Redis Keys
 
@@ -105,6 +107,38 @@ Empty-binding-table publishes to durable direct exchanges raise `InconsistencyEr
 ### Global queue_expires
 
 The `queue_expires` transport option (seconds, default `None`) gives every queue declared without `x-expires` the global expiry (`_new_queue` stores it in `_expires`, so it rides the existing refresh machinery). When set, `_queue_bind`/`_put`/`_refresh_queue_expires` also `PEXPIRE` binding keys (GT, bootstrap in `_queue_bind` when the key has no TTL yet) and `_put_fanout` pexpires the stream. Message hashes are the exception: they follow `message_ttl`/`x-message-ttl` only, and an expired index leaves them unreachable, so full broker cleanup needs both options.
+
+### Fanout streams
+
+Celery rides fanout for two things: the `celeryev` event exchange (the redis driver flips it from
+topic to fanout) and the pidbox control exchange. Both are consumed with `no_ack=True`, so a fanout
+delivery never occupies a prefetch slot. Consequently `on_poll_start`/`get` register XREAD whenever
+`active_fanout_queues` is non-empty, and `on_readable` parses an XREAD reply regardless of
+`qos.can_consume()`; only BZMPOP stays gated. Gating fanout on the prefetch window made a worker
+holding a full window stop reading events, which surfaces as celery's `Substantial drift` warnings
+(`State._warn_drift`, 16s threshold) and `inspect ping` timeouts.
+
+`_xread_start` sends `COUNT stream_read_count` and `_xread_read` delivers every message in the
+reply, tracking a `delivered` flag so `Empty` is still raised when nothing was delivered. One
+delivery per poll cannot keep up with a fleet emitting events.
+
+`_bound_offset_age` clamps a stored offset to `stream_max_age` so a consumer that fell behind skips
+the backlog instead of replaying it. Streams have no consumer-side TTL, but a stream id is
+`<unix-ms>-<seq>`, so a timestamp is a valid start offset; ids are unpadded, so the comparison is on
+ints, not strings. `$`, a negative `stream_max_age`, and a stream with no anchor yet pass through
+unchanged. Server-side `XADD ... MINID` was the alternative, but XADD takes only one trim strategy
+and `MAXLEN` holds the memory bound.
+
+The cutoff never touches the local wall clock. `_xread_read` records `_stream_seen[stream] =
+(server_ms, monotonic())` for the newest id it sees, and the cutoff is
+`seen_ms + (monotonic() - seen_at - stream_max_age) * 1000`. Stream ids carry the Redis server
+clock, so a `time()`-derived cutoff on a worker whose clock runs ahead lands past every id in the
+stream and skips it permanently; anchoring on the server clock and measuring only elapsed time
+locally keeps the two clocks from mixing.
+
+`QoS._fanout_tags` is only discarded in `ack`/`reject`, so `_xread_read` adds a tag only when the
+queue is not in `_no_ack_queues`; a no_ack consumer never acks and the set would grow for the life
+of the process.
 
 ### no_ack consumption
 

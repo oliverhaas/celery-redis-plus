@@ -27,6 +27,13 @@ DEFAULT_BLOCKING_TIMEOUT = 10
 # Default stream maximum length for fanout streams
 DEFAULT_STREAM_MAXLEN = 10000
 
+# XREAD COUNT per fanout poll; a busy fleet emits events faster than one per tick
+DEFAULT_STREAM_READ_COUNT = 1000
+
+# Seconds of fanout backlog a lagging consumer replays, measured off the Redis
+# server clock; negative disables the bound
+DEFAULT_STREAM_MAX_AGE = 60
+
 # Interval in seconds for requeue check (restores unacked messages and moves delayed messages)
 DEFAULT_REQUEUE_CHECK_INTERVAL = 60
 

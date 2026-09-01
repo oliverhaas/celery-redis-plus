@@ -44,6 +44,8 @@ All options are passed via Celery's `broker_transport_options` configuration.
 | `queue_expires` | `int` or `None` | `None` | Expiry in seconds for queues declared without `x-expires`; also puts TTLs on binding tables and fanout streams |
 | `global_keyprefix` | `str` | `""` | Prefix for all Redis keys |
 | `stream_maxlen` | `int` | `10000` | Max messages per fanout stream (approximate) |
+| `stream_read_count` | `int` | `1000` | Max messages read per fanout poll |
+| `stream_max_age` | `int` | `60` | Seconds of fanout backlog a lagging consumer replays, off the server clock (negative = no bound) |
 
 !!! warning "`blocking_timeout` is not kombu's `polling_interval`"
 
@@ -176,6 +178,8 @@ app.config_from_object({
         'global_keyprefix': 'myapp:',
         'visibility_timeout': 600,
         'stream_maxlen': 50000,
+        'stream_read_count': 1000,
+        'stream_max_age': 60,
         'message_ttl': 259200,  # 3 days
         'max_connections': 20,
         'health_check_interval': 30,

@@ -8,6 +8,7 @@ import time
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
 from queue import Empty
+from time import monotonic
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -27,6 +28,8 @@ from kombu.utils.json import dumps as json_dumps
 import celery_redis_plus.transport as transport_mod
 from celery_redis_plus.constants import (
     DEFAULT_MESSAGE_TTL,
+    DEFAULT_STREAM_MAX_AGE,
+    DEFAULT_STREAM_READ_COUNT,
     DEFAULT_VISIBILITY_TIMEOUT,
     DROPPED_REPORT_LIMIT,
     MESSAGE_KEY_PREFIX,
@@ -1665,7 +1668,7 @@ class TestChannel:
 
         mock_client = MagicMock()
         mock_client.zrem.side_effect = _client_exceptions.ResponseError(
-            "WRONGTYPE Operation against a key holding the wrong kind of value"
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
         )
         mock_context = MagicMock()
         mock_context.__enter__ = MagicMock(return_value=mock_client)
@@ -1744,7 +1747,7 @@ class TestChannel:
         mock_client = MagicMock()
         mock_pipe = _stub_binding_table(mock_client, [])
         mock_pipe.execute.side_effect = _client_exceptions.ResponseError(
-            "WRONGTYPE Operation against a key holding the wrong kind of value"
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
         )
         mock_client.smembers.return_value = {b"my_key\x06\x16\x06\x16my_queue"}
         mock_context = MagicMock()
@@ -2426,8 +2429,9 @@ class TestMultiChannelPoller:
         poller._register_BZMPOP.assert_not_called()  # type: ignore[attr-defined]
         poller._register_XREAD.assert_called_once_with(channel)  # type: ignore[attr-defined]
 
-    def test_on_poll_start_qos_cannot_consume(self) -> None:
-        """Test on_poll_start when QoS cannot consume."""
+    def test_on_poll_start_gates_only_bzmpop_on_the_prefetch_window(self) -> None:
+        """A full prefetch window stops task consumption, not fanout: fanout
+        deliveries are no-ack and never occupy a prefetch slot."""
         poller = MultiChannelPoller()
         poller._register_BZMPOP = MagicMock()  # type: ignore[method-assign]
         poller._register_XREAD = MagicMock()  # type: ignore[method-assign]
@@ -2440,9 +2444,46 @@ class TestMultiChannelPoller:
 
         poller.on_poll_start()
 
-        # Neither should be registered when can_consume is False
         poller._register_BZMPOP.assert_not_called()  # type: ignore[attr-defined]
-        poller._register_XREAD.assert_not_called()  # type: ignore[attr-defined]
+        poller._register_XREAD.assert_called_once_with(channel)  # type: ignore[attr-defined]
+
+    def test_get_gates_only_bzmpop_on_the_prefetch_window(self) -> None:
+        """get() re-registers the same way on_poll_start does, so the fanout
+        gate has to come off in both places."""
+        poller = MultiChannelPoller()
+        poller._register_BZMPOP = MagicMock()  # type: ignore[method-assign]
+        poller._register_XREAD = MagicMock()  # type: ignore[method-assign]
+        poller.poller = MagicMock()
+        poller.poller.poll.return_value = []
+        poller.maybe_refresh_queue_expires_without_loop = MagicMock()  # type: ignore[method-assign]
+        poller.maybe_enqueue_due_messages_without_loop = MagicMock()  # type: ignore[method-assign]
+        poller.maybe_update_messages_index_without_loop = MagicMock()  # type: ignore[method-assign]
+
+        channel = MagicMock()
+        channel.active_queues = ["queue1"]
+        channel.active_fanout_queues = ["fanout_queue"]
+        channel.qos.can_consume.return_value = False
+        poller._channels = {channel}  # type: ignore[assignment]
+
+        with pytest.raises(Empty):
+            poller.get(callback=MagicMock(), timeout=0)
+
+        poller._register_BZMPOP.assert_not_called()  # type: ignore[attr-defined]
+        poller._register_XREAD.assert_called_once_with(channel)  # type: ignore[attr-defined]
+
+    def test_on_readable_parses_an_xread_reply_with_a_full_prefetch_window(self) -> None:
+        """The reply is already on the socket; refusing to parse it leaves the
+        events sitting there until the window drains."""
+        poller = MultiChannelPoller()
+        channel = MagicMock()
+        channel.qos.can_consume.return_value = False
+        channel.handlers = {"XREAD": MagicMock()}
+
+        poller._fd_to_chan = {42: (channel, "XREAD")}
+
+        poller.on_readable(42)
+
+        channel.handlers["XREAD"].assert_called_once()
 
     def test_close_handles_unregister_errors(self) -> None:
         """Test that close handles KeyError and ValueError when unregistering."""
@@ -3266,6 +3307,211 @@ class TestFastSlowConsumeMode:
             mock_client.connection,
             "BZMPOP",
         )
+
+
+def _make_fanout_channel(
+    *,
+    no_ack_queues: set[str] | None = None,
+    stream_offsets: dict[str, str] | None = None,
+    stream_seen: dict[str, tuple[int, float]] | None = None,
+) -> Channel:
+    """Build a bare Channel wired up for the XREAD fanout paths."""
+    channel = object.__new__(Channel)
+    channel.global_keyprefix = ""
+    channel.keyprefix_fanout = "/0."
+    channel.active_fanout_queues = {"fanout_queue"}
+    channel._fanout_queues = {"fanout_queue": ("test_exchange", "")}
+    channel._no_ack_queues = no_ack_queues if no_ack_queues is not None else set()
+    channel._stream_offsets = stream_offsets if stream_offsets is not None else {}
+    channel._stream_seen = stream_seen if stream_seen is not None else {}
+    channel.stream_read_count = DEFAULT_STREAM_READ_COUNT
+    channel.stream_max_age = DEFAULT_STREAM_MAX_AGE
+    channel.blocking_timeout = 10
+    channel.subclient = MagicMock()
+    channel.subclient._prefix_args.side_effect = lambda args: args
+    channel.connection = MagicMock()
+    qos = object.__new__(QoS)
+    qos._fanout_tags = set()
+    channel._qos = qos
+    return channel
+
+
+STREAM = "/0.test_exchange"
+
+
+def _stream_reply(stream: str, *ids: str) -> list[Any]:
+    """Build an XREAD reply carrying one payload per message id."""
+    return [
+        (
+            stream.encode(),
+            [
+                (
+                    message_id.encode(),
+                    {b"payload": json_dumps({"body": message_id, "properties": {}}).encode()},
+                )
+                for message_id in ids
+            ],
+        ),
+    ]
+
+
+@pytest.mark.unit
+class TestFanoutStreamConsumption:
+    """Tests for the XREAD fanout consume path.
+
+    Celery rides fanout for the ``celeryev`` event exchange and the pidbox
+    control exchange, both consumed with ``no_ack=True``. Anything that slows
+    that path down shows up as event drift warnings and pidbox timeouts.
+    """
+
+    def test_xread_reads_a_batch_per_poll(self) -> None:
+        """One delivery per poll cannot keep up with a fleet emitting events;
+        the COUNT has to be the batch size, not 1."""
+        channel = _make_fanout_channel()
+
+        channel._xread_start()
+
+        args = channel.subclient.connection.send_command.call_args[0]
+        assert args[args.index("COUNT") + 1] == str(DEFAULT_STREAM_READ_COUNT)
+
+    def test_xread_read_delivers_every_message_in_the_reply(self) -> None:
+        """A reply carrying a batch must be drained fully; returning after the
+        first delivery strands the rest until the next poll."""
+        channel = _make_fanout_channel()
+        channel.subclient.parse_response.return_value = _stream_reply(STREAM, "1000-0", "1000-1", "1000-2")
+
+        assert channel._xread_read() is True
+
+        assert channel.connection._deliver.call_count == 3
+        assert channel._stream_offsets[STREAM] == "1000-2"
+
+    def test_xread_read_raises_empty_when_nothing_was_delivered(self) -> None:
+        """A reply whose messages all belong to unknown streams delivered
+        nothing, so the poll has to report Empty."""
+        channel = _make_fanout_channel()
+        channel.subclient.parse_response.return_value = _stream_reply("/0.other_exchange", "1000-0")
+
+        with pytest.raises(Empty):
+            channel._xread_read()
+
+        channel.connection._deliver.assert_not_called()
+
+    def test_xread_read_leaves_no_ack_tags_untracked(self) -> None:
+        """QoS._fanout_tags is only discarded in ack/reject, and a no_ack
+        consumer never acks, so tracking its tags leaks for the process life."""
+        channel = _make_fanout_channel(no_ack_queues={"fanout_queue"})
+        channel.subclient.parse_response.return_value = _stream_reply(STREAM, "1000-0")
+
+        channel._xread_read()
+
+        assert channel.qos._fanout_tags == set()
+
+    def test_xread_read_tracks_tags_for_acking_consumers(self) -> None:
+        """A fanout queue consumed with acks still needs its tags flagged, so
+        the index heartbeat skips them and ack can discard them."""
+        channel = _make_fanout_channel()
+        channel.subclient.parse_response.return_value = _stream_reply(STREAM, "1000-0")
+
+        channel._xread_read()
+
+        assert len(channel.qos._fanout_tags) == 1
+
+    def test_bound_offset_age_passes_through_the_new_messages_offset(self) -> None:
+        """ "$" is not a timestamp; it means "from now" and is already current."""
+        channel = _make_fanout_channel()
+
+        assert channel._bound_offset_age(STREAM, "$") == "$"
+
+    def test_bound_offset_age_needs_a_server_clock_anchor(self) -> None:
+        """Until a message has been seen there is nothing to measure the age
+        against, and the local clock is not a substitute."""
+        channel = _make_fanout_channel()
+
+        assert channel._bound_offset_age(STREAM, "1-0") == "1-0"
+
+    def test_bound_offset_age_keeps_a_recent_offset(self) -> None:
+        """An offset inside the age window is the consumer's real position."""
+        channel = _make_fanout_channel(
+            stream_seen={STREAM: (1_000_000_000_000, monotonic() - 1)},
+        )
+
+        assert channel._bound_offset_age(STREAM, "999999999000-0") == "999999999000-0"
+
+    def test_bound_offset_age_skips_a_backlog_older_than_the_window(self) -> None:
+        """A consumer that fell behind must not replay the whole backlog to
+        reach the present; it jumps to the oldest offset still worth reading."""
+        seen_ms = 1_000_000_000_000
+        elapsed = DEFAULT_STREAM_MAX_AGE + 60
+        channel = _make_fanout_channel(stream_seen={STREAM: (seen_ms, monotonic() - elapsed)})
+
+        bounded = channel._bound_offset_age(STREAM, f"{seen_ms}-0")
+
+        expected_ms = seen_ms + (elapsed - DEFAULT_STREAM_MAX_AGE) * 1000
+        assert bounded.endswith("-0")
+        assert abs(int(bounded.split("-")[0]) - expected_ms) < 1000
+
+    def test_bound_offset_age_ignores_a_local_clock_running_ahead(self) -> None:
+        """Stream ids come off the Redis server clock. A worker whose wall
+        clock runs ahead would otherwise compute a cutoff past every id in the
+        stream and skip it permanently."""
+        seen_ms = 1_000_000_000_000
+        channel = _make_fanout_channel(stream_seen={STREAM: (seen_ms, monotonic())})
+
+        with patch.object(transport_mod, "time", return_value=time.time() + 86_400 * 365):
+            assert channel._bound_offset_age(STREAM, f"{seen_ms}-0") == f"{seen_ms}-0"
+
+    def test_bound_offset_age_compares_timestamps_numerically(self) -> None:
+        """Stream ids are unpadded, so a shorter (older) timestamp sorts above
+        a longer one lexicographically; the comparison has to be on ints."""
+        elapsed = DEFAULT_STREAM_MAX_AGE + 60
+        channel = _make_fanout_channel(
+            stream_seen={STREAM: (1_000_000_000_000, monotonic() - elapsed)},
+        )
+
+        assert channel._bound_offset_age(STREAM, "999999999999-0") != "999999999999-0"
+
+    def test_bound_offset_age_disabled_by_a_negative_max_age(self) -> None:
+        """A negative window opts out and replays whatever the stream holds."""
+        channel = _make_fanout_channel(
+            stream_seen={STREAM: (1_000_000_000_000, monotonic() - 3600)},
+        )
+        channel.stream_max_age = -1
+
+        assert channel._bound_offset_age(STREAM, "1-0") == "1-0"
+
+    def test_xread_read_anchors_the_server_clock(self) -> None:
+        """The newest id seen and the monotonic instant it arrived are the
+        only two things the age bound is allowed to measure against."""
+        channel = _make_fanout_channel()
+        channel.subclient.parse_response.return_value = _stream_reply(STREAM, "1000-0", "2000-1")
+
+        channel._xread_read()
+
+        seen_ms, seen_at = channel._stream_seen[STREAM]
+        assert seen_ms == 2000
+        assert monotonic() - seen_at < 5
+
+    def test_xread_start_bounds_the_stored_offset(self) -> None:
+        """The bound applies where the offset is looked up, so a lagging
+        consumer skips the backlog on its very next poll."""
+        seen_ms = 1_000_000_000_000
+        elapsed = DEFAULT_STREAM_MAX_AGE + 60
+        channel = _make_fanout_channel(
+            stream_offsets={STREAM: f"{seen_ms}-0"},
+            stream_seen={STREAM: (seen_ms, monotonic() - elapsed)},
+        )
+
+        channel._xread_start()
+
+        args = channel.subclient.connection.send_command.call_args[0]
+        assert int(args[-1].split("-")[0]) > seen_ms
+
+    def test_stream_options_are_settable_from_transport_options(self) -> None:
+        """An option missing from the tuple is silently ignored."""
+        assert "stream_read_count" in Channel.from_transport_options
+        assert "stream_max_age" in Channel.from_transport_options
+        assert Channel.stream_read_count == DEFAULT_STREAM_READ_COUNT
+        assert Channel.stream_max_age == DEFAULT_STREAM_MAX_AGE
 
 
 @pytest.mark.integration
@@ -4430,6 +4676,54 @@ class TestFanoutMessaging:
 
             # Cleanup
             redis_client.delete(f"{global_keyprefix}_kombu.binding.test_fanout_wildcard")
+
+    def test_fanout_drains_the_whole_batch_in_one_poll(
+        self,
+        celery_app: Celery,
+        redis_client: Any,
+        global_keyprefix: str,
+    ) -> None:
+        """A backlog has to clear in one poll, not one message per event-loop
+        tick: celery's event and pidbox traffic outruns the tick rate, and the
+        lag shows up as `Substantial drift` warnings and inspect ping timeouts.
+        """
+        with celery_app.connection() as conn:
+            channel = cast("Channel", conn.default_channel)
+
+            fanout_exchange = Exchange("test_batch_xread", type="fanout")
+            fanout_queue = Queue("batch_xread_queue", exchange=fanout_exchange, routing_key="#")
+            bound_queue = fanout_queue.bind(channel)
+            bound_queue.declare()  # type: ignore[attr-defined]
+
+            delivered: list[Any] = []
+            channel.basic_consume(
+                "batch_xread_queue",
+                no_ack=True,
+                callback=delivered.append,
+                consumer_tag="ctag-batch",
+            )
+
+            for i in range(5):
+                channel._put_fanout(
+                    "test_batch_xread",
+                    {
+                        "body": f'{{"n": {i}}}',
+                        "properties": {
+                            "delivery_tag": f"batch-tag-{i}",
+                            "delivery_info": {"exchange": "test_batch_xread", "routing_key": "worker.heartbeat"},
+                        },
+                    },
+                    routing_key="worker.heartbeat",
+                )
+
+            if channel.subclient.connection is None:
+                channel.subclient.connection = channel.subclient.connection_pool.get_connection()
+            channel._stream_offsets[channel._fanout_stream_key("test_batch_xread")] = "0"
+            channel._xread_start(timeout=1)
+
+            assert channel._xread_read() is True
+            assert len(delivered) == 5
+            assert cast("QoS", channel.qos)._fanout_tags == set()
 
     def test_fanout_end_to_end_via_xread(
         self,
