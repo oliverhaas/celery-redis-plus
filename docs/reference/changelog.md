@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.1] - 2026-09-01
 
 ### Fixed
 - Fanout consumption is no longer gated on the prefetch window. `MultiChannelPoller.on_poll_start` and `get` only issued the XREAD when `qos.can_consume()` was true, and `on_readable` refused to parse an XREAD reply already sitting readable on the socket under the same condition. A worker holding a full prefetch window (`prefetch_multiplier` × concurrency unacked, with `acks_late`) therefore stopped reading fanout entirely. Fanout deliveries are broadcast and never occupy a prefetch slot, so the gate protected against nothing. Celery rides fanout for the `celeryev` event exchange and the pidbox control exchange, so the visible symptoms were `Substantial drift ... may mean clocks are out of sync` warnings from `celery.events.state.State._warn_drift` on workers with correct clocks, and `celery inspect ping` timing out on a busy worker. BZMPOP stays gated. kombu's own Redis transport leaves the equivalent LISTEN registration ungated for the same reason
