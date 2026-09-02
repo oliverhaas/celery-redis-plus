@@ -27,8 +27,8 @@ classifiers = [
 dependencies = ["celery>=5.5.0", "kombu>=5.5.0"]
 
 [project.optional-dependencies]
-redis = ["redis>=7.1.0,<8"]
-hiredis = ["redis[hiredis]<8,>=7.1.0"]
+redis = ["redis>=7.1.0,<9"]
+hiredis = ["redis[hiredis]<9,>=7.1.0"]
 valkey = ["valkey>=6.1.0,<7"]
 libvalkey = ["valkey[libvalkey]>=6.1.0,<7"]
 
@@ -48,7 +48,7 @@ dev = [
   "pytest==9.1.1",
   "pytest-cov==7.1.0",
   "pytest-xdist>=3.8.0",
-  "redis[hiredis]==7.4.0",
+  "redis[hiredis]==8.1.0",
   "ruff==0.16.4",
   "testcontainers==4.15.0",
   "ty==0.0.74",

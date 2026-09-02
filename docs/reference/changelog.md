@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- The `redis` and `hiredis` extras now accept redis-py 8.x. The bound was `<8` while redis-py had already released 8.1.0, so `celery-redis-plus[redis]` could not be installed alongside a current client and pip silently resolved the extra away or downgraded it. The cap is now `<9` and the test suite runs against 8.1.0
+
 ## [0.4.1] - 2026-09-01
 
 ### Fixed
