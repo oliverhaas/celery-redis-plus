@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - The `redis` and `hiredis` extras now accept redis-py 8.x. The bound was `<8` while redis-py had already released 8.1.0, so `celery-redis-plus[redis]` could not be installed alongside a current client and pip silently resolved the extra away or downgraded it. The cap is now `<9` and the test suite runs against 8.1.0
 
+### Removed
+- The `fanout_patterns` transport option. It came over from kombu's Redis transport, where it selects PSUBSCRIBE pattern routing, and was never read here: fanout is one stream per exchange, so there are no patterns to match. Setting it did nothing, which the documentation contradicted
+
 ## [0.4.1] - 2026-09-01
 
 ### Fixed

@@ -161,7 +161,6 @@ All options are passed via Celery's `broker_transport_options` configuration.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `fanout_prefix` | `bool` or `str` | `True` | Prefix for fanout streams (`True` uses `/{db}.`) |
-| `fanout_patterns` | `bool` | `True` | Enable pattern-based fanout routing |
 
 #### Advanced Options
 

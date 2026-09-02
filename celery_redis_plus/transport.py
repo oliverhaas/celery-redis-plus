@@ -959,7 +959,6 @@ class Channel(virtual.Channel):
 
     # Fanout settings
     fanout_prefix: bool | str = True
-    fanout_patterns = True
 
     _async_pool: Any = None
     _pool: Any = None
@@ -971,7 +970,6 @@ class Channel(virtual.Channel):
         "queue_expires",
         "visibility_timeout",
         "fanout_prefix",
-        "fanout_patterns",
         "global_keyprefix",
         "socket_timeout",
         "socket_connect_timeout",

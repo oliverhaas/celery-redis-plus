@@ -945,7 +945,6 @@ class TestChannel:
         """Test _put_fanout publishes to stream."""
         channel = object.__new__(Channel)
         channel.keyprefix_fanout = "/0."
-        channel.fanout_patterns = False
         channel.stream_maxlen = 1000
         channel.queue_expires = None
 
