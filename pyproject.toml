@@ -49,15 +49,15 @@ dev = [
   "pytest-cov==7.1.0",
   "pytest-xdist>=3.8.0",
   "redis[hiredis]==8.1.0",
-  "ruff==0.16.7",
+  "ruff==0.16.8",
   "testcontainers==4.15.0",
-  "ty==0.0.80",
+  "ty==0.0.82",
   "valkey[libvalkey]==6.1.1",
 ]
 docs = ["mkdocs==1.6.1", "mkdocs-material==9.7.7", "mike==2.2.0"]
 
 [build-system]
-requires = ["hatchling==1.32.0"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
