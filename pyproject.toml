@@ -30,7 +30,7 @@ dependencies = ["celery>=5.5.0", "kombu>=5.5.0"]
 redis = ["redis>=7.1.0,<9"]
 hiredis = ["redis[hiredis]<9,>=7.1.0"]
 valkey = ["valkey>=6.1.0,<7"]
-libvalkey = ["valkey[libvalkey]>=6.1.0,<7"]
+libvalkey = ["valkey[libvalkey]<7,>=6.1.0"]
 
 [project.urls]
 Homepage = "https://github.com/oliverhaas/celery-redis-plus"
@@ -44,17 +44,17 @@ valkeys = "celery_redis_plus.transport:Transport"
 [dependency-groups]
 dev = [
   "celery-types-ng==0.25.6",
-  "pre-commit==4.6.2",
+  "pre-commit==4.7.0",
   "pytest==9.1.1",
   "pytest-cov==7.1.0",
   "pytest-xdist>=3.8.0",
   "redis[hiredis]==8.1.0",
-  "ruff==0.16.10",
+  "ruff==0.17.2",
   "testcontainers==4.15.0",
-  "ty==0.0.84",
-  "valkey[libvalkey]==6.1.1",
+  "ty==0.0.92",
+  "valkey[libvalkey]==6.2.0",
 ]
-docs = ["mkdocs==1.6.1", "mkdocs-material==9.7.7", "mike==2.2.0"]
+docs = ["mkdocs==1.6.1", "mkdocs-material==9.8.0", "mike==2.2.0"]
 
 [build-system]
 requires = ["hatchling==1.32.4"]
